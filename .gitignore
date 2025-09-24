@@ -1,0 +1,18 @@
+# editor cache
+/.vscode
+/.theia
+
+# build cache
+/build
+*.egg-info/
+*.pyc
+*.pyi
+*.so
+
+# other
+*.jpg
+*.png
+*.pdf
+*.csv
+.DS_Store
+export.zip
