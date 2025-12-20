@@ -30,9 +30,9 @@ To force CUDA build (if not auto-detected):
 FORCE_CUDA=1 pip install .
 ```
 
-Installation when already installed torch and pybind11:
+Note that this process may install the latest CPU-only PyTorch version. If you would like to use a CUDA-enabled PyTorch version, or you have already install a specific PyTorch version according to the [official website](https://pytorch.org/get-started/locally/), install without isolated build system. This is important for PyTorch version compability!
 ```bash
-pip install . -v --no-deps --no-build-isolation
+pip install . --no-build-isolation
 ```
 
 ## Usage
@@ -101,7 +101,7 @@ import time
 def benchmark_parallel_states(data_size_mb=50, device="cpu"):
   num_symbols = 256
   freq_precision = 16
-  sizes = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
   pmf = torch.ones(1, num_symbols, dtype=torch.float32, device=device) / num_symbols
   cdfs = torch_ans.rans_pmf_to_quantized_cdf(pmf, freq_precision)
   cdfs_sizes = torch.full((1,), cdfs.size(-1), dtype=torch.int32, device=device)
@@ -117,8 +117,9 @@ def benchmark_parallel_states(data_size_mb=50, device="cpu"):
       torch.cuda.synchronize()
     elapsed = time.time() - start
     results.append((batch_size, elapsed))
-    print(f"Batch size: {batch_size:4d} | Time: {elapsed:.4f} s")
+    print(f"Batch size: {batch_size:4d} | Time: {elapsed:.4f} s | Throughput: {(data_size_mb/elapsed):.2f} MB/s")
   return results
+
 
 # Example usage:
 print("Benchmarking on CPU:")
@@ -131,29 +132,33 @@ benchmark_parallel_states(data_size_mb=50, device="cuda")
 Example output on i7-6800k (6C12T) CPU and RTX 2080Ti GPU:
 ```
 Benchmarking on CPU:
-Batch size:    4 | Time: 0.1809 s
-Batch size:    8 | Time: 0.1819 s
-Batch size:   16 | Time: 0.1738 s
-Batch size:   32 | Time: 0.1415 s
-Batch size:   64 | Time: 0.1348 s
-Batch size:  128 | Time: 0.1277 s
-Batch size:  256 | Time: 0.1184 s
-Batch size:  512 | Time: 0.1198 s
-Batch size: 1024 | Time: 0.1188 s
-Batch size: 2048 | Time: 0.1209 s
-Batch size: 4096 | Time: 0.1208 s
+Batch size:    1 | Time: 0.1711 s | Throughput: 292.26 MB/s
+Batch size:    2 | Time: 0.1121 s | Throughput: 446.11 MB/s
+Batch size:    4 | Time: 0.0794 s | Throughput: 629.38 MB/s
+Batch size:    8 | Time: 0.0722 s | Throughput: 692.59 MB/s
+Batch size:   16 | Time: 0.0809 s | Throughput: 618.17 MB/s
+Batch size:   32 | Time: 0.0678 s | Throughput: 737.36 MB/s
+Batch size:   64 | Time: 0.0664 s | Throughput: 753.02 MB/s
+Batch size:  128 | Time: 0.0627 s | Throughput: 797.97 MB/s
+Batch size:  256 | Time: 0.0534 s | Throughput: 937.06 MB/s
+Batch size:  512 | Time: 0.0501 s | Throughput: 998.68 MB/s
+Batch size: 1024 | Time: 0.0473 s | Throughput: 1058.06 MB/s
+Batch size: 2048 | Time: 0.0479 s | Throughput: 1044.59 MB/s
+Batch size: 4096 | Time: 0.0500 s | Throughput: 999.69 MB/s
 Benchmarking on GPU:
-Batch size:    4 | Time: 1.5052 s
-Batch size:    8 | Time: 0.7136 s
-Batch size:   16 | Time: 0.3569 s
-Batch size:   32 | Time: 0.1787 s
-Batch size:   64 | Time: 0.0895 s
-Batch size:  128 | Time: 0.0449 s
-Batch size:  256 | Time: 0.0228 s
-Batch size:  512 | Time: 0.0124 s
-Batch size: 1024 | Time: 0.0079 s
-Batch size: 2048 | Time: 0.0078 s
-Batch size: 4096 | Time: 0.0078 s
+Batch size:    1 | Time: 6.5701 s | Throughput: 7.61 MB/s
+Batch size:    2 | Time: 4.8248 s | Throughput: 10.36 MB/s
+Batch size:    4 | Time: 1.4710 s | Throughput: 33.99 MB/s
+Batch size:    8 | Time: 0.7357 s | Throughput: 67.96 MB/s
+Batch size:   16 | Time: 0.3679 s | Throughput: 135.90 MB/s
+Batch size:   32 | Time: 0.1841 s | Throughput: 271.66 MB/s
+Batch size:   64 | Time: 0.0922 s | Throughput: 542.46 MB/s
+Batch size:  128 | Time: 0.0463 s | Throughput: 1081.05 MB/s
+Batch size:  256 | Time: 0.0235 s | Throughput: 2128.31 MB/s
+Batch size:  512 | Time: 0.0128 s | Throughput: 3898.49 MB/s
+Batch size: 1024 | Time: 0.0081 s | Throughput: 6149.65 MB/s
+Batch size: 2048 | Time: 0.0081 s | Throughput: 6161.39 MB/s
+Batch size: 4096 | Time: 0.0080 s | Throughput: 6222.82 MB/s
 ```
 
 This will help you determine the best batch size (number of parallel states) for your hardware and data size. For most users, start with CPU and increase batch size until speed plateaus or memory usage becomes excessive.

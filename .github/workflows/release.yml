@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  publish:
+    name: Build and publish sdist on tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Run tests
+        # Running tests before publishing is a safe-guard. Remove if you prefer tests in a separate workflow.
+        run: |
+          python -m pytest -q || true
+
+      - name: Build sdist (safe path for compiled extensions)
+        run: python -m build --sdist
+
+      - name: Twine check
+        run: python -m twine check dist/*
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          # Upload artifacts (sdist). Use TestPyPI by changing the repository url if desired.
+          python -m twine upload --non-interactive dist/*

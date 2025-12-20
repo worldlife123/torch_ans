@@ -1,0 +1,56 @@
+name: Build wheels (cibuildwheel template)
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build wheels for target PyTorch versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: [3.10]
+        torch_version: ["2.4.1"]
+        cuda: ["cpu", "cu118"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install cibuildwheel==2.2.0
+
+      - name: Build wheels with cibuildwheel (preinstall target torch)
+        env:
+          # Limit builds to cp${{ matrix.python }} ABI patterns if desired
+          CIBW_BUILD: "cp310-*"
+          # Pre-install the target torch in the build environment before building wheels
+          CIBW_BEFORE_BUILD: |
+            if [ "${{ matrix.cuda }}" = "cpu" ]; then
+              pip install torch==${{ matrix.torch_version }}
+            else
+              pip install torch==${{ matrix.torch_version }} --extra-index-url https://download.pytorch.org/whl/${{ matrix.cuda }}
+            fi
+        run: |
+          python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Upload built wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.python }}-torch-${{ matrix.torch_version }}-${{ matrix.cuda }}
+          path: wheelhouse/*.whl
+
+# NOTES:
+# - This is a template. Adapt Python versions, torch versions, and CUDA tags to your needs.
+# - For production, extend matrix to other Python versions and configure manylinux/Windows/macOS builds.
+# - Ensure sufficient runner resources and timeouts for cibuildwheel; building many wheels can take significant time.

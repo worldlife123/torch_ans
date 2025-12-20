@@ -5,7 +5,7 @@ import time
 def benchmark_parallel_states(data_size_mb=50, device="cpu"):
   num_symbols = 256
   freq_precision = 16
-  sizes = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+  sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
   pmf = torch.ones(1, num_symbols, dtype=torch.float32, device=device) / num_symbols
   cdfs = torch_ans.rans_pmf_to_quantized_cdf(pmf, freq_precision)
   cdfs_sizes = torch.full((1,), cdfs.size(-1), dtype=torch.int32, device=device)
@@ -21,7 +21,7 @@ def benchmark_parallel_states(data_size_mb=50, device="cpu"):
       torch.cuda.synchronize()
     elapsed = time.time() - start
     results.append((batch_size, elapsed))
-    print(f"Batch size: {batch_size:4d} | Time: {elapsed:.4f} s")
+    print(f"Batch size: {batch_size:4d} | Time: {elapsed:.4f} s | Throughput: {(data_size_mb/elapsed):.2f} MB/s")
   return results
 
 # Example usage:
