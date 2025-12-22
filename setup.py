@@ -82,6 +82,19 @@ setup(
     author_email="worldlife@sjtu.edu.cn",
     url="https://github.com/worldlife123/torch_ans",
     packages=["torch_ans"],
+    include_package_data=True,
+    package_data={
+        "torch_ans": [
+            "*.hpp",
+            "*.h",
+            "*.hh",
+            "*.inl",
+            "*.ipp",
+            "*.cu",
+            "*.cuh",
+            "*.cpp",
+        ]
+    },
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=["torch>=1.12", "pybind11"],

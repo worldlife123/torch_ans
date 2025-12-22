@@ -12,11 +12,11 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 ## Features
 
 - **High-speed ANS compression/decompression**: Efficient encoding and decoding using rANS, suitable for large-scale data and neural network applications.
-- **Parallel rANS on CPU and GPU**: Leverages PyTorch's parallelism and CUDA acceleration for batch processing and high throughput.
+- **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration for batch processing and high throughput.
 - **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
 - **Easy integration with PyTorch**: Designed for seamless use in PyTorch pipelines, including custom layers and models.
-- **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new ANS/rANS variants without compromise on efficiency.
+- **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
 
 ## Installation
 
@@ -32,6 +32,7 @@ FORCE_CUDA=1 pip install .
 
 Note that this process may install the latest CPU-only PyTorch version. If you would like to use a CUDA-enabled PyTorch version, or you have already install a specific PyTorch version according to the [official website](https://pytorch.org/get-started/locally/), install without isolated build system. This is important for PyTorch version compability!
 ```bash
+pip install pybind11
 pip install . --no-build-isolation
 ```
 
@@ -197,7 +198,7 @@ torch_ans.rans*_push(
 Encodes symbols into the rANS stream in parallel.
 - **stream** (`torch.Tensor`): rANS stream tensor.
 - **symbols** (`torch.Tensor`): Symbols to encode (int tensor).
-- **indexes** (`torch.Tensor`): Distribution index for each symbol.
+- **indexes** (`torch.Tensor`): CDF table index for each symbol.
 - **cdfs** (`torch.Tensor`): Batched CDF tables.
 - **cdfs_sizes** (`torch.Tensor`): Size of each CDF table.
 - **offsets** (`torch.Tensor`): Offset for each distribution.
@@ -221,7 +222,7 @@ torch_ans.rans*_pop(
 ```
 Decodes symbols from the rANS stream in parallel.
 - **stream** (`torch.Tensor`): rANS stream tensor.
-- **indexes** (`torch.Tensor`): Distribution index for each symbol.
+- **indexes** (`torch.Tensor`): CDF table index for each symbol.
 - **cdfs** (`torch.Tensor`): Batched CDF tables.
 - **cdfs_sizes** (`torch.Tensor`): Size of each CDF table.
 - **offsets** (`torch.Tensor`): Offset for each distribution.
@@ -262,9 +263,10 @@ from torch_ans.utils import TorchANSInterface
 ```python
 coder = TorchANSInterface(impl="rans64", freq_precision=16, device="cpu")
 ```
-- **impl** (str): rANS variant (e.g., "rans64", "rans32", "rans64_i4", etc.)
+- **impl** (str): rANS variant (e.g., "rans64", "rans32", "rans32_16", etc.)
 - **freq_precision** (int): Frequency precision in bits.
 - **device** (str): "cpu" or "cuda".
+- ... (More parameters in [torch_ans/utils.py](torch_ans/utils.py))
 
 **Parameter Setup:**
 
@@ -280,7 +282,7 @@ coder.init_params(freqs, num_freqs, offsets)
 ```python
 encoded = coder.encode_with_indexes(symbols, indexes)
 ```
-- **symbols** (`torch.Tensor`): Symbols to encode, shape `(B, N)`. `B` is the same with ANS state batch size, `N` is number of symbols.
+- **symbols** (`torch.Tensor`): Symbols to encode, shape `(B, N)`. `B` is the same with ANS state batch size (equal to number of parallel states), `N` is number of symbols.
 - **indexes** (`torch.Tensor`): Distribution/table index for each symbol, should have same shape with **symbols**.
 - **Returns**: Encoded stream (typically a list of `bytes` or tensor).
 
@@ -290,11 +292,11 @@ encoded = coder.encode_with_indexes(symbols, indexes)
 decoded = coder.decode_with_indexes(encoded, indexes)
 ```
 - **encoded**: Encoded stream from `encode_with_indexes`.
-- **indexes** (`torch.Tensor`): Distribution/table index for each symbol, shape `(B, N)`.
+- **indexes** (`torch.Tensor`): Distribution/table index for each symbol, shape `(B, N)`. `B` is the same with ANS state batch size (equal to number of parallel states), `N` is number of symbols.
 - **Returns**: Decoded symbols as `torch.Tensor`.
 
 **Other Features:**
-- Supports both CPU and CUDA transparently.
+- Supports both CPU and CUDA parallel coding transparently.
 - Handles CDF/PMF conversion internally during init_params.
 - Provides methods for serialization and deserialization of streams.
 
@@ -414,23 +416,23 @@ This library is developed for research-purpose only, and as a robust everyday so
 ### TODO
 - Fix interleave ANS state on CUDA
 - Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API
-- Implement tANS and its variants
+- Implement tANS and its variants (similar to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
 - Support for other backends supported in PyTorch (such as ROCM)
 
 # Related Projects
 
--- [PyTorch](https://pytorch.org/): Deep learning framework used for tensor operations and GPU support.
--- [pybind11](https://github.com/pybind/pybind11): Python bindings for C++ used in this extension.
--- [CompressAI](https://github.com/InterDigitalInc/CompressAI): Neural compression library with entropy coding.
--- [torchac](https://github.com/fab-jul/torchac): Fast arithmetic coding library for PyTorch, includes ANS variants.
--- [ryg_rans](https://github.com/rygorous/ryg_rans): Reference C implementation of rANS.
--- [fsc](https://github.com/skal65535/fsc): rANS implementation with alias mapping.
--- [Recoil](https://github.com/lin-toto/recoil): A header-only C++20 rANS library including parallel rANS algorithms.
--- [FiniteStateEntropy](https://github.com/Cyan4973/FiniteStateEntropy): Reference C implementation of tANS/FSE by Yann Collet.
--- [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding): Provides a numpy-based unified rANS/tANS interface implementation.
+- [PyTorch](https://pytorch.org/): Deep learning framework used for tensor operations and GPU support.
+- [pybind11](https://github.com/pybind/pybind11): Python bindings for C++ used in this extension.
+- [CompressAI](https://github.com/InterDigitalInc/CompressAI): Neural compression library with entropy coding.
+- [torchac](https://github.com/fab-jul/torchac): Fast arithmetic coding library for PyTorch, includes ANS variants.
+- [ryg_rans](https://github.com/rygorous/ryg_rans): Reference C implementation of rANS.
+- [fsc](https://github.com/skal65535/fsc): rANS implementation with alias mapping.
+- [Recoil](https://github.com/lin-toto/recoil): A header-only C++20 rANS library including parallel rANS algorithms.
+- [FiniteStateEntropy](https://github.com/Cyan4973/FiniteStateEntropy): Reference C implementation of tANS/FSE by Yann Collet.
+- [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding): Provides a numpy-based unified rANS/tANS interface implementation.
 
 For more ANS implementations, see [Jarek Duda's blog on encode.su](https://encode.su/threads/2078-List-of-Asymmetric-Numeral-Systems-implementations)
 
 ## License
 
-TODO
+MIT License

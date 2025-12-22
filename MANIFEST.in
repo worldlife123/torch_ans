@@ -1,0 +1,8 @@
+# Include C/C++ headers and native sources in source distributions
+recursive-include torch_ans *.hpp *.h *.hh *.inl *.ipp *.cu *.cuh *.cpp *.cc *.cxx
+
+# Also include Python package files
+recursive-include torch_ans *.py
+
+# Exclude build artifacts
+global-exclude *.pyc __pycache__ *.so

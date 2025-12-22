@@ -14,5 +14,5 @@ dependencies = [
     "torch>=1.12",
     "pybind11"
 ]
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 license = { file="LICENSE" }
