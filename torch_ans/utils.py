@@ -433,7 +433,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
     Args:
         impl (str): rANS implementation variant ("rans64", "rans32", etc.).
-        num_parallel_states (int, optional): Number of parallel ANS states.
+        num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
         **kwargs: Passed to TorchEntropyCoderBaseInterface.
     """
@@ -451,15 +451,16 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             self.ans_init_func = rans64_init_stream
             self.ans_encode_func = rans64_push
             self.ans_decode_func = rans64_pop
+            self.freq_precision = min(self.freq_precision, 31)
         elif self.impl.startswith("rans32") or self.impl.startswith("rans_byte"):
             self.ans_init_func = rans32_init_stream
             self.ans_encode_func = rans32_push
             self.ans_decode_func = rans32_pop
+            self.freq_precision = min(self.freq_precision, 23)
         elif self.impl.startswith("rans32_16"):
             self.ans_init_func = rans32_16_init_stream
             self.ans_encode_func = rans32_16_push
             self.ans_decode_func = rans32_16_pop
-            # workaround for rans32_16 implementation supporting 15bit freq at most
             self.freq_precision = min(self.freq_precision, 15)
         else:
             raise NotImplementedError(f"Unknown impl {self.impl}")

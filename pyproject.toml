@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "pybind11"]
+requires = ["setuptools>=42", "wheel", "pybind11", "torch>=1.12"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "torch_ans"
 version = "0.1.1"
 description = "PyTorch extension for ANS-based compression (C++/CUDA)"
 authors = [
-    { name="Your Name", email="your@email.com" }
+    { name="worldlife", email="worldlife@sjtu.edu.cn" }
 ]
 requires-python = ">=3.8"
 dependencies = [

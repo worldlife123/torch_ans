@@ -15,11 +15,18 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 - **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration for batch processing and high throughput.
 - **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
-- **Easy integration with PyTorch**: Designed for seamless use in PyTorch pipelines, including custom layers and models.
 - **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
 
 ## Installation
 
+
+### From PyPI
+It is recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`
+```bash
+pip install torch_ans --no-build-isolation
+```
+
+### From source
 ```bash
 pip install .
 ```
@@ -38,13 +45,7 @@ pip install . --no-build-isolation
 
 ## Usage
 
-torch_ans supports a wide range of rANS variants, including different state, stream, and frequency sizes, interleaved coding, and parallel coding on CPU or GPU. In addition to standard and interleaved rANS, two advanced coding types are supported: alias coding and inverse CDF coding.
-
-**Alias Coding**: Alias coding modifies both the push (encode) and pop (decode) steps. It accelerates the pop (decode) process by enabling constant-time symbol lookup, but increases memory usage during the push (encode) step due to the need for additional alias tables.
-
-**Inverse CDF decoding**: Inverse CDF decoding only changes the pop (decode) step. It accelerates decoding by allowing direct symbol lookup from the state, but requires much more memory during the pop step because of large inverse CDF tables. However, it seems that reading large inverse CDF tables does not result in prominent acceleration compared to standard coding.
-
-Use alias coding for fast decoding when memory usage during encoding is not a concern. Use inverse CDF coding for maximum decoding speed when memory usage during decoding is acceptable.
+torch_ans supports a wide range of rANS variants, including different state, stream, and frequency sizes, interleaved coding, and parallel coding on CPU or GPU. 
 
 Below we list currently supported variants:
 
@@ -54,22 +55,30 @@ Below we list currently supported variants:
 | rans64_i4              | 64         | 32          | 16            | 4                  | CPU           | -                        | rans64_i4_push           | rans64_i4_pop           |
 | rans64_alias           | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_alias_push        | rans64_alias_pop        |
 | rans64_invcdf          | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_push              | rans64_invcdf_pop       |
-| rans32                 | 32         | 8           | 8             | 1                  | CPU, CUDA     | rans32_init_stream       | rans32_push              | rans32_pop              |
-| rans32_i4              | 32         | 8           | 8             | 4                  | CPU           | -                        | rans32_i4_push           | rans32_i4_pop           |
-| rans32_alias           | 32         | 8           | 8             | 1                  | CPU, CUDA     | -                        | rans32_alias_push        | rans32_alias_pop        |
-| rans32_invcdf          | 32         | 8           | 8             | 1                  | CPU, CUDA     | -                        | rans32_push              | rans32_invcdf_pop       |
+| rans32                 | 32         | 8           | 16             | 1                  | CPU, CUDA     | rans32_init_stream       | rans32_push              | rans32_pop              |
+| rans32_i4              | 32         | 8           | 16             | 4                  | CPU           | -                        | rans32_i4_push           | rans32_i4_pop           |
+| rans32_alias           | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_alias_push        | rans32_alias_pop        |
+| rans32_invcdf          | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_push              | rans32_invcdf_pop       |
 | rans32_16              | 32         | 16          | 15            | 1                  | CPU, CUDA     | rans32_16_init_stream    | rans32_16_push           | rans32_16_pop           |
 | rans32_16_i4           | 32         | 16          | 15            | 4                  | CPU           | -                        | rans32_16_i4_push        | rans32_16_i4_pop        |
 | rans32_16_alias        | 32         | 8           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_alias_push     | rans32_16_alias_pop     |
 | rans32_16_invcdf       | 32         | 8           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_push           | rans32_16_invcdf_pop    |
 
 **Legend:**
-- *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio.
+- *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
 - *Stream Bits*: Number of bits per stream element. This affects the frequency of overflowed state to be written into/read from bitstream, slightly affecting speed.
-- *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better).
-- *Interleaved States*: Number of interleaved states for sequential coding in one step.
+- *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In torch_ans implementation, State Bits > Stream Bits + Max Freq Bits.
+- *Interleaved States*: Number of interleaved states for sequential coding in one step. Effective when combined with SIMD instructions (not implemented in torch_ans).
 - *Device Support*: Indicates if variant is available on CPU and/or CUDA GPU.
 - *init_func/push_func/pop_func*: Main API functions for this variant.
+
+In addition to standard and interleaved rANS, two advanced coding types are supported: alias coding and inverse CDF coding.
+
+**Alias Coding**: Alias coding modifies both the push (encode) and pop (decode) steps. It accelerates the pop (decode) process by enabling constant-time symbol lookup, but increases memory usage during the push (encode) step due to the need for additional alias tables.
+
+**Inverse CDF decoding**: Inverse CDF decoding only changes the pop (decode) step. It accelerates decoding by allowing direct symbol lookup from the state, but requires much more memory during the pop step because of large inverse CDF tables. However, it seems that reading large inverse CDF tables does not result in prominent acceleration compared to standard coding.
+
+Use alias coding for fast decoding when memory usage during encoding is not a concern. Use inverse CDF coding for maximum decoding speed when memory usage during decoding is acceptable.
 
 ### Parallel ANS stream
 
@@ -374,35 +383,49 @@ A: Parallel states corresponds to individual bitstreams, so they require extra s
 
 In constrast, interleaved states corresponds to a single bitstream, and is sequentially processed. In fact, SIMD ops (such as AVX2 and AVX512) could be used to accelerate interleaved ANS coding, but in our experiments 8 parallel states has better acceleration than the 8 interleaved states with AVX2 ops. 
 
+**Q: How to choose parameters like State Bits, Stream Bits and Freq Bits? What is their relation to stream size and memory occupation?**
+
+To be simple, always use rans64 configuration if data size is not extremely small (less than 1KB) and you are not sensitive about memory occupation!
+If data size is extremely small, you could try rans32 or rans32_16 to reduce initial state.
+
 
 ### Technical
 
 **Q: What Python and PyTorch versions are supported?**
+
 A: Python >= 3.8 and PyTorch >= 1.12 are recommended. Earlier versions may work but are not tested.
 
 **Q: How do I enable CUDA support?**
+
 A: Install the CUDA toolkit and ensure PyTorch is built with CUDA. Use `FORCE_CUDA=1 pip install .` to force CUDA build if not auto-detected. Check with `torch.cuda.is_available()`.
 
 **Q: Why do I get compilation errors during installation?**
+
 A: Make sure you have a C++17 compiler, pybind11, and compatible PyTorch. Try cleaning the build directory: `rm -rf build/ torch_ans.egg-info/` and reinstall.
 
 **Q: How do I choose between CPU and GPU?**
+
 A: Set the `device` argument in API calls to "cpu" or "cuda". For large batches, GPU is recommended; for small data, CPU may be faster.
 
 **Q: What is the difference between low-level and high-level APIs?**
+
 A: Low-level APIs operate directly on tensors for maximum control, but improper use may lead to segmentation fault. High-level APIs (TorchANSInterface) is designed with a similar API to CompressAI's entropy coder, which simplify usage and enables auto paralellization, ANS stream management and serialization for you.
 
 **Q: How do I serialize and deserialize streams in torch.Tensor format?**
+
 A: Use `torch_ans.rans_stream_to_byte_strings` and `torch_ans.rans_byte_strings_to_stream` for conversion between tensors and Python bytes.
 
 **Q: How do I run tests?**
+
 A: Run `python tests/torch_ans_test.py` or use `pytest` in the project directory.
 
 **Q: Where can I find more usage examples?**
+
 A: See the README Usage section and `torch_ans_test.py` for practical examples and test cases. For practical usage of ANS coding in neural compression, see [CompressAI](https://github.com/InterDigitalInc/CompressAI).
 
 **Q: What can I do if segmentation fault occurs?**
-This library is developed for research-purpose only, and as a robust everyday software, so errors may occur occasionally. If you are using the low-level API, try to switch to the high-level API and enable bypass coding, which might be more robust. If error still persists, try debugging by watching middle variables such as cdf (should be incremental positive integers).
+
+This library is developed for research-purpose only, and not as a robust everyday software, so errors may occur occasionally. If you are using the low-level API, try to switch to the high-level API and enable bypass coding, which might be more robust. If error still persists, try checking middle variables such as cdf (should be incremental positive integers and less than 2^freq_precision).
 
 ## Development
 
