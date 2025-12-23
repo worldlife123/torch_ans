@@ -82,8 +82,6 @@ Use alias coding for fast decoding when memory usage during encoding is not a co
 
 ### Parallel ANS stream
 
-#### Parallel ANS Streams
-
 All encoding (push) and decoding (pop) operations in torch_ans are fully parallelized. The batch size of the rANS stream tensor (`stream.shape[0]`) determines the number of parallel states processed simultaneously. This enables efficient utilization of multi-core CPUs and GPUs for large-scale data compression.
 
 - The stream tensor is typically `int32` (defined in DEFAULT_TORCH_TENSOR_TYPE and DEFAULT_TORCH_TENSOR_DTYPE in `rans_utils.hpp`) and has shape `(B, L)`, where `B` is the batch size (number of parallel states) and `L` is the stream length. Note that due to int32 range, each stream length could not exceed 2GB.
@@ -441,6 +439,7 @@ This library is developed for research-purpose only, and not as a robust everyda
 - Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API
 - Implement tANS and its variants (similar to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
 - Support for other backends supported in PyTorch (such as ROCM)
+- Add more examples such as neural compression
 
 # Related Projects
 

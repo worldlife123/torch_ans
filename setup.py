@@ -76,7 +76,7 @@ if any(arg in sys.argv for arg in ("build_ext", "bdist_wheel", "bdist_egg", "ins
 
 setup(
     name="torch_ans",
-    version="0.1.1",
+    version="0.1.1.post1",
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     author="worldlife",
     author_email="worldlife@sjtu.edu.cn",

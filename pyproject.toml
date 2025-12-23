@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch_ans"
-version = "0.1.1"
+version = "0.1.1.post1"
 description = "PyTorch extension for ANS-based compression (C++/CUDA)"
 authors = [
     { name="worldlife", email="worldlife@sjtu.edu.cn" }
