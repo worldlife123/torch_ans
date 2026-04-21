@@ -41,7 +41,7 @@ torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves, ssize_t pr
 }
 
 
-template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF, bool USE_INVERSED_CDF, size_t NUM_INTERLEAVES>
+template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF, size_t NUM_INTERLEAVES>
 void rans_push_indexed_cpu(// ANSStream stream,
   torch::Tensor stream, 
   const torch::Tensor& symbols, 
@@ -388,29 +388,30 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
 TORCH_LIBRARY_IMPL(torch_ans, CPU, m) {
     m.impl("rans64_init_stream", &rans_init_stream<uint64_t, uint32_t>);
     m.impl("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf_cpu);
-    m.impl("rans64_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t>);
+    m.impl("rans64_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t, false, 1>);
     m.impl("rans64_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t>);
     m.impl("rans64_i4_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t, false, 4>);
     m.impl("rans64_i4_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, false, false, 4>);
-    m.impl("rans64_alias_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t, true>);
+    m.impl("rans64_alias_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t, true, 1>);
     m.impl("rans64_alias_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, true, false>);
     m.impl("rans64_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, false, true>);
     m.impl("rans32_init_stream", &rans_init_stream<uint32_t, uint8_t>);
-    m.impl("rans32_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t>);
+    m.impl("rans32_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t, false, 1>);
     m.impl("rans32_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t>);
     m.impl("rans32_i4_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t, false, 4>);
     m.impl("rans32_i4_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t, false, false, 4>);
     m.impl("rans32_i4_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t, false, true, 4>);
-    m.impl("rans32_alias_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t, true>);
+    m.impl("rans32_alias_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t, true, 1>);
     m.impl("rans32_alias_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t, true, false>);
     m.impl("rans32_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t, false, true>);
     m.impl("rans32_16_init_stream", &rans_init_stream<uint32_t, uint16_t>);
-    m.impl("rans32_16_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t>);
+    m.impl("rans32_16_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, false, 1>);
     m.impl("rans32_16_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t>);
     m.impl("rans32_16_i4_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, false, 4>);
     m.impl("rans32_16_i4_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, false, 4>);
     m.impl("rans32_16_i4_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, true, 4>);
-    m.impl("rans32_16_alias_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, true>);
+    m.impl("rans32_16_alias_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, true, 1>);
     m.impl("rans32_16_alias_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, true, false>);
     m.impl("rans32_16_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, true>);
+    
 }
