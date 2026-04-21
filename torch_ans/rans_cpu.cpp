@@ -41,7 +41,7 @@ torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves, ssize_t pr
 }
 
 
-template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
+template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF, bool USE_INVERSED_CDF, size_t NUM_INTERLEAVES>
 void rans_push_indexed_cpu(// ANSStream stream,
   torch::Tensor stream, 
   const torch::Tensor& symbols, 
