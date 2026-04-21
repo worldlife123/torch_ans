@@ -305,6 +305,14 @@ class TorchEntropyCoderBaseInterface(object):
             return self.encode_symbols(**self.cache_encode_symbols, cache=False, **kwargs)
         # raise NotImplementedError()
 
+    def reset_cache(self) -> None:
+        """
+        Resets all encoding caches.
+        """
+        self.cache_encode_with_indexes = dict()
+        self.cache_encode_with_freqs = dict()
+        self.cache_encode_symbols = dict()
+
     def encode_with_freqs(self, symbols: torch.Tensor, freqs: Optional[torch.Tensor], num_freqs: Optional[torch.Tensor], cache=False, **kwargs) -> bytes:
         """
         Caches or encodes symbols with explicit frequency tables.
@@ -508,6 +516,24 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         #     self.cdfs_sizes = self.cdfs_sizes.to(device=self.device)
         #     self.offsets = self.offsets.to(device=self.device)
         
+    def set_cdfs(self, cdfs: torch.Tensor, cdfs_sizes: torch.Tensor, offsets: torch.Tensor) -> None:
+        """
+        Sets coder CDFs, sizes, and offsets directly.
+
+        Args:
+            cdfs (torch.Tensor): CDF tensor.
+            cdfs_sizes (torch.Tensor): Sizes of each CDF.
+            offsets (torch.Tensor): Offset tensor for each distribution.
+        """
+        self.cdfs = self._init_tensor(cdfs).contiguous()
+        self.cdfs_sizes = self._init_tensor(cdfs_sizes).contiguous()
+        self.offsets = self._init_tensor(offsets).contiguous()
+
+        # if self.device is not None:
+        #     self.cdfs = self.cdfs.to(device=self.device)
+        #     self.cdfs_sizes = self.cdfs_sizes.to(device=self.device)
+        #     self.offsets = self.offsets.to(device=self.device)
+
     def _init_decoder(self, **kwargs):
         """
         Initializes decoder stream for rANS decoding.

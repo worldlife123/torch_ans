@@ -1,0 +1,138 @@
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-tests-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  x86-test-matrix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      max-parallel: 4
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: 3.7
+            torch: 1.10.1
+          - os: windows-latest
+            python-version: 3.7
+            torch: 1.10.1
+          - os: macos-latest
+            python-version: 3.7
+            torch: 1.10.1
+          - os: ubuntu-latest
+            python-version: 3.9
+            torch: 2.1.1
+          - os: windows-latest
+            python-version: 3.9
+            torch: 2.1.1
+          - os: macos-latest
+            python-version: 3.9
+            torch: 2.1.1
+          - os: ubuntu-latest
+            python-version: 3.10
+            torch: 2.4.1
+          - os: windows-latest
+            python-version: 3.10
+            torch: 2.4.1
+          - os: macos-latest
+            python-version: 3.10
+            torch: 2.4.1
+          - os: ubuntu-latest
+            python-version: 3.11
+            torch: 2.7.1
+          - os: windows-latest
+            python-version: 3.11
+            torch: 2.7.1
+          - os: macos-latest
+            python-version: 3.11
+            torch: 2.7.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml','**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install setuptools wheel pybind11
+
+
+      - name: Install libomp on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install libomp
+
+      - name: Install PyTorch
+        run: |
+          # Use the official PyTorch wheels index for compatibility across platforms
+          python -m pip install "torch==${{ matrix.torch }}" -f https://download.pytorch.org/whl/torch_stable.html
+
+      - name: Install package
+        run: |
+          # Install package in non-isolated mode so compiled extension builds against the installed torch
+          python -m pip install --no-build-isolation .
+
+      - name: Show versions
+        run: |
+          python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__)"
+
+      - name: Run tests
+        run: |
+          python -m pytest -q
+
+  # a simple test for arm64
+  arm64-test:
+    runs-on: ubuntu-22.04-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install setuptools wheel pybind11
+
+      - name: Install PyTorch for ARM64
+        run: |
+          python -m pip install "torch==2.4.1" -f https://download.pytorch.org/whl/torch_stable.html
+
+      - name: Install package
+        run: |
+          python -m pip install --no-build-isolation .
+
+      - name: Show versions
+        run: |
+          python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__)"
+
+      - name: Run tests
+        run: |
+          python -m pytest -q

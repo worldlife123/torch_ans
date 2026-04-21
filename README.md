@@ -28,13 +28,19 @@ pip install torch_ans --no-build-isolation
 
 ### From source
 ```bash
-pip install .
+pip install . --no-build-isolation
 ```
 
 To force CUDA build (if not auto-detected):
 
 ```bash
-FORCE_CUDA=1 pip install .
+FORCE_CUDA=1 pip install . --no-build-isolation
+```
+
+Or disable CUDA build if you cannot properly compile CUDA code with:
+
+```bash
+CUDA_VISIBLE_DEVICES= pip install . --no-build-isolation
 ```
 
 Note that this process may install the latest CPU-only PyTorch version. If you would like to use a CUDA-enabled PyTorch version, or you have already install a specific PyTorch version according to the [official website](https://pytorch.org/get-started/locally/), install without isolated build system. This is important for PyTorch version compability!
@@ -42,6 +48,22 @@ Note that this process may install the latest CPU-only PyTorch version. If you w
 pip install pybind11
 pip install . --no-build-isolation
 ```
+
+If you would like to disable CUDA when building:
+
+```bash
+CUDA_VISIBLE_DEVICES= pip install .
+```
+
+### CUDA on Jetson (beta)
+
+If you want CUDA support on Jetson, build with a matching ARM64 PyTorch/CUDA environment and set the CUDA arch list appropriately, for example:
+```bash
+export TORCH_CUDA_ARCH_LIST="5.3;6.2;7.2"
+pip install . --no-build-isolation
+```
+
+Use --no-build-isolation so pip reuses your installed arm64 torch instead of trying to install a new one in an isolated build env.
 
 ## Usage
 
@@ -61,8 +83,8 @@ Below we list currently supported variants:
 | rans32_invcdf          | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_push              | rans32_invcdf_pop       |
 | rans32_16              | 32         | 16          | 15            | 1                  | CPU, CUDA     | rans32_16_init_stream    | rans32_16_push           | rans32_16_pop           |
 | rans32_16_i4           | 32         | 16          | 15            | 4                  | CPU           | -                        | rans32_16_i4_push        | rans32_16_i4_pop        |
-| rans32_16_alias        | 32         | 8           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_alias_push     | rans32_16_alias_pop     |
-| rans32_16_invcdf       | 32         | 8           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_push           | rans32_16_invcdf_pop    |
+| rans32_16_alias        | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_alias_push     | rans32_16_alias_pop     |
+| rans32_16_invcdf       | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_push           | rans32_16_invcdf_pop    |
 
 **Legend:**
 - *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
@@ -391,11 +413,15 @@ If data size is extremely small, you could try rans32 or rans32_16 to reduce ini
 
 **Q: What Python and PyTorch versions are supported?**
 
-A: Python >= 3.8 and PyTorch >= 1.12 are recommended. Earlier versions may work but are not tested.
+A: Python >= 3.7 and PyTorch >= 1.10 are recommended. Earlier versions may work but are not tested.
 
 **Q: How do I enable CUDA support?**
 
 A: Install the CUDA toolkit and ensure PyTorch is built with CUDA. Use `FORCE_CUDA=1 pip install .` to force CUDA build if not auto-detected. Check with `torch.cuda.is_available()`.
+
+**Q: RuntimeError: The detected CUDA version (x.x) mismatches the version that was used to compile PyTorch (y.y). Please make sure to use the same CUDA versions.**
+
+A: Ensure that your installed CUDA toolkit version align with PyTorch CUDA version. Or if you do not need CUDA for coding, Use `CUDA_VISIBLE_DEVICES= pip install .` to disable CUDA when building.
 
 **Q: Why do I get compilation errors during installation?**
 
@@ -427,7 +453,7 @@ This library is developed for research-purpose only, and not as a robust everyda
 
 ## Development
 
-- Requires Python >= 3.8, PyTorch, and a C++17 compiler.
+- Requires Python >= 3.7, PyTorch, and a C++17 compiler.
 - CUDA toolkit required for GPU support.
 - Run tests with:
   ```bash

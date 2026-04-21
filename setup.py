@@ -1,6 +1,7 @@
 from setuptools import setup
 import os
 import sys
+import platform
 from glob import glob
 
 
@@ -24,9 +25,19 @@ def get_extension_config():
     sources = glob(f"{extension_dir}/*.cpp")
     include_dirs = [extension_dir]
 
-    extra_compile_args = {"cxx": ["-std=c++17", "-O3", '-fopenmp', '-march=native']}
+    # extra_compile_args = {"cxx": ["-std=c++17", "-O3", '-fopenmp', '-march=native']}
+    extra_compile_args = {"cxx": ["-std=c++17", "-O3"]}
+    if sys.platform == "win32":
+        extra_compile_args["cxx"] = ["/std:c++17", "/O2", "/openmp"]
+    elif sys.platform == "darwin":
+        extra_compile_args["cxx"] += ["-mmacosx-version-min=10.14"]
+    else:
+        extra_compile_args["cxx"] += ["-fopenmp"]
+    
+    if platform.machine() == "x86_64":
+        extra_compile_args["cxx"] += ["-march=native"]    
+    
     define_macros = []
-
     if torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1":
         sources += glob(f"{extension_dir}/*.cu")
         ext_type = CUDAExtension
@@ -97,6 +108,6 @@ setup(
     },
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    install_requires=["torch>=1.12", "pybind11"],
-    python_requires=">=3.8",
+    install_requires=["torch>=1.10", "pybind11"],
+    python_requires=">=3.7",
 )

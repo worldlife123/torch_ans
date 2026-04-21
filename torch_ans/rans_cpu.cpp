@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 
-#include <x86intrin.h>
+// #include <x86intrin.h>
 #include <vector>
 // #include <span>
 // #include <bit>
@@ -19,7 +19,7 @@ constexpr void constexpr_for(F&& f)
     }
 }
 
-template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS=0>
+template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS>
 torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves, ssize_t preallocate_size) 
 {
   ssize_t stream_init_size = 1 + preallocate_size / sizeof(DEFAULT_TORCH_TENSOR_TYPE) + num_interleaves * ((sizeof(RANS_STATE_TYPE) + sizeof(DEFAULT_TORCH_TENSOR_TYPE) - 1) / sizeof(DEFAULT_TORCH_TENSOR_TYPE));
