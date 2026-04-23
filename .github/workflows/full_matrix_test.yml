@@ -33,14 +33,7 @@ jobs:
         include: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     env:
       FORCE_CUDA: ${{ matrix.cuda-version != 'cpu' && '1' || '0' }}
-    runs-on: ${{
-      (matrix.os == 'linux' && matrix.platform == 'x86_64' && 'ubuntu-latest') ||
-      (matrix.os == 'linux' && matrix.platform == 'aarch64' && 'ubuntu-24.04-arm') ||
-      (matrix.os == 'windows' && 'windows-latest') ||
-      (matrix.os == 'macos' && matrix.platform == 'x86_64' && 'macos-15-intel') ||
-      (matrix.os == 'macos' && matrix.platform == 'arm64' && 'macos-latest') ||
-      'ubuntu-latest'
-    }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}

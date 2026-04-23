@@ -77,7 +77,22 @@ def main():
     # Filter to reasonable versions (PyTorch typically supports recent Python versions)
     python_versions = [v for v in python_versions if tuple(map(int, v.split('.'))) >= (3, 7)]
 
-    # Create matrix entries with os and arch
+
+    # Map (os, arch) to GitHub Actions runner label
+    def get_runner(os_name, arch):
+        if os_name == 'linux' and arch == 'x86_64':
+            return 'ubuntu-latest'
+        if os_name == 'linux' and arch == 'aarch64':
+            return 'ubuntu-24.04-arm'  # Example, adjust as needed
+        if os_name == 'windows':
+            return 'windows-latest'
+        if os_name == 'macos' and arch == 'x86_64':
+            return 'macos-15-intel'  # Example, adjust as needed
+        if os_name == 'macos' and arch == 'arm64':
+            return 'macos-latest'
+        return 'ubuntu-latest'
+
+    # Create matrix entries with os, arch, and runner
     matrix = []
     for py, cuda, os_name, arch in variants:
         if py in python_versions:
@@ -85,7 +100,8 @@ def main():
                 "python-version": py,
                 "cuda-version": cuda,
                 "os": os_name,
-                "platform": arch
+                "platform": arch,
+                "runner": get_runner(os_name, arch)
             })
 
     # Output as JSON for GitHub Actions
