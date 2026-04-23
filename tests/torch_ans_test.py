@@ -4,7 +4,7 @@ import torch
 # torch.set_num_threads(multiprocessing.cpu_count())
 
 import torch
-import numpy as np
+# import numpy as np
 import time
 import unittest
 import functools
