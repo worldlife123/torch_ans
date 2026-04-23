@@ -10,10 +10,9 @@ import urllib.request
 import urllib.parse
 from collections import defaultdict
 
-def fetch_pytorch_versions():
+def fetch_pytorch_versions(cuda_versions):
     """Fetch available PyTorch wheel versions from official indices."""
     # Known CUDA versions from PyTorch
-    cuda_versions = ['cpu', 'cu118', 'cu124', 'cu128']
     base_url = "https://download.pytorch.org/whl/{}/torch/"
 
     # Patterns for different OS/platforms
@@ -67,7 +66,13 @@ def fetch_pytorch_versions():
 
 def main():
 
-    python_versions, cuda_versions, variants = fetch_pytorch_versions()
+    # get CUDA versions from command line or use defaults
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch supported PyTorch versions for CI matrix.")
+    parser.add_argument('--cuda-versions', nargs='*', default=['cpu', 'cu118', 'cu124', 'cu128'], help="CUDA versions to check (e.g., cpu, cu102, cu113, cu116)")
+    args = parser.parse_args()
+
+    python_versions, cuda_versions, variants = fetch_pytorch_versions(args.cuda_versions)
 
     # Filter to reasonable versions (PyTorch typically supports recent Python versions)
     python_versions = [v for v in python_versions if tuple(map(int, v.split('.'))) >= (3, 7)]

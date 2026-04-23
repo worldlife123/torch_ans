@@ -21,19 +21,26 @@ jobs:
       - name: Fetch PyTorch versions
         id: fetch
         run: |
-          python scripts/fetch_pytorch_versions.py > versions.json
+          python scripts/fetch_pytorch_versions.py --cuda-versions cpu > versions.json
           matrix=$(jq -c '.matrix' versions.json)
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
   test-matrix:
     needs: setup-matrix
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     env:
       FORCE_CUDA: ${{ matrix.cuda-version != 'cpu' && '1' || '0' }}
+    runs-on: ${{
+      (matrix.os == 'linux' && matrix.platform == 'x86_64' && 'ubuntu-latest') ||
+      (matrix.os == 'linux' && matrix.platform == 'aarch64' && 'ubuntu-24.04-arm') ||
+      (matrix.os == 'windows' && 'windows-latest') ||
+      (matrix.os == 'macos' && matrix.platform == 'x86_64' && 'macos-15-intel') ||
+      (matrix.os == 'macos' && matrix.platform == 'arm64' && 'macos-latest') ||
+      'ubuntu-latest'
+    }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -47,9 +54,9 @@ jobs:
       - name: Install PyTorch (official wheel)
         run: |
           if [ "${{ matrix.cuda-version }}" = "cpu" ]; then
-            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
           else
-            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
+            pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
           fi
       - name: Install build dependencies
         run: pip install setuptools wheel pybind11 pytest
