@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  x86-test-matrix:
+  test-matrix:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,13 +27,19 @@ jobs:
           - os: ubuntu-24.04
             python-version: 3.9
             torch: 2.1.1
-          - os: ubuntu-24.04-arm64
-            python-version: 3.9
-            torch: 2.1.1
           - os: ubuntu-latest
             python-version: 3.11
             torch: 2.7.1
+          - os: ubuntu-24.04-arm
+            python-version: 3.11
+            torch: 2.7.1
           - os: windows-latest
+            python-version: 3.11
+            torch: 2.7.1
+          - os: windows-11-arm
+            python-version: 3.11
+            torch: 2.7.1
+          - os: macos-latest-large
             python-version: 3.11
             torch: 2.7.1
           - os: macos-latest
