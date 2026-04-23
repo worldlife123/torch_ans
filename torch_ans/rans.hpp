@@ -1,6 +1,8 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <cstddef>
+#include <cstdint>
 
 #include "rans_utils.hpp"
 
@@ -8,7 +10,7 @@
 
 // template <size_t STATE_BITS, size_t STREAM_BITS>
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS=0>
-torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves=1, ssize_t preallocate_size=0);
+torch::Tensor rans_init_stream(int64_t size, int64_t num_interleaves=1, int64_t preallocate_size=0);
 
 // template <typename STATE_TYPE, typename STREAM_TYPE>
 // std::vector<py::bytes> rans_flush_stream(// ANSStream stream,
@@ -20,8 +22,8 @@ torch::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings);
 
 std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
   const torch::Tensor& cdfs, const torch::Tensor& cdfs_sizes,
-  ssize_t symbol_precision=8,
-  ssize_t freq_precision=16
+  int64_t symbol_precision=8,
+  int64_t freq_precision=16
 );
 
 #if defined(WITH_CUDA) || defined(WITH_HIP)
@@ -33,9 +35,9 @@ void rans_push_indexed_cuda(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision=16,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4);
+  int64_t bypass_precision=4);
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
 torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
@@ -44,9 +46,9 @@ torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision=16,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4);
+  int64_t bypass_precision=4);
 
   // Batched PMF to quantized CDF declarations
 torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t precision);
@@ -61,9 +63,9 @@ void rans_push_indexed_cpu(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision=16,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4);
+  int64_t bypass_precision=4);
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
 torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
@@ -72,9 +74,9 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision=16,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4);
+  int64_t bypass_precision=4);
 
 // Batched PMF to quantized CDF declarations
 torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision);
@@ -87,13 +89,13 @@ void rans_push(// ANSStream stream,
   std::optional<torch::Tensor> cdfs, 
   std::optional<torch::Tensor> cdfs_sizes, 
   std::optional<torch::Tensor> offsets,
-  ssize_t symbol_precision=8,
-  ssize_t freq_precision=16,
+  int64_t symbol_precision=8,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4)
+  int64_t bypass_precision=4)
 {
-  const ssize_t batch_size = stream.size(0);
-  const ssize_t num_symbols = symbols.size(1);
+  const int64_t batch_size = stream.size(0);
+  const int64_t num_symbols = symbols.size(1);
   const bool use_cuda = stream.device().is_cuda();
 
   if (symbols.size(0) != batch_size) {
@@ -222,10 +224,10 @@ torch::Tensor rans_pop(// ANSStream stream,
   std::optional<torch::Tensor> cdfs, 
   std::optional<torch::Tensor> cdfs_sizes, 
   std::optional<torch::Tensor> offsets,
-  ssize_t symbol_precision=8,
-  ssize_t freq_precision=16,
+  int64_t symbol_precision=8,
+  int64_t freq_precision=16,
   bool bypass_coding=true, 
-  ssize_t bypass_precision=4)
+  int64_t bypass_precision=4)
 {
   torch::Tensor symbols;
   const bool use_cuda = stream.device().is_cuda();

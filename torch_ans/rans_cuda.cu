@@ -21,9 +21,9 @@ __global__ void rans_push_indexed_cuda_kernel(
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> cdfs_accessor,
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> cdfs_sizes_accessor,
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> offsets_accessor,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
     int b = blockIdx.x * blockDim.x + (USE_INTERLEAVED_KERNEL_THREADS ? 0 : threadIdx.x);
     if (b >= stream_accessor.size(0)) return;
@@ -46,7 +46,7 @@ __global__ void rans_push_indexed_cuda_kernel(
 
     auto symbols_ptr = symbols_accessor[b].data();
     auto indexes_ptr = indexes_accessor[b].data();
-    ssize_t num_symbols = symbols_accessor.size(1);
+    int64_t num_symbols = symbols_accessor.size(1);
 
     // __shared__ RANS_STREAM_TYPE stream_cache_ptr[DEFAULT_SHARED_STREAM_CACHE_SIZE];
     // RANS_STREAM_TYPE* stream_cache_mutable_ptr = stream_cache_ptr;
@@ -57,7 +57,7 @@ __global__ void rans_push_indexed_cuda_kernel(
     // __shared__ const RANS_STREAM_TYPE stream_cache_ptr[DEFAULT_SHARED_STREAM_CACHE_SIZE];
     // __shared__ RANS_STREAM_TYPE* stream_cache_ptr_mutable = stream_cache;
     // const auto first_interleave = num_symbols % NUM_INTERLEAVES;
-    // ssize_t i = num_symbols-state_idx-1;
+    // int64_t i = num_symbols-state_idx-1;
     // for (; i >= 0; i-=NUM_INTERLEAVES) {
     //     const auto index = indexes_ptr[i-state_idx];
     //     const auto cdf_ptr = cdfs_accessor[index].data();
@@ -116,9 +116,9 @@ void rans_push_indexed_cuda(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
   // TORCH_CHECK(stream.dtype() == TORCH_TENSOR_DTYPE);
   // TORCH_CHECK(symbols.dtype() == TORCH_TENSOR_DTYPE);
@@ -172,9 +172,9 @@ __global__ void rans_pop_indexed_cuda_kernel(
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> cdfs_accessor,
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> cdfs_sizes_accessor,
   const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> offsets_accessor,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= stream_accessor.size(0)) return;
@@ -194,7 +194,7 @@ __global__ void rans_pop_indexed_cuda_kernel(
     RANS_STREAM_TYPE* stream_ptr = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr) + stream_ptr_offset - 1;
 
     // __shared__ TORCH_TENSOR_TYPE cdf_cache_ptr[DEFAULT_SHARED_STREAM_CACHE_SIZE];
-    // for (ssize_t index = 0; index < cdfs_sizes_accessor.size(0); index++) {
+    // for (int64_t index = 0; index < cdfs_sizes_accessor.size(0); index++) {
     //   auto cdf_size = cdfs_sizes_accessor[index];
     //   auto cdf_ptr = cdfs_accessor[index].data();
     //   memcpy((cdf_cache_ptr + index * cdf_size), cdf_ptr, cdf_size*sizeof(TORCH_TENSOR_TYPE));
@@ -202,9 +202,9 @@ __global__ void rans_pop_indexed_cuda_kernel(
 
     auto symbols_ptr = symbols_accessor[b].data();
     auto indexes_ptr = indexes_accessor[b].data();
-    ssize_t num_symbols = symbols_accessor.size(1);
+    int64_t num_symbols = symbols_accessor.size(1);
 
-    for (ssize_t i = 0; i < num_symbols; i++) {
+    for (int64_t i = 0; i < num_symbols; i++) {
       auto index = indexes_ptr[i];
       auto cdf_size = cdfs_sizes_accessor[index];
       auto cdf_ptr = cdfs_accessor[index].data();
@@ -236,9 +236,9 @@ torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
 
   // TORCH_CHECK(stream.dtype() == TORCH_TENSOR_DTYPE);

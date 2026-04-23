@@ -1,6 +1,9 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #ifdef RANS_CUDA_API
   #define RANS_API __device__
@@ -102,7 +105,7 @@ RANS_API inline RANS_SYMBOL_TYPE binary_search_cdf(RANS_FREQ_TYPE cum_freq,
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename RANS_SYMBOL_TYPE, size_t RANS_STATE_VALID_BITS=0>
 RANS_API inline void rans_push_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE** stream_pptr, 
     RANS_SYMBOL_TYPE raw_val, 
-    ssize_t bypass_precision
+    int64_t bypass_precision
     )
 {
     // RANS_SYMBOL_TYPE raw_val = 0;
@@ -138,7 +141,7 @@ RANS_API inline void rans_push_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_S
     // bypass_syms.push_back(val);
 
     RANS_STATE_TYPE x = *state_ptr;
-    for (ssize_t j = n_bypass-1; j >= 0; j--) {
+    for (int64_t j = n_bypass-1; j >= 0; j--) {
       const RANS_SYMBOL_TYPE bypass_val =
           (raw_val >> (j * bypass_precision)) & max_bypass_val;
       // RANS_FREQ_TYPE freq = 1 << (freq_precision - bypass_precision);
@@ -149,7 +152,7 @@ RANS_API inline void rans_push_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_S
       // bypass_syms.push_back(val);
     }
     RANS_APPEND_BITS(x, stream_pptr, rest_n_bypass, bypass_precision);
-    for (ssize_t j = n_codes_n_bypass-1; j >= 0; j--) {
+    for (int64_t j = n_codes_n_bypass-1; j >= 0; j--) {
       RANS_APPEND_BITS(x, stream_pptr, max_bypass_val, bypass_precision);
     }
 
@@ -167,9 +170,9 @@ RANS_API inline void rans_push_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE
     const RANS_FREQ_TYPE* cdf, 
     const RANS_SYMBOL_TYPE cdf_size, 
     const RANS_SYMBOL_TYPE offset, 
-    ssize_t freq_precision,
+    int64_t freq_precision,
     bool bypass_coding, 
-    ssize_t bypass_precision,
+    int64_t bypass_precision,
     const RANS_FREQ_TYPE* cdf_alias_remap
     )
 {
@@ -322,7 +325,7 @@ RANS_API inline void rans_push_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename RANS_SYMBOL_TYPE, size_t RANS_STATE_VALID_BITS=0>
 RANS_API inline RANS_SYMBOL_TYPE rans_pop_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE** stream_pptr, 
-    ssize_t bypass_precision
+    int64_t bypass_precision
     )
 {
     const RANS_SYMBOL_TYPE max_bypass_val = (1u << bypass_precision) - 1;
@@ -377,9 +380,9 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
     const RANS_FREQ_TYPE* cdf, 
     const RANS_SYMBOL_TYPE cdf_size, 
     const RANS_SYMBOL_TYPE offset, 
-    ssize_t freq_precision,
+    int64_t freq_precision,
     bool bypass_coding, 
-    ssize_t bypass_precision,
+    int64_t bypass_precision,
     const RANS_FREQ_TYPE* inversed_cdf,
     const RANSAliasSamplingCDFTableElement<RANS_FREQ_TYPE>* cdf_alias_table
     )
@@ -532,13 +535,13 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
 
 // See https://github.com/skal65535/fsc/blob/master/alias.c
 template <typename RANS_SYMBOL_TYPE, typename RANS_FREQ_TYPE>
-RANS_API inline bool build_alias_mapping(
+inline bool build_alias_mapping(
   const RANS_FREQ_TYPE* cdf, 
   const RANS_SYMBOL_TYPE cdf_size, 
   RANSAliasSamplingCDFTableElement<RANS_FREQ_TYPE>* cdf_alias_table,
   RANS_FREQ_TYPE* cdf_alias_remap,
-  ssize_t symbol_precision,
-  ssize_t freq_precision
+  int64_t symbol_precision,
+  int64_t freq_precision
 )
 {
   auto max_symbols = cdf_size - 1;
@@ -551,9 +554,9 @@ RANS_API inline bool build_alias_mapping(
   const RANS_SYMBOL_TYPE num_cuts = (1 << symbol_precision); // (max_table_size + cut - 1) / cut;
   if ((num_cuts * cut) != max_table_size) return false;
   
-  RANS_SYMBOL_TYPE symbols[num_cuts];
+  std::vector<RANS_SYMBOL_TYPE> symbols(num_cuts);
   int l = num_cuts, s = 0;
-  RANS_FREQ_TYPE proba[num_cuts];
+  std::vector<RANS_FREQ_TYPE> proba(num_cuts);
   RANS_SYMBOL_TYPE total = 0;
   assert(num_cuts >= max_symbols);
   assert((num_cuts * cut) >= max_table_size);
@@ -623,7 +626,7 @@ RANS_API inline bool build_alias_mapping(
   // }
 
   // Accumulate counts and compute the start_.
-  RANS_FREQ_TYPE c[num_cuts] = { 0 };
+  std::vector<RANS_FREQ_TYPE> c(num_cuts, 0);
   for (s = 0; s < num_cuts; ++s) {
     if (s * cut >= max_table_size) break;
     const int other = cdf_alias_table[s].other_symbol;

@@ -20,9 +20,9 @@ constexpr void constexpr_for(F&& f)
 }
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS>
-torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves, ssize_t preallocate_size) 
+torch::Tensor rans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size) 
 {
-  ssize_t stream_init_size = 1 + preallocate_size / sizeof(DEFAULT_TORCH_TENSOR_TYPE) + num_interleaves * ((sizeof(RANS_STATE_TYPE) + sizeof(DEFAULT_TORCH_TENSOR_TYPE) - 1) / sizeof(DEFAULT_TORCH_TENSOR_TYPE));
+  int64_t stream_init_size = 1 + preallocate_size / sizeof(DEFAULT_TORCH_TENSOR_TYPE) + num_interleaves * ((sizeof(RANS_STATE_TYPE) + sizeof(DEFAULT_TORCH_TENSOR_TYPE) - 1) / sizeof(DEFAULT_TORCH_TENSOR_TYPE));
   auto stream = torch::zeros({size, stream_init_size}, torch::TensorOptions().dtype(DEFAULT_TORCH_TENSOR_DTYPE));
   auto stream_accessor = stream.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
   // stream.index_put_({Slice(), 0}, sizeof(RANS_STATE_TYPE));
@@ -31,7 +31,7 @@ torch::Tensor rans_init_stream(ssize_t size, ssize_t num_interleaves, ssize_t pr
       for (size_t b = start; b < end; b++) {
           stream_accessor[b][0] = sizeof(RANS_STATE_TYPE) * num_interleaves;
           RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
-          for (ssize_t i = 0; i < num_interleaves; i++) {
+          for (int64_t i = 0; i < num_interleaves; i++) {
             state_ptr[i] = RANS_STATE_LOWER_BOUND;
           }
       }
@@ -49,9 +49,9 @@ void rans_push_indexed_cpu(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
 
   AT_DISPATCH_INTEGRAL_TYPES(symbols.scalar_type(), "rans_push_indexed_cpu", [&] {
@@ -68,7 +68,7 @@ void rans_push_indexed_cpu(// ANSStream stream,
     auto batch_size = stream.size(0);
 
     auto symbols_accessor = symbols.accessor<scalar_t, 2>();
-    ssize_t num_symbols = symbols_accessor.size(1);
+    int64_t num_symbols = symbols_accessor.size(1);
 
     auto stream_accessor = stream.accessor<scalar_t, 2>();
     auto indexes_accessor = indexes.accessor<scalar_t, 2>();
@@ -86,8 +86,8 @@ void rans_push_indexed_cpu(// ANSStream stream,
         auto symbols_ptr = symbols_accessor[b].data();
         auto indexes_ptr = indexes_accessor[b].data();
         // reverse coding
-        const ssize_t first_interleave = num_symbols % NUM_INTERLEAVES;
-        ssize_t i = num_symbols-1;
+        const int64_t first_interleave = num_symbols % NUM_INTERLEAVES;
+        int64_t i = num_symbols-1;
         for (; i >= num_symbols-first_interleave; i--) {
           const auto index = indexes_ptr[i];
           const auto cdf_ptr = cdfs_accessor[index].data();
@@ -195,9 +195,9 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
   const torch::Tensor& cdfs, 
   const torch::Tensor& cdfs_sizes, 
   const torch::Tensor& offsets,
-  ssize_t freq_precision,
+  int64_t freq_precision,
   bool bypass_coding, 
-  ssize_t bypass_precision)
+  int64_t bypass_precision)
 {
   torch::Tensor symbols = torch::zeros_like(indexes);
 
@@ -213,7 +213,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
     auto offsets_accessor = offsets.accessor<scalar_t, 1>();
 
     auto symbols_accessor = symbols.accessor<scalar_t, 2>();
-    ssize_t num_symbols = symbols_accessor.size(1);
+    int64_t num_symbols = symbols_accessor.size(1);
 
     using RANS_SYMBOL_TYPE = scalar_t;
     using RANS_FREQ_TYPE = scalar_t;
@@ -226,8 +226,8 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
         RANS_STREAM_TYPE* stream_ptr = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr) + stream_ptr_offset - 1;
         auto symbols_ptr = symbols_accessor[b].data();
         auto indexes_ptr = indexes_accessor[b].data();
-        const ssize_t last_interleave = num_symbols - (NUM_INTERLEAVES-1);
-        ssize_t i;
+        const int64_t last_interleave = num_symbols - (NUM_INTERLEAVES-1);
+        int64_t i;
 
         for (i = 0; i < last_interleave; i+=NUM_INTERLEAVES) {
 
