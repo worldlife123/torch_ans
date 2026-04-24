@@ -86,6 +86,7 @@ jobs:
         with:
           path: results/
       - name: Generate table
+        shell: bash
         run: |
           echo "## Test Results" > table.md
           echo "" >> table.md
@@ -106,6 +107,7 @@ jobs:
           echo "" >> table.md
           echo "Last updated: $(date)" >> table.md
       - name: Create build_status.md
+        shell: bash
         run: mv table.md build_status.md
       - name: Commit changes
         uses: EndBug/add-and-commit@v9
