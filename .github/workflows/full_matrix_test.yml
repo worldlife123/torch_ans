@@ -1,6 +1,9 @@
 name: Full Matrix Test
 
 on:
+  push:
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 
 concurrency:
@@ -13,9 +16,9 @@ jobs:
     outputs:
       matrix: ${{ steps.fetch.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - name: Fetch PyTorch versions
@@ -35,9 +38,9 @@ jobs:
       FORCE_CUDA: ${{ matrix.cuda-version != 'cpu' && '1' || '0' }}
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install pip
@@ -60,3 +63,54 @@ jobs:
         run: python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__, 'CUDA:', torch.cuda.is_available())"
       - name: Run tests
         run: pytest -q tests
+      - name: Create result file
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "PASS" > result.txt
+          else
+            echo "FAIL" > result.txt
+          fi
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
+          path: result.txt
+
+  update-build-status:
+    needs: test-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
+      - name: Generate table
+        run: |
+          echo "## Test Results" > table.md
+          echo "" >> table.md
+          echo "| OS | Platform | Python | CUDA | Status |" >> table.md
+          echo "|----|----------|--------|------|--------|" >> table.md
+          for dir in results/test-result-*; do
+            if [ -d "$dir" ]; then
+              result_file="$dir/result.txt"
+              if [ -f "$result_file" ]; then
+                # Parse dirname: test-result-os-platform-python-cuda
+                dirname=$(basename "$dir")
+                IFS='-' read -r _ os platform python cuda <<< "$dirname"
+                status=$(cat "$result_file")
+                echo "| $os | $platform | $python | $cuda | $status |" >> table.md
+              fi
+            fi
+          done
+          echo "" >> table.md
+          echo "Last updated: $(date)" >> table.md
+      - name: Create build_status.md
+        run: mv table.md build_status.md
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          author_name: GitHub Actions
+          author_email: actions@github.com
+          message: 'Update build status table'
+          add: 'build_status.md'

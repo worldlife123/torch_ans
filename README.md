@@ -6,13 +6,14 @@
 
 # torch_ans
 
-**torch_ans** is a high-performance PyTorch extension for ANS (Asymmetric Numeral Systems) entropy coding, supporting both C++ and CUDA backends. It enables fast, parallel rANS (range ANS) compression and decompression for deep learning and data compression workflows.
+**torch_ans** is a high-performance PyTorch extension for ANS (Asymmetric Numeral Systems) entropy coding, supporting both C++ and CUDA backends across multiple platforms including Linux, macOS, and Windows. It enables fast, parallel rANS (range ANS) compression and decompression for deep learning and data compression workflows.
 This extension is designed as an efficient, extensible replacement to [torchac](https://github.com/fab-jul/torchac) and [CompressAI](https://github.com/InterDigitalInc/CompressAI) range coding.
 
 ## Features
 
 - **High-speed ANS compression/decompression**: Efficient encoding and decoding using rANS, suitable for large-scale data and neural network applications.
 - **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration for batch processing and high throughput.
+- **Multi-platform support**: Compatible with Linux/macOS/Windows OS and x86_64/aarch64 based platforms, provided that PyTorch and the necessary build tools (C++ compiler, CUDA toolkit if applicable) are available on that platform.
 - **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
 - **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
@@ -44,6 +45,7 @@ CUDA_VISIBLE_DEVICES= pip install . --no-build-isolation
 ```
 
 Note that this process may install the latest CPU-only PyTorch version. If you would like to use a CUDA-enabled PyTorch version, or you have already install a specific PyTorch version according to the [official website](https://pytorch.org/get-started/locally/), install without isolated build system. This is important for PyTorch version compability!
+
 ```bash
 pip install pybind11
 pip install . --no-build-isolation
@@ -54,16 +56,6 @@ If you would like to disable CUDA when building:
 ```bash
 CUDA_VISIBLE_DEVICES= pip install .
 ```
-
-### CUDA on Jetson (beta)
-
-If you want CUDA support on Jetson, build with a matching ARM64 PyTorch/CUDA environment and set the CUDA arch list appropriately, for example:
-```bash
-export TORCH_CUDA_ARCH_LIST="5.3;6.2;7.2"
-pip install . --no-build-isolation
-```
-
-Use --no-build-isolation so pip reuses your installed arm64 torch instead of trying to install a new one in an isolated build env.
 
 ## Usage
 
@@ -414,6 +406,10 @@ If data size is extremely small, you could try rans32 or rans32_16 to reduce ini
 **Q: What Python and PyTorch versions are supported?**
 
 A: Python >= 3.7 and PyTorch >= 1.10 are recommended. Earlier versions may work but are not tested.
+
+**Q: What platforms are supported?**
+
+A: torch_ans supports Linux (x86_64/aarch64), macOS (x86_64/aarch64), and Windows (x86_64) platforms. Ensure you have a compatible C++ compiler and optionally CUDA toolkit (for GPU support) installed on your system.
 
 **Q: How do I enable CUDA support?**
 
