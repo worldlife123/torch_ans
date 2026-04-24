@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+pytest.importorskip("pytest_benchmark")
+
 from torch_ans.utils import TorchANSInterface
 
 

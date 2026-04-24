@@ -74,12 +74,12 @@ jobs:
             echo "FAIL" > result.txt
           fi
       - name: Upload result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: result.txt
       - name: Upload benchmark artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: benchmark.json

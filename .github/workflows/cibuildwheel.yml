@@ -45,7 +45,7 @@ jobs:
           python -m cibuildwheel --output-dir wheelhouse
 
       - name: Upload built wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.python }}-torch-${{ matrix.torch_version }}-${{ matrix.cuda }}
           path: wheelhouse/*.whl
