@@ -14,12 +14,11 @@ def get_extension_config():
     """
     # Import here so an environment that already has torch can be used for local builds
     from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
+    try:
+        from torch.utils.cpp_extension import ROCMExtension
+    except ImportError:
+        ROCMExtension = None
     import torch
-    # TODO: Add ROCMExtension import
-    # try:
-    #     from torch.utils.cpp_extension import ROCMExtension
-    # except ImportError:
-    #     ROCMExtension = None
 
     extension_dir = "torch_ans"
     sources = glob(f"{extension_dir}/*.cpp")
@@ -45,14 +44,14 @@ def get_extension_config():
         ext_type = CUDAExtension
         define_macros += [("WITH_CUDA", None)]
         extra_compile_args["nvcc"] = ["-O3", "-std=c++17"]
-    # elif getattr(torch.version, "hip", None) is not None or os.getenv("FORCE_ROCM", "0") == "1":
-    #     sources += glob(f"{extension_dir}/*.hip")
-    #     if ROCMExtension is not None:
-    #         ext_type = ROCMExtension
-    #         define_macros += [("WITH_HIP", None)]
-    #         extra_compile_args["hipcc"] = ["-O3", "-std=c++17"]
-    #     else:
-    #         ext_type = CppExtension  # fallback if ROCMExtension not available
+    elif getattr(torch.version, "hip", None) is not None or os.getenv("FORCE_ROCM", "0") == "1":
+        sources += glob(f"{extension_dir}/*.cu")
+        if ROCMExtension is not None:
+            ext_type = ROCMExtension
+            define_macros += [("WITH_HIP", None)]
+            extra_compile_args["hipcc"] = ["-O3", "-std=c++17"]
+        else:
+            ext_type = CppExtension  # fallback if ROCMExtension not available
     else:
         ext_type = CppExtension
 

@@ -1,6 +1,10 @@
 #include <torch/extension.h>
+#if defined(WITH_CUDA)
 #include <cuda.h>
 #include <cuda_runtime.h>
+#elif defined(WITH_HIP)
+#include <hip/hip_runtime.h>
+#endif
 
 // enable compiling rans_utils for kernel call
 #define RANS_CUDA_API
@@ -345,7 +349,11 @@ torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t p
   int threads = 256;
   int blocks = (B + threads - 1) / threads;
   fix_cdf_batch_kernel<<<blocks, threads>>>(cdf_ptr, B, N);
+#if defined(WITH_CUDA)
   cudaDeviceSynchronize();
+#elif defined(WITH_HIP)
+  hipDeviceSynchronize();
+#endif
 
   if (pmf.dim() == 1) {
     return cdf_contig[0];

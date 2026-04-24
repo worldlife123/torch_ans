@@ -38,6 +38,12 @@ To force CUDA build (if not auto-detected):
 FORCE_CUDA=1 pip install . --no-build-isolation
 ```
 
+To force ROCm/AMD build when using a ROCm-enabled PyTorch installation:
+
+```bash
+FORCE_ROCM=1 pip install . --no-build-isolation
+```
+
 Or disable CUDA build if you cannot properly compile CUDA code with:
 
 ```bash
@@ -435,9 +441,19 @@ In constrast, interleaved states corresponds to a single bitstream, and is seque
 
 **Q: How to choose parameters like State Bits, Stream Bits and Freq Bits? What is their relation to stream size and memory occupation?**
 
-To be simple, always use rans64 configuration if data size is not extremely small (less than 1KB) and you are not sensitive about memory occupation!
+A: To be simple, always use rans64 configuration if data size is not extremely small (less than 1KB) and you are not sensitive about memory occupation!
 If data size is extremely small, you could try rans32 or rans32_16 to reduce initial state.
 
+**Q: Why isn't GPU throughput significantly higher than CPU? Some existing implementation like [dietgpu](https://github.com/facebookresearch/dietgpu) achieve over 200GB/s but torch_ans have only 6GB/s throughput!**
+
+A: The foundamental idea of torch_ans acceleration is simply parallel ANS coding. 
+For simplicity, we use the same set of implementation logic for both CPU and GPU in `rans_utils.hpp`, which indicates that hardware-specific optimizations are not adopted.
+For example, dietgpu adopt [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) to efficiently distribute interleaved push/pop steps over threads. 
+On the contrary, torch_ans implement non-interleaved push/pop steps based on conditional blocks (if-else) similar to [FSE](https://github.com/Cyan4973/FiniteStateEntropy), which results in different threads in a warp take separate paths, reducing throughput. Currently we define DEFAULT_NUM_THREADS_PER_BLOCK=1 to achieve best GPU throughput, and using more threads reduces throughput.
+
+**Q: How to achieve even higher throughput on GPU?**
+
+A: Personally I'm not familiar with CUDA programming. You can refer to [Recoil](https://github.com/lin-toto/recoil) or [dietgpu](https://github.com/facebookresearch/dietgpu), which share the same idea of using parallel ANS stream but reports much better GPU performance. From my observation of their code, both of them implement 32-lane interleaved ANS with CUDA warp-level primitives, so this might be the trick.
 
 ### Technical
 
@@ -495,10 +511,11 @@ This library is developed for research-purpose only, and not as a robust everyda
   ```
 
 ### TODO
-- Fix interleave ANS state on CUDA
 - Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API
+- Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
+- Implement lookup table logic in push/pop steps for possible acceleration (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
 - Implement tANS and its variants (similar to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
-- Support for other backends supported in PyTorch (such as ROCM)
+- Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression
 
 # Related Projects
@@ -509,6 +526,7 @@ This library is developed for research-purpose only, and not as a robust everyda
 - [torchac](https://github.com/fab-jul/torchac): Fast arithmetic coding library for PyTorch, includes ANS variants.
 - [ryg_rans](https://github.com/rygorous/ryg_rans): Reference C implementation of rANS.
 - [fsc](https://github.com/skal65535/fsc): rANS implementation with alias mapping.
+- [dietgpu](https://github.com/facebookresearch/dietgpu): An ultra-fast parallel rANS implementation (over 200GB/s) on NVIDIA GPUs.
 - [Recoil](https://github.com/lin-toto/recoil): A header-only C++20 rANS library including parallel rANS algorithms.
 - [FiniteStateEntropy](https://github.com/Cyan4973/FiniteStateEntropy): Reference C implementation of tANS/FSE by Yann Collet.
 - [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding): Provides a numpy-based unified rANS/tANS interface implementation.

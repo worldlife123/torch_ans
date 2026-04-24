@@ -50,7 +50,7 @@ def fetch_pytorch_versions(cuda_versions):
                 wheel = urllib.parse.unquote(wheel)
                 # Extract version info from wheel name
                 # Format: torch-X.Y.Z+{cpu|cuXXX}-cp{PYTHON}-cp{PYTHON}-PLATFORM.whl
-                match = re.search(r'torch-[^+-]+(?:\+([^+-]+))?-cp(\d+)-cp\d+-[^.]+\.whl', wheel)
+                match = re.search(r'torch-[^+-]+(?:\+([^+-]+))?-cp(\d+)-cp\d+m?-[^.]+\.whl', wheel)
                 if match:
                     cuda_part = match.group(1) or 'cpu'
                     py_tag = match.group(2)
