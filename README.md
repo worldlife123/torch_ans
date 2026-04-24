@@ -57,6 +57,44 @@ If you would like to disable CUDA when building:
 CUDA_VISIBLE_DEVICES= pip install .
 ```
 
+## Testing and coverage
+
+Install the development dependencies and run the Python unit tests:
+
+```bash
+pip install . --no-build-isolation
+pip install pytest pytest-cov gcovr
+pytest -q
+```
+
+Run Python coverage for the package:
+
+```bash
+pytest --cov=torch_ans --cov-report=term-missing --cov-report=html
+```
+
+To track throughput with `pytest-benchmark`, install the benchmark dependency and run:
+
+```bash
+pip install pytest-benchmark
+pytest --benchmark-only
+```
+
+To collect native C/C++ coverage for the compiled extension, build with coverage instrumentation and run tests from the repository root:
+
+```bash
+ENABLE_COVERAGE=1 CUDA_VISIBLE_DEVICES= python setup.py build_ext --inplace
+ENABLE_COVERAGE=1 pytest -q
+```
+
+Then generate a native coverage report with `gcovr`:
+
+```bash
+gcovr -r . --html-details -o native_coverage.html
+```
+
+This produces Python coverage output in `htmlcov/` and native C/C++ coverage output in `native_coverage.html`.
+
 ## Usage
 
 torch_ans supports a wide range of rANS variants, including different state, stream, and frequency sizes, interleaved coding, and parallel coding on CPU or GPU. 

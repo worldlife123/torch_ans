@@ -27,16 +27,18 @@ def get_extension_config():
 
     # extra_compile_args = {"cxx": ["-std=c++17", "-O3", '-fopenmp', '-march=native']}
     extra_compile_args = {"cxx": ["-std=c++17", "-O3"]}
+    extra_link_args = []
+
     if sys.platform == "win32":
         extra_compile_args["cxx"] = ["/std:c++17", "/O2", "/openmp"]
     elif sys.platform == "darwin":
         extra_compile_args["cxx"] += ["-mmacosx-version-min=10.14"]
     else:
         extra_compile_args["cxx"] += ["-fopenmp"]
-    
+
     if platform.machine() == "x86_64":
-        extra_compile_args["cxx"] += ["-march=native"]    
-    
+        extra_compile_args["cxx"] += ["-march=native"]
+
     define_macros = []
     if torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1":
         sources += glob(f"{extension_dir}/*.cu")
@@ -54,6 +56,14 @@ def get_extension_config():
     else:
         ext_type = CppExtension
 
+    if os.getenv("ENABLE_COVERAGE", "0") == "1":
+        extra_compile_args["cxx"] += ["-fprofile-arcs", "-ftest-coverage"]
+        extra_link_args += ["-fprofile-arcs", "-ftest-coverage"]
+        if sys.platform != "darwin":
+            extra_link_args += ["-lgcov"]
+        if "nvcc" in extra_compile_args:
+            extra_compile_args["nvcc"] += ["-Xcompiler", "-fprofile-arcs", "-Xcompiler", "-ftest-coverage"]
+
     ext_modules = [
         ext_type(
             "torch_ans._C",
@@ -61,6 +71,7 @@ def get_extension_config():
             include_dirs=include_dirs,
             define_macros=define_macros,
             extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
         )
     ]
     cmdclass = {"build_ext": BuildExtension}

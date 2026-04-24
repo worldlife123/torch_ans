@@ -56,13 +56,15 @@ jobs:
             pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
           fi
       - name: Install build dependencies
-        run: pip install setuptools wheel pybind11 pytest
+        run: pip install setuptools wheel pybind11 pytest pytest-benchmark
       - name: Build and install extension
         run: pip install --no-build-isolation .
       - name: Show versions
         run: python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__, 'CUDA:', torch.cuda.is_available())"
       - name: Run tests
         run: pytest -q tests
+      - name: Run benchmarks
+        run: pytest --benchmark-only --benchmark-json=benchmark.json tests/test_benchmarks.py
       - name: Create result file
         shell: bash
         run: |
@@ -76,6 +78,11 @@ jobs:
         with:
           name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: result.txt
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
+          path: benchmark.json
 
   update-build-status:
     needs: test-matrix
@@ -83,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Download all results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: results/
       - name: Generate table
@@ -99,21 +106,30 @@ jobs:
               if [ -f "$result_file" ]; then
                 # Parse dirname: test-result-os-platform-python-cuda
                 dirname=$(basename "$dir")
-                IFS='-' read -r _ os platform python cuda <<< "$dirname"
+                dirname=${dirname#test-result-}
+                IFS='-' read -r os platform python cuda <<< "$dirname"
                 status=$(cat "$result_file")
+                if [ "$status" = "PASS" ]; then
+                  status="✅"
+                else
+                  status="❌"
+                fi
                 echo "| $os | $platform | $python | $cuda | $status |" >> table.md
               fi
             fi
           done
           echo "" >> table.md
           echo "Last updated: $(date)" >> table.md
+      - name: Generate benchmark table
+        shell: bash
+        run: python scripts/generate_benchmark_status.py results benchmark_status.md
       - name: Create build_status.md
         shell: bash
         run: mv table.md build_status.md
       - name: Commit changes
-        uses: EndBug/add-and-commit@v9
+        uses: EndBug/add-and-commit@v10
         with:
           author_name: GitHub Actions
           author_email: actions@github.com
-          message: 'Update build status table'
-          add: 'build_status.md'
+          message: 'Update build and benchmark status tables'
+          add: 'build_status.md benchmark_status.md'
