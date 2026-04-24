@@ -64,6 +64,7 @@ jobs:
       - name: Run tests
         run: pytest -q tests
       - name: Create result file
+        shell: bash
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             echo "PASS" > result.txt
