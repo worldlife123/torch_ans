@@ -21,5 +21,5 @@ license = { file="LICENSE" }
 dev = ["pytest", "pytest-cov", "pytest-benchmark", "gcovr"]
 
 [tool.pytest.ini_options]
-addopts = "--cov=torch_ans --cov-report=html --cov-report=term-missing"
+# addopts = "--cov=torch_ans --cov-report=html --cov-report=term-missing"
 testpaths = ["tests"]
