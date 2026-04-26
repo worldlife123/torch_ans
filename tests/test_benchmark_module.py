@@ -20,13 +20,13 @@ class TestTorchANSBenchmarkCLI(unittest.TestCase):
     def test_benchmark_parallel_states_cuda_skips_when_unavailable(self):
         try:
             results = benchmark_parallel_states(batch_sizes=[1024], data_size_mb=1.0, device="cuda")
+            self.assertTrue(len(results) == 1)
+            self.assertTrue(results[0][0] == 1024)
         except RuntimeError as exc:
             if "not compiled with GPU support" in str(exc):
                 self.skipTest("torch_ans is not compiled with GPU support")
                 return
         
-        self.assertTrue(len(results) == 1)
-        self.assertTrue(results[0][0] == 1)
 
     def test_benchmark_parallel_states_cpu_pop_mode(self):
         results = benchmark_parallel_states(batch_sizes=[1, 8], data_size_mb=1.0, device="cpu", mode="pop")
