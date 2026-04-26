@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-tests-${{ github.ref }}-${{ github.sha }}
+  group: ci-fulltest-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
