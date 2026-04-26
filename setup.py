@@ -39,12 +39,12 @@ def get_extension_config():
         extra_compile_args["cxx"] += ["-march=native"]
 
     define_macros = []
-    if torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1":
+    if (torch.cuda.is_available() and os.getenv("WITH_CUDA", "0") == "1") or os.getenv("FORCE_CUDA", "0") == "1":
         sources += glob(f"{extension_dir}/*.cu")
         ext_type = CUDAExtension
         define_macros += [("WITH_CUDA", None)]
         extra_compile_args["nvcc"] = ["-O3", "-std=c++17"]
-    elif getattr(torch.version, "hip", None) is not None or os.getenv("FORCE_ROCM", "0") == "1":
+    elif (getattr(torch.version, "hip", None) is not None and os.getenv("WITH_HIP", "0") == "1") or os.getenv("FORCE_ROCM", "0") == "1":
         sources += glob(f"{extension_dir}/*.cu")
         if ROCMExtension is not None:
             ext_type = ROCMExtension
@@ -79,6 +79,8 @@ def get_extension_config():
         build_ver_path = os.path.join(extension_dir, "_torch_build_version.py")
         with open(build_ver_path, "w") as _bv:
             _bv.write(f"BUILD_TORCH_VERSION = {repr(torch.__version__)}\n")
+            _bv.write(f"BUILD_WITH_CUDA = {repr('nvcc' in extra_compile_args)}\n")
+            _bv.write(f"BUILD_WITH_HIP = {repr('hipcc' in extra_compile_args)}\n")
     except Exception:
         # If writing fails for any reason, continue; the runtime check will be skipped.
         pass
@@ -97,7 +99,7 @@ if any(arg in sys.argv for arg in ("build_ext", "bdist_wheel", "bdist_egg", "ins
 
 setup(
     name="torch_ans",
-    version="0.1.2",
+    version="0.1.3",
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     author="worldlife",
     author_email="worldlife@sjtu.edu.cn",

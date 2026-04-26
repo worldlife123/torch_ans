@@ -120,7 +120,8 @@ class TestTorchANS(unittest.TestCase):
         except RuntimeError as e:
             # If the native extension wasn't compiled with GPU support, skip this CUDA variant gracefully
             if device == "cuda" and "not compiled with GPU support" in str(e):
-                print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
+                # print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
+                self.skipTest("torch_ans is not compiled with GPU support")
                 return
             raise
         byte_strings = rans_stream_to_byte_strings(stream.cpu() if device == "cuda" else stream)
@@ -137,7 +138,8 @@ class TestTorchANS(unittest.TestCase):
             decoded = pop_func(stream)
         except RuntimeError as e:
             if device == "cuda" and "not compiled with GPU support" in str(e):
-                print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
+                # print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
+                self.skipTest("torch_ans is not compiled with GPU support")
                 return
             raise
         if device == "cuda":
@@ -147,17 +149,10 @@ class TestTorchANS(unittest.TestCase):
         self.assertFalse((data.cpu() != decoded.cpu()).any())
         # self.assertEqual(data.reshape(-1).tolist(), decoded.reshape(-1).tolist())
 
-    def test_rans_batch_coding(self):
-        from torch_ans._C import (
-            rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_alias_build_table,
-            rans64_init_stream, rans64_push, rans64_pop, rans64_i4_push, rans64_i4_pop, rans64_alias_push, rans64_alias_pop,
-            rans32_init_stream, rans32_push, rans32_pop, rans32_i4_push, rans32_i4_pop, rans32_alias_push, rans32_alias_pop,
-            rans32_16_init_stream, rans32_16_push, rans32_16_pop, rans32_16_i4_push, rans32_16_i4_pop
-        )
+    def _prepare_rans_batch_coding(self, num_batch=1000, num_dists=8, symbol_precision=8, freq_precision=15):
+        from torch_ans._C import rans_alias_build_table
 
-        symbol_precision = 8
-        freq_precision = 15
-        num_batch, num_dists, num_symbols = 1000, 8, (1 << symbol_precision) - 1
+        num_symbols = (1 << symbol_precision) - 1
         bypass_num = 0
         data_num = 3 * 1024
 
@@ -168,68 +163,275 @@ class TestTorchANS(unittest.TestCase):
         cdfs_with_alias_remap, cdfs_with_alias_table = rans_alias_build_table(
             cdfs, cdfs_sizes, symbol_precision=symbol_precision, freq_precision=freq_precision
         )
+        return data, indexes, cdfs, cdfs_sizes, offsets, cdfs_with_alias_remap, cdfs_with_alias_table
 
-        # Non-alias methods
-        non_alias_methods = [
-            ("Rans32", "cpu", functools.partial(rans32_init_stream, num_batch), rans32_push, rans32_pop),
-            ("Rans32", "cuda", functools.partial(rans32_init_stream, num_batch), rans32_push, rans32_pop),
-            # Interleaved methods (CPU only)
-            ("Rans32(4way-interleaved)", "cpu", functools.partial(rans32_init_stream, num_batch, 4), rans32_i4_push, rans32_i4_pop),
-            ("Rans32/16", "cpu", functools.partial(rans32_16_init_stream, num_batch), rans32_16_push, rans32_16_pop),
-            ("Rans32/16", "cuda", functools.partial(rans32_16_init_stream, num_batch), rans32_16_push, rans32_16_pop),
-            ("Rans32/16(4way-interleaved)", "cpu", functools.partial(rans32_16_init_stream, num_batch, 4), rans32_16_i4_push, rans32_16_i4_pop),
-            ("Rans64", "cpu", functools.partial(rans64_init_stream, num_batch), rans64_push, rans64_pop),
-            ("Rans64", "cuda", functools.partial(rans64_init_stream, num_batch), rans64_push, rans64_pop),
-            ("Rans64(4way-interleaved)", "cpu", functools.partial(rans64_init_stream, num_batch, 4), rans64_i4_push, rans64_i4_pop),
-        ]
+    # def test_rans_batch_coding(self):
+    #     from torch_ans._C import (
+    #         rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_alias_build_table,
+    #         rans64_init_stream, rans64_push, rans64_pop, rans64_i4_push, rans64_i4_pop, rans64_alias_push, rans64_alias_pop,
+    #         rans32_init_stream, rans32_push, rans32_pop, rans32_i4_push, rans32_i4_pop, rans32_alias_push, rans32_alias_pop,
+    #         rans32_16_init_stream, rans32_16_push, rans32_16_pop, rans32_16_i4_push, rans32_16_i4_pop
+    #     )
 
-        # Alias methods
-        alias_methods = [
-            ("Rans32(alias)", "cpu",
-                functools.partial(rans32_init_stream, num_batch),
-                functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
-            ("Rans32(alias)", "cuda",
-                functools.partial(rans32_init_stream, num_batch),
-                functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
-            ("Rans64(alias)", "cpu",
-                functools.partial(rans64_init_stream, num_batch),
-                functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
-            ("Rans64(alias)", "cuda",
-                functools.partial(rans64_init_stream, num_batch),
-                functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
-        ]
+    #     symbol_precision = 8
+    #     freq_precision = 15
+    #     num_batch, num_dists, num_symbols = 1000, 8, (1 << symbol_precision) - 1
+    #     bypass_num = 0
+    #     data_num = 3 * 1024
 
-        with torch.no_grad():
-            # Test non-alias methods
-            for name, device, init_func, push_func, pop_func in non_alias_methods:
-                if not torch.cuda.is_available() and device == "cuda":
-                    continue
-                self._test_torch_ans(
-                    name + f" ({device})",
-                    data,
-                    init_func=init_func,
-                    push_func=functools.partial(push_func, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                    pop_func=functools.partial(pop_func, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
-                    device=device
-                )
+    #     data_shape = (num_batch, data_num)
+    #     data = torch.randint(0, num_symbols + bypass_num, data_shape, dtype=torch.int32)
+    #     indexes = torch.randint(0, num_dists, data_shape, dtype=torch.int32)
+    #     cdfs, cdfs_sizes, offsets = self._generate_rans_params(num_dists, num_symbols, freq_precision=freq_precision)
+    #     cdfs_with_alias_remap, cdfs_with_alias_table = rans_alias_build_table(
+    #         cdfs, cdfs_sizes, symbol_precision=symbol_precision, freq_precision=freq_precision
+    #     )
 
-            # Test alias methods
-            for name, device, init_func, push_func, pop_func in alias_methods:
-                # Skip CUDA alias tests on systems without CUDA
-                if not torch.cuda.is_available() and device == "cuda":
-                    continue
-                self._test_torch_ans(
-                    name + f" ({device})",
-                    data,
-                    init_func=init_func,
-                    push_func=push_func,
-                    pop_func=pop_func,
-                    device=device
-                )
+    #     # Non-alias methods
+    #     non_alias_methods = [
+    #         ("Rans32", "cpu", functools.partial(rans32_init_stream, num_batch), rans32_push, rans32_pop),
+    #         ("Rans32", "cuda", functools.partial(rans32_init_stream, num_batch), rans32_push, rans32_pop),
+    #         # Interleaved methods (CPU only)
+    #         ("Rans32(4way-interleaved)", "cpu", functools.partial(rans32_init_stream, num_batch, 4), rans32_i4_push, rans32_i4_pop),
+    #         ("Rans32/16", "cpu", functools.partial(rans32_16_init_stream, num_batch), rans32_16_push, rans32_16_pop),
+    #         ("Rans32/16", "cuda", functools.partial(rans32_16_init_stream, num_batch), rans32_16_push, rans32_16_pop),
+    #         ("Rans32/16(4way-interleaved)", "cpu", functools.partial(rans32_16_init_stream, num_batch, 4), rans32_16_i4_push, rans32_16_i4_pop),
+    #         ("Rans64", "cpu", functools.partial(rans64_init_stream, num_batch), rans64_push, rans64_pop),
+    #         ("Rans64", "cuda", functools.partial(rans64_init_stream, num_batch), rans64_push, rans64_pop),
+    #         ("Rans64(4way-interleaved)", "cpu", functools.partial(rans64_init_stream, num_batch, 4), rans64_i4_push, rans64_i4_pop),
+    #     ]
+
+    #     # Alias methods
+    #     alias_methods = [
+    #         ("Rans32(alias)", "cpu",
+    #             functools.partial(rans32_init_stream, num_batch),
+    #             functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #             functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
+    #         ("Rans32(alias)", "cuda",
+    #             functools.partial(rans32_init_stream, num_batch),
+    #             functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #             functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
+    #         ("Rans64(alias)", "cpu",
+    #             functools.partial(rans64_init_stream, num_batch),
+    #             functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #             functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
+    #         ("Rans64(alias)", "cuda",
+    #             functools.partial(rans64_init_stream, num_batch),
+    #             functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #             functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision)),
+    #     ]
+
+    #     with torch.no_grad():
+    #         # Test non-alias methods
+    #         for name, device, init_func, push_func, pop_func in non_alias_methods:
+    #             if not torch.cuda.is_available() and device == "cuda":
+    #                 continue
+    #             self._test_torch_ans(
+    #                 name + f" ({device})",
+    #                 data,
+    #                 init_func=init_func,
+    #                 push_func=functools.partial(push_func, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #                 pop_func=functools.partial(pop_func, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=freq_precision),
+    #                 device=device
+    #             )
+
+    #         # Test alias methods
+    #         for name, device, init_func, push_func, pop_func in alias_methods:
+    #             # Skip CUDA alias tests on systems without CUDA
+    #             if not torch.cuda.is_available() and device == "cuda":
+    #                 continue
+    #             self._test_torch_ans(
+    #                 name + f" ({device})",
+    #                 data,
+    #                 init_func=init_func,
+    #                 push_func=push_func,
+    #                 pop_func=pop_func,
+    #                 device=device
+    #             )
+
+    def test_rans32_cpu_batch_coding(self):
+        from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32",
+            data,
+            init_func=functools.partial(rans32_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans64_cpu_batch_coding(self):
+        from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans64",
+            data,
+            init_func=functools.partial(rans64_init_stream, data.shape[0]),
+            push_func=functools.partial(rans64_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans64_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans32_alias_cpu_batch_coding(self):
+        from torch_ans._C import rans32_init_stream, rans32_alias_push, rans32_alias_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, cdfs_with_alias_remap, cdfs_with_alias_table = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32(alias)",
+            data,
+            init_func=functools.partial(rans32_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans64_alias_cpu_batch_coding(self):
+        from torch_ans._C import rans64_init_stream, rans64_alias_push, rans64_alias_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, cdfs_with_alias_remap, cdfs_with_alias_table = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans64(alias)",
+            data,
+            init_func=functools.partial(rans64_init_stream, data.shape[0]),
+            push_func=functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans32_cuda_batch_coding(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32",
+            data,
+            init_func=functools.partial(rans32_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cuda"
+        )
+
+    def test_rans64_cuda_batch_coding(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans64",
+            data,
+            init_func=functools.partial(rans64_init_stream, data.shape[0]),
+            push_func=functools.partial(rans64_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans64_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cuda"
+        )
+
+    def test_rans32_4way_cpu_batch_coding(self):
+        from torch_ans._C import rans32_init_stream, rans32_i4_push, rans32_i4_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32(4way-interleaved)",
+            data,
+            init_func=functools.partial(rans32_init_stream, data.shape[0], 4),
+            push_func=functools.partial(rans32_i4_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_i4_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans32_16_cpu_batch_coding(self):
+        from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32/16",
+            data,
+            init_func=functools.partial(rans32_16_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_16_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_16_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans32_16_cuda_batch_coding(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32/16",
+            data,
+            init_func=functools.partial(rans32_16_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_16_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_16_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cuda"
+        )
+
+    def test_rans32_16_4way_cpu_batch_coding(self):
+        from torch_ans._C import rans32_16_init_stream, rans32_16_i4_push, rans32_16_i4_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32/16(4way-interleaved)",
+            data,
+            init_func=functools.partial(rans32_16_init_stream, data.shape[0], 4),
+            push_func=functools.partial(rans32_16_i4_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_16_i4_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans64_4way_cpu_batch_coding(self):
+        from torch_ans._C import rans64_init_stream, rans64_i4_push, rans64_i4_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, _, _ = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans64(4way-interleaved)",
+            data,
+            init_func=functools.partial(rans64_init_stream, data.shape[0], 4),
+            push_func=functools.partial(rans64_i4_push, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans64_i4_pop, indexes=indexes, cdfs=cdfs, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cpu"
+        )
+
+    def test_rans32_alias_cuda_batch_coding(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        from torch_ans._C import rans32_init_stream, rans32_alias_push, rans32_alias_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, cdfs_with_alias_remap, cdfs_with_alias_table = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans32(alias)",
+            data,
+            init_func=functools.partial(rans32_init_stream, data.shape[0]),
+            push_func=functools.partial(rans32_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans32_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cuda"
+        )
+
+    def test_rans64_alias_cuda_batch_coding(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+
+        from torch_ans._C import rans64_init_stream, rans64_alias_push, rans64_alias_pop
+
+        data, indexes, cdfs, cdfs_sizes, offsets, cdfs_with_alias_remap, cdfs_with_alias_table = self._prepare_rans_batch_coding()
+        self._test_torch_ans(
+            "Rans64(alias)",
+            data,
+            init_func=functools.partial(rans64_init_stream, data.shape[0]),
+            push_func=functools.partial(rans64_alias_push, indexes=indexes, cdfs=cdfs_with_alias_remap, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            pop_func=functools.partial(rans64_alias_pop, indexes=indexes, cdfs=cdfs_with_alias_table, cdfs_sizes=cdfs_sizes, offsets=offsets, freq_precision=15),
+            device="cuda"
+        )
 
     # High-level API tests moved to tests/test_high_level_api.py
 

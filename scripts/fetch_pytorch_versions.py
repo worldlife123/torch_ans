@@ -49,7 +49,7 @@ def fetch_pytorch_versions(cuda_versions):
             for wheel in wheels:
                 wheel = urllib.parse.unquote(wheel)
                 # Extract version info from wheel name
-                # Format: torch-X.Y.Z+{cpu|cuXXX}-cp{PYTHON}-cp{PYTHON}-PLATFORM.whl
+                # Format: torch-X.Y.Z+{cpu|cuXXX}-cp{PYTHON}-cp{PYTHON}(m)-PLATFORM.whl
                 match = re.search(r'torch-[^+-]+(?:\+([^+-]+))?-cp(\d+)-cp\d+m?-[^.]+\.whl', wheel)
                 if match:
                     cuda_part = match.group(1) or 'cpu'

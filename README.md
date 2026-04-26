@@ -22,7 +22,8 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 
 
 ### From PyPI
-It is recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`
+It is recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
+
 ```bash
 pip install torch_ans --no-build-isolation
 ```
@@ -32,35 +33,16 @@ pip install torch_ans --no-build-isolation
 pip install . --no-build-isolation
 ```
 
-To force CUDA build (if not auto-detected):
+To build with CUDA support:
 
 ```bash
-FORCE_CUDA=1 pip install . --no-build-isolation
+WITH_CUDA=1 pip install . --no-build-isolation
 ```
 
-To force ROCm/AMD build when using a ROCm-enabled PyTorch installation:
+To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation:
 
 ```bash
-FORCE_ROCM=1 pip install . --no-build-isolation
-```
-
-Or disable CUDA build if you cannot properly compile CUDA code with:
-
-```bash
-CUDA_VISIBLE_DEVICES= pip install . --no-build-isolation
-```
-
-Note that this process may install the latest CPU-only PyTorch version. If you would like to use a CUDA-enabled PyTorch version, or you have already install a specific PyTorch version according to the [official website](https://pytorch.org/get-started/locally/), install without isolated build system. This is important for PyTorch version compability!
-
-```bash
-pip install pybind11
-pip install . --no-build-isolation
-```
-
-If you would like to disable CUDA when building:
-
-```bash
-CUDA_VISIBLE_DEVICES= pip install .
+WITH_HIP=1 pip install . --no-build-isolation
 ```
 
 ## Testing and coverage
@@ -89,7 +71,7 @@ pytest --benchmark-only
 To collect native C/C++ coverage for the compiled extension, build with coverage instrumentation and run tests from the repository root:
 
 ```bash
-ENABLE_COVERAGE=1 CUDA_VISIBLE_DEVICES= python setup.py build_ext --inplace
+ENABLE_COVERAGE=1 python setup.py build_ext --inplace
 ENABLE_COVERAGE=1 pytest -q
 ```
 
@@ -155,76 +137,60 @@ Increasing the number of parallel states (`B`) generally improves throughput, bu
 - For large datasets, GPUs become advantageous only with a large number of parallel states (typically >256).
 - Example: On an i7-6800k (6C12T) CPU and RTX 2080Ti GPU, rans64 encoding speed is similar for CPU and GPU with 128 parallel states, while with 256 parallel states GPU is 2 times faster than CPU.
 
-#### Benchmark Example: Find Your Optimal Parallel States
 
-Use the following script to benchmark encoding speed for different numbers of parallel states on your machine:
+### Command-line benchmark tool
+After installing the package, you can run a built-in benchmark tool directly with Python:
 
-```python
-import torch
-import torch_ans
-import time
+```bash
+python -m torch_ans.benchmark
+```
 
-def benchmark_parallel_states(data_size_mb=50, device="cpu"):
-  num_symbols = 256
-  freq_precision = 16
-  sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-  pmf = torch.ones(1, num_symbols, dtype=torch.float32, device=device) / num_symbols
-  cdfs = torch_ans.rans_pmf_to_quantized_cdf(pmf, freq_precision)
-  cdfs_sizes = torch.full((1,), cdfs.size(-1), dtype=torch.int32, device=device)
-  offsets = torch.zeros(1, dtype=torch.int32, device=device)
-  results = []
-  for batch_size in sizes:
-    num_data = int(data_size_mb * 1024 * 1024 / batch_size / 4)
-    symbols = torch.randint(0, num_symbols, (batch_size, num_data), dtype=torch.int32, device=device)
-    stream = torch_ans.rans64_init_stream(batch_size).to(device=device)
-    start = time.time()
-    torch_ans.rans64_push(stream, symbols, torch.zeros_like(symbols), cdfs, cdfs_sizes, offsets, freq_precision, bypass_coding=False)
-    if device == "cuda":
-      torch.cuda.synchronize()
-    elapsed = time.time() - start
-    results.append((batch_size, elapsed))
-    print(f"Batch size: {batch_size:4d} | Time: {elapsed:.4f} s | Throughput: {(data_size_mb/elapsed):.2f} MB/s")
-  return results
+This runs the rANS throughput benchmark across the specified batch sizes and devices. The benchmark supports `push`, `pop`, and `both` modes with `--mode`.
 
-
-# Example usage:
-print("Benchmarking on CPU:")
-benchmark_parallel_states(data_size_mb=50, device="cpu")
-# For GPU:
-print("Benchmarking on GPU:")
-benchmark_parallel_states(data_size_mb=50, device="cuda")
+Example:
+```bash
+python -m torch_ans.benchmark -d cpu cuda --mode push
 ```
 
 Example output on i7-6800k (6C12T) CPU and RTX 2080Ti GPU:
 ```
-Benchmarking on CPU:
-Batch size:    1 | Time: 0.1711 s | Throughput: 292.26 MB/s
-Batch size:    2 | Time: 0.1121 s | Throughput: 446.11 MB/s
-Batch size:    4 | Time: 0.0794 s | Throughput: 629.38 MB/s
-Batch size:    8 | Time: 0.0722 s | Throughput: 692.59 MB/s
-Batch size:   16 | Time: 0.0809 s | Throughput: 618.17 MB/s
-Batch size:   32 | Time: 0.0678 s | Throughput: 737.36 MB/s
-Batch size:   64 | Time: 0.0664 s | Throughput: 753.02 MB/s
-Batch size:  128 | Time: 0.0627 s | Throughput: 797.97 MB/s
-Batch size:  256 | Time: 0.0534 s | Throughput: 937.06 MB/s
-Batch size:  512 | Time: 0.0501 s | Throughput: 998.68 MB/s
-Batch size: 1024 | Time: 0.0473 s | Throughput: 1058.06 MB/s
-Batch size: 2048 | Time: 0.0479 s | Throughput: 1044.59 MB/s
-Batch size: 4096 | Time: 0.0500 s | Throughput: 999.69 MB/s
-Benchmarking on GPU:
-Batch size:    1 | Time: 6.5701 s | Throughput: 7.61 MB/s
-Batch size:    2 | Time: 4.8248 s | Throughput: 10.36 MB/s
-Batch size:    4 | Time: 1.4710 s | Throughput: 33.99 MB/s
-Batch size:    8 | Time: 0.7357 s | Throughput: 67.96 MB/s
-Batch size:   16 | Time: 0.3679 s | Throughput: 135.90 MB/s
-Batch size:   32 | Time: 0.1841 s | Throughput: 271.66 MB/s
-Batch size:   64 | Time: 0.0922 s | Throughput: 542.46 MB/s
-Batch size:  128 | Time: 0.0463 s | Throughput: 1081.05 MB/s
-Batch size:  256 | Time: 0.0235 s | Throughput: 2128.31 MB/s
-Batch size:  512 | Time: 0.0128 s | Throughput: 3898.49 MB/s
-Batch size: 1024 | Time: 0.0081 s | Throughput: 6149.65 MB/s
-Batch size: 2048 | Time: 0.0081 s | Throughput: 6161.39 MB/s
-Batch size: 4096 | Time: 0.0080 s | Throughput: 6222.82 MB/s
+torch_ans benchmark
+  impl: rans64
+  mode: push
+  data size: 50.0 MB
+  num symbols: 256
+  freq precision: 16
+ 
+Benchmarking on cpu:
+num threads: 6
+  Batch size:    1 | Time: 0.1711 s | Throughput: 292.26 MB/s
+  Batch size:    2 | Time: 0.1121 s | Throughput: 446.11 MB/s
+  Batch size:    4 | Time: 0.0794 s | Throughput: 629.38 MB/s
+  Batch size:    8 | Time: 0.0722 s | Throughput: 692.59 MB/s
+  Batch size:   16 | Time: 0.0809 s | Throughput: 618.17 MB/s
+  Batch size:   32 | Time: 0.0678 s | Throughput: 737.36 MB/s
+  Batch size:   64 | Time: 0.0664 s | Throughput: 753.02 MB/s
+  Batch size:  128 | Time: 0.0627 s | Throughput: 797.97 MB/s
+  Batch size:  256 | Time: 0.0534 s | Throughput: 937.06 MB/s
+  Batch size:  512 | Time: 0.0501 s | Throughput: 998.68 MB/s
+  Batch size: 1024 | Time: 0.0473 s | Throughput: 1058.06 MB/s
+  Batch size: 2048 | Time: 0.0479 s | Throughput: 1044.59 MB/s
+  Batch size: 4096 | Time: 0.0500 s | Throughput: 999.69 MB/s
+
+Benchmarking on cuda:
+  Batch size:    1 | Time: 6.5701 s | Throughput: 7.61 MB/s
+  Batch size:    2 | Time: 4.8248 s | Throughput: 10.36 MB/s
+  Batch size:    4 | Time: 1.4710 s | Throughput: 33.99 MB/s
+  Batch size:    8 | Time: 0.7357 s | Throughput: 67.96 MB/s
+  Batch size:   16 | Time: 0.3679 s | Throughput: 135.90 MB/s
+  Batch size:   32 | Time: 0.1841 s | Throughput: 271.66 MB/s
+  Batch size:   64 | Time: 0.0922 s | Throughput: 542.46 MB/s
+  Batch size:  128 | Time: 0.0463 s | Throughput: 1081.05 MB/s
+  Batch size:  256 | Time: 0.0235 s | Throughput: 2128.31 MB/s
+  Batch size:  512 | Time: 0.0128 s | Throughput: 3898.49 MB/s
+  Batch size: 1024 | Time: 0.0081 s | Throughput: 6149.65 MB/s
+  Batch size: 2048 | Time: 0.0081 s | Throughput: 6161.39 MB/s
+  Batch size: 4096 | Time: 0.0080 s | Throughput: 6222.82 MB/s
 ```
 
 This will help you determine the best batch size (number of parallel states) for your hardware and data size. For most users, start with CPU and increase batch size until speed plateaus or memory usage becomes excessive.
@@ -467,15 +433,20 @@ A: torch_ans supports Linux (x86_64/aarch64), macOS (x86_64/aarch64), and Window
 
 **Q: How do I enable CUDA support?**
 
-A: Install the CUDA toolkit and ensure PyTorch is built with CUDA. Use `FORCE_CUDA=1 pip install .` to force CUDA build if not auto-detected. Check with `torch.cuda.is_available()`.
+A: Install the CUDA toolkit and ensure PyTorch is built with CUDA. Use `WITH_CUDA=1 pip install .` to enable CUDA build. Also check with `torch.cuda.is_available()`.
 
 **Q: RuntimeError: The detected CUDA version (x.x) mismatches the version that was used to compile PyTorch (y.y). Please make sure to use the same CUDA versions.**
 
-A: Ensure that your installed CUDA toolkit version align with PyTorch CUDA version. Or if you do not need CUDA for coding, Use `CUDA_VISIBLE_DEVICES= pip install .` to disable CUDA when building.
+A: Ensure that your installed CUDA toolkit version align with PyTorch CUDA version. Or if you do not need CUDA for coding, remove `WITH_CUDA` environment variable to disable CUDA when building.
 
 **Q: Why do I get compilation errors during installation?**
 
 A: Make sure you have a C++17 compiler, pybind11, and compatible PyTorch. Try cleaning the build directory: `rm -rf build/ torch_ans.egg-info/` and reinstall.
+
+**Q: ImportError: ...torch_ans/_C... Undefined Symbol xxxx.**
+
+A: In most cases this is caused by version mismatch between PyTorch during runtime and building torch_ans. Reinstalling torch_ans would hopefully solve this.
+
 
 **Q: How do I choose between CPU and GPU?**
 
@@ -510,11 +481,14 @@ This library is developed for research-purpose only, and not as a robust everyda
   python tests/torch_ans_test.py
   ```
 
+### Known Issues
+- Rans64 coding test fails on some newer GPU architectures.
+
 ### TODO
 - Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API
 - Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
 - Implement lookup table logic in push/pop steps for possible acceleration (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
-- Implement tANS and its variants (similar to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
+- Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
 - Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression
 
