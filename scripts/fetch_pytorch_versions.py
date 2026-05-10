@@ -79,11 +79,13 @@ def main():
 
 
     # Map (os, arch) to GitHub Actions runner label
-    def get_runner(os_name, arch):
+    def get_runner(os_name, arch, py_version):
         if os_name == 'linux' and arch == 'x86_64':
-            return 'ubuntu-latest'
+            # TODO: future versions of python may not be supported on ubuntu-24.04, need to check when that happens
+            return 'ubuntu-24.04' if tuple(map(int, py_version.split('.'))) > (3, 7) else 'ubuntu-22.04'
         if os_name == 'linux' and arch == 'aarch64':
-            return 'ubuntu-24.04-arm'  # Example, adjust as needed
+            # TODO: future versions of python may not be supported on ubuntu-24.04, need to check when that happens
+            return 'ubuntu-24.04-arm' if tuple(map(int, py_version.split('.'))) > (3, 7) else 'ubuntu-22.04-arm'
         if os_name == 'windows':
             return 'windows-latest'
         if os_name == 'macos' and arch == 'x86_64':
@@ -101,7 +103,7 @@ def main():
                 "cuda-version": cuda,
                 "os": os_name,
                 "platform": arch,
-                "runner": get_runner(os_name, arch)
+                "runner": get_runner(os_name, arch, py)
             })
 
     # Output as JSON for GitHub Actions
