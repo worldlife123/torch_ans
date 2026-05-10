@@ -15,7 +15,7 @@ try:
 except:
     print("Torch ANS is not compiled properly!")
 
-from typing import Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple
 
 
 def _get_bytes_format(num_bytes=4):
@@ -192,18 +192,20 @@ class TorchEntropyCoderBaseInterface(object):
     Args:
         symbol_precision (int): Precision of symbols in bits.
         freq_precision (int): Precision of frequencies in bits.
-        bypass_coding (bool): Enable bypass coding for out-of-range symbols.
-        bypass_precision (int): Precision for bypass coding.
         mode (str): "encoder", "decoder", or "encdec".
         dtype (torch.dtype): Tensor dtype for internal buffers.
         device (str or torch.device, optional): Device for tensors.
         **kwargs: Additional arguments for encoder/decoder initialization.
     """
-    def __init__(self, symbol_precision: int = 8, freq_precision: int = 16, bypass_coding: bool = True, bypass_precision: int = 4, mode="encdec", dtype=torch.int32, device=None, **kwargs) -> None:
+    def __init__(self, 
+                 symbol_precision: int = 8, 
+                 freq_precision: int = 16, 
+                 mode="encdec", 
+                 dtype=torch.int32, 
+                 device=None, 
+                 **kwargs) -> None:
         self.symbol_precision = symbol_precision
         self.freq_precision = freq_precision
-        self.bypass_coding = bypass_coding
-        self.bypass_precision = bypass_precision
         
         self.mode = mode
         if self.mode == "encoder" or self.mode == "encdec":
@@ -211,28 +213,59 @@ class TorchEntropyCoderBaseInterface(object):
         if self.mode == "decoder" or self.mode == "encdec":
             self._init_decoder(**kwargs)
             
-        self.dtype = dtype
-        self.device = device
+        self._set_dtype(dtype)
+        self._set_device(device)
         
     def _init_encoder(self, **kwargs):
         """
         Initializes encoder caches for different encoding methods.
         """
-        self.cache_encode_with_indexes = dict()
-        self.cache_encode_with_freqs = dict()
-        self.cache_encode_symbols = dict()
+        self._encode_queue = []
+        # self.cache_encode_with_indexes = dict()
+        # self.cache_encode_with_freqs = dict()
+        # self.cache_encode_symbols = dict()
 
     def _init_decoder(self, **kwargs):
         """
         Initializes decoder state. Override in subclasses if needed.
         """
-        pass
+        self._encoded_stream = None
     
     def _init_tensor(self, tensor : torch.Tensor) -> torch.Tensor:
         """
         Moves tensor to the configured dtype and device.
         """
         return tensor.to(dtype=self.dtype, device=self.device)
+    
+    def _init_stream(self, **kwargs) -> torch.Tensor:
+        """
+        Initializes the encoding stream tensor.
+
+        Args:
+            **kwargs: Additional arguments for stream initialization.
+
+        Returns:
+            torch.Tensor: Initialized stream tensor.
+        """
+        return torch.zeros(1, dtype=self.dtype, device=self.device) # dummy stream tensor, override in subclass if needed
+    
+    def _set_dtype(self, dtype: torch.dtype) -> None:
+        """
+        Sets the dtype for internal tensors.
+
+        Args:
+            dtype (torch.dtype): Desired tensor dtype.
+        """
+        self.dtype = dtype  
+
+    def _set_device(self, device: torch.device) -> None:
+        """
+        Sets the device for internal tensors.
+
+        Args:
+            device (torch.device): Desired device.
+        """
+        self.device = device
 
     def init_params(self, freqs : torch.Tensor, num_freqs : torch.Tensor, offsets : torch.Tensor) -> None:
         """
@@ -247,7 +280,14 @@ class TorchEntropyCoderBaseInterface(object):
         self.num_freqs = self._init_tensor(num_freqs)
         self.offsets = self._init_tensor(offsets)
 
-    ####### Encode functions #########
+    # Override by subclass
+    def _encode_func(self, symbols: torch.Tensor, stream: Optional[torch.Tensor], **kwargs) -> torch.Tensor:
+        raise NotImplementedError()
+
+    # Override by subclass
+    def _decode_func(self, stream: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError()
+
     def _cache_concat(self, prev : torch.Tensor, new : torch.Tensor):
         """
         Concatenates two tensors along a new batch dimension for caching.
@@ -261,7 +301,146 @@ class TorchEntropyCoderBaseInterface(object):
         """
         return torch.stack([prev, new], dim=0)
 
-    def encode_with_indexes(self, symbols: torch.Tensor, indexes: torch.Tensor, cache=False, **kwargs) -> bytes:
+    def reset_cache(self) -> None:
+        """
+        Resets all encoding caches.
+        """
+        self._encode_queue = []
+        # self.cache_encode_with_indexes = dict()
+        # self.cache_encode_with_freqs = dict()
+        # self.cache_encode_symbols = dict()
+
+    # def _check_patterns(self, symbols: torch.Tensor, 
+    #            dist_indexes: Optional[torch.Tensor]=None, 
+    #            dist_freqs: Optional[torch.Tensor]=None, # aka freqs
+    #            dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
+    #            dist_min: Optional[torch.Tensor]=None, # aka offsets
+    #            cache=False, **kwargs) -> Dict[str, Optional[torch.Tensor]]:
+    #     if dist_indexes is not None:
+    #         assert symbols.shape == dist_indexes.shape, "For encode_with_indexes pattern, symbols and dist_indexes should have the same shape"
+    #     elif dist_freqs is not None:
+    #         assert symbols.shape == dist_freqs.shape[:-1], "For encode_with_freqs pattern, symbols.shape should match dist_freqs.shape[:-1]"
+    #     else:
+    #         raise NotImplementedError("Unsupported encoding pattern. Please provide either dist_indexes or dist_freqs.")
+
+    # NOTE: we might add an optional stream argument for encode function later,
+    # in case some entropy coder support FIFO encode (e.g. arithmetic coders are FIFO, but ANS are LIFO)
+    def encode(self, symbols: torch.Tensor, 
+            #    stream: Optional[torch.Tensor], 
+               dist_indexes: Optional[torch.Tensor]=None, 
+               dist_freqs: Optional[torch.Tensor]=None, # aka freqs
+               dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
+               dist_min: Optional[torch.Tensor]=None, # aka offsets
+               cache=False, **kwargs) -> Optional[torch.Tensor]:
+        """
+        Main encode function that check Tensor requirements for specific encoding patterns based on provided arguments.
+        1. If only symbols are provided, pass. (encode_symbols pattern)
+        2. If dist_indexes is provided, check symbols.shape == dist_indexes.shape. (encode_with_indexes pattern).
+        3. If dist_freqs are provided, check symbols.shape == dist_freqs.shape[:-1]. (encode_with_freqs pattern).
+        4. Otherwise, raise NotImplementedError.
+
+        If cache=True, store all necessary information into self._encode_queue. Later call self.flush to encode all cached data and return encoded stream.
+        Otherwise, directly call the corresponding encode function (here just raise NotImplementedError).
+
+        """
+        if dist_indexes is not None:
+            assert symbols.shape == dist_indexes.shape, "For encode_with_indexes pattern, symbols and dist_indexes should have the same shape"
+            dist_indexes = self._init_tensor(dist_indexes)
+        elif dist_freqs is not None:
+            assert symbols.shape == dist_freqs.shape[:-1], "For encode_with_freqs pattern, symbols.shape should match dist_freqs.shape[:-1]"
+            dist_freqs = self._init_tensor(dist_freqs)
+            dist_num_freqs = self._init_tensor(dist_num_freqs if dist_num_freqs is not None else torch.zeros_like(symbols) + dist_freqs.shape[-1])
+            dist_min = self._init_tensor(dist_min if dist_min is not None else torch.zeros_like(symbols))
+        else:
+            raise NotImplementedError("Unsupported encoding pattern. Please provide either dist_indexes or dist_freqs.")
+
+        symbols = self._init_tensor(symbols)
+        if cache:
+            self._encode_queue.append(dict(
+                symbols=symbols,
+                dist_indexes=dist_indexes,
+                dist_freqs=dist_freqs,
+                dist_num_freqs=dist_num_freqs,
+                dist_min=dist_min,
+                **kwargs
+            ))
+        else:
+            stream = self._init_stream()
+            return self._encode_func(symbols, 
+                stream=stream,
+                dist_indexes=dist_indexes, 
+                dist_freqs=dist_freqs, 
+                dist_num_freqs=dist_num_freqs, 
+                dist_min=dist_min, 
+                **kwargs
+            )
+
+    def encode_flush(self, **kwargs) -> Optional[torch.Tensor]:
+        """
+        Flushes cached encoding data and returns encoded bytes.
+
+        Args:
+            **kwargs: Additional arguments.
+
+        Returns:
+            torch.Tensor: Encoded tensor.
+        """
+        stream = None
+        if len(self._encode_queue) > 0:
+            # NOTE: reverse the queue to encode in LIFO order
+            for item in reversed(self._encode_queue): 
+                stream = self._encode_func(stream=stream, **item, **kwargs)
+        return stream
+        # Deprecated calls (not working properly)
+        # if len(self.cache_encode_with_indexes) > 0:
+        #     return self.encode_with_indexes(**self.cache_encode_with_indexes, cache=False, **kwargs)
+        # if len(self.cache_encode_with_freqs) > 0:
+        #     return self.encode_with_freqs(**self.cache_encode_with_freqs, cache=False, **kwargs)
+        # if len(self.cache_encode_symbols) > 0:
+        #     return self.encode_symbols(**self.cache_encode_symbols, cache=False, **kwargs)
+        # raise NotImplementedError()
+
+    def decode(self, stream: Optional[torch.Tensor], 
+               dist_indexes: Optional[torch.Tensor]=None, 
+               dist_freqs: Optional[torch.Tensor]=None, # aka freqs
+               dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
+               dist_min: Optional[torch.Tensor]=None, # aka offsets
+               **kwargs) -> torch.Tensor:
+        """
+        Main decode function that check Tensor requirements for specific decoding patterns based on provided arguments.
+        0. If stream is not provided, use self._encoded_stream.
+        1. If only stream is provided, pass. (decode_symbols pattern)
+        2. If dist_indexes is provided, check dist_indexes.shape matches expected shape for the encoded data. (decode_with_indexes pattern).
+        3. If dist_freqs are provided, check dist_freqs.shape[:-1] matches expected shape for the encoded data. (decode_with_freqs pattern).
+        4. Otherwise, raise NotImplementedError.
+
+        Then call the corresponding decode function (here just raise NotImplementedError).
+
+        """
+        if stream is None:
+            stream = self._encoded_stream
+
+        if dist_indexes is not None:
+            dist_indexes = self._init_tensor(dist_indexes)
+        elif dist_freqs is not None:
+            dist_freqs = self._init_tensor(dist_freqs)
+            dist_num_freqs = self._init_tensor(dist_num_freqs if dist_num_freqs is not None else torch.zeros_like(dist_freqs[..., 0]) + dist_freqs.shape[-1])
+            dist_min = self._init_tensor(dist_min if dist_min is not None else torch.zeros_like(dist_freqs[..., 0]))
+        else:
+            raise NotImplementedError("Unsupported decoding pattern. Please provide either dist_indexes or dist_freqs.")
+        
+        decoded = self._decode_func(stream, 
+            dist_indexes=dist_indexes, 
+            dist_freqs=dist_freqs, 
+            dist_num_freqs=dist_num_freqs, 
+            dist_min=dist_min, 
+            **kwargs
+        )
+        return decoded
+
+    ####### CompressAI/FSAR like API functions #########
+    # NOTE: these functions should represent streams as bytes instead of torch.Tensor, following CompressAI's API design. 
+    def encode_with_indexes(self, symbols: torch.Tensor, indexes: torch.Tensor, cache=False, **kwargs) -> Optional[bytes]:
         """
         Caches or encodes symbols with indexes.
 
@@ -274,18 +453,32 @@ class TorchEntropyCoderBaseInterface(object):
         Returns:
             bytes: Encoded bytes (if cache=False).
         """
-        if cache:
-            if len(self.cache_encode_with_indexes) == 0:
-                self.cache_encode_with_indexes = dict(
-                    symbols=self._init_tensor(symbols), 
-                    indexes=self._init_tensor(indexes), 
-                    **kwargs
-                )
-            else:
-                self.cache_encode_with_indexes["symbols"] = self._cache_concat(self.cache_encode_with_indexes["symbols"], self._init_tensor(symbols))
-                self.cache_encode_with_indexes["indexes"] = self._cache_concat(self.cache_encode_with_indexes["indexes"], self._init_tensor(indexes))
-        else:
-            raise NotImplementedError()
+        # if cache:
+        #     if len(self.cache_encode_with_indexes) == 0:
+        #         self.cache_encode_with_indexes = dict(
+        #             symbols=self._init_tensor(symbols), 
+        #             indexes=self._init_tensor(indexes), 
+        #             **kwargs
+        #         )
+        #     else:
+        #         self.cache_encode_with_indexes["symbols"] = self._cache_concat(self.cache_encode_with_indexes["symbols"], self._init_tensor(symbols))
+        #         self.cache_encode_with_indexes["indexes"] = self._cache_concat(self.cache_encode_with_indexes["indexes"], self._init_tensor(indexes))
+        # else:
+        raise NotImplementedError()
+
+    def decode_with_indexes(self, encoded: str, indexes: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Decodes encoded data using indexes.
+
+        Args:
+            encoded (str): Encoded stream.
+            indexes (torch.Tensor): Distribution indexes for each symbol.
+            **kwargs: Additional arguments.
+
+        Returns:
+            torch.Tensor: Decoded symbols.
+        """
+        raise NotImplementedError()
 
     def flush(self, **kwargs) -> bytes:
         """
@@ -297,77 +490,14 @@ class TorchEntropyCoderBaseInterface(object):
         Returns:
             bytes: Encoded bytes.
         """
-        if len(self.cache_encode_with_indexes) > 0:
-            return self.encode_with_indexes(**self.cache_encode_with_indexes, cache=False, **kwargs)
-        if len(self.cache_encode_with_freqs) > 0:
-            return self.encode_with_freqs(**self.cache_encode_with_freqs, cache=False, **kwargs)
-        if len(self.cache_encode_symbols) > 0:
-            return self.encode_symbols(**self.cache_encode_symbols, cache=False, **kwargs)
         # raise NotImplementedError()
-
-    def reset_cache(self) -> None:
-        """
-        Resets all encoding caches.
-        """
-        self.cache_encode_with_indexes = dict()
-        self.cache_encode_with_freqs = dict()
-        self.cache_encode_symbols = dict()
-
-    def encode_with_freqs(self, symbols: torch.Tensor, freqs: Optional[torch.Tensor], num_freqs: Optional[torch.Tensor], cache=False, **kwargs) -> bytes:
-        """
-        Caches or encodes symbols with explicit frequency tables.
-
-        Args:
-            symbols (torch.Tensor): Symbols to encode.
-            freqs (torch.Tensor, optional): Per-symbol frequency tables.
-            num_freqs (torch.Tensor, optional): Number of frequencies per table.
-            cache (bool): If True, cache for later flush.
-            **kwargs: Additional arguments.
-
-        Returns:
-            bytes: Encoded bytes (if cache=False).
-        """
-        if cache:
-            if len(self.cache_encode_with_freqs) == 0:
-                self.cache_encode_with_freqs = dict(
-                    symbols=self._init_tensor(symbols), 
-                    freqs=self._init_tensor(freqs), 
-                    num_freqs=self._init_tensor(num_freqs), 
-                    **kwargs
-                )
-            else:
-                self.cache_encode_with_freqs["symbols"] = self._cache_concat(self.cache_encode_with_freqs["symbols"], self._init_tensor(symbols))
-                self.cache_encode_with_freqs["freqs"] = self._cache_concat(self.cache_encode_with_freqs["freqs"], self._init_tensor(freqs))
-                self.cache_encode_with_freqs["num_freqs"] = self._cache_concat(self.cache_encode_with_freqs["num_freqs"], self._init_tensor(num_freqs))
+        stream = self.encode_flush(**kwargs)
+        if stream is None:
+            return b''
         else:
-            raise NotImplementedError()
+            byte_strings = rans_stream_to_byte_strings(stream)
+            return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
 
-    def encode_symbols(self, symbols: torch.Tensor, embedded_freqs=False, cache=False, **kwargs) -> bytes:
-        """
-        Caches or encodes symbols, optionally with embedded frequencies.
-
-        Args:
-            symbols (torch.Tensor): Symbols to encode.
-            embedded_freqs (bool): If True, embed frequency tables.
-            cache (bool): If True, cache for later flush.
-            **kwargs: Additional arguments.
-
-        Returns:
-            bytes: Encoded bytes (if cache=False).
-        """
-        if cache:
-            if len(self.cache_encode_symbols) == 0:
-                self.cache_encode_symbols = dict(
-                    symbols=self._init_tensor(symbols), 
-                    embedded_freqs=embedded_freqs, 
-                    **kwargs
-                )
-            else:
-                self.cache_encode_symbols["symbols"] = self._cache_concat(self.cache_encode_symbols["symbols"], self._init_tensor(symbols))
-        else:
-            raise NotImplementedError()
-
-    ####### Decode functions #########
     def set_stream(self, encoded: str) -> None:
         """
         Sets the encoded stream for decoding operations.
@@ -390,13 +520,43 @@ class TorchEntropyCoderBaseInterface(object):
         """
         raise NotImplementedError()
 
-    def decode_with_indexes(self, encoded: str, indexes: torch.Tensor, **kwargs) -> torch.Tensor:
+    def encode_with_freqs(self, symbols: torch.Tensor, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, cache=False, **kwargs) -> Optional[bytes]:
         """
-        Decodes encoded data using indexes.
+        Caches or encodes symbols with per-symbol frequencies.
+
+        Args:
+            symbols (torch.Tensor): Symbols to encode.
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
+            cache (bool): If True, cache for later flush.
+            **kwargs: Additional arguments.
+
+        Returns:
+            bytes: Encoded bytes (if cache=False).
+        """
+        # if cache:
+        #     if len(self.cache_encode_with_indexes) == 0:
+        #         self.cache_encode_with_indexes = dict(
+        #             symbols=self._init_tensor(symbols), 
+        #             indexes=self._init_tensor(indexes), 
+        #             **kwargs
+        #         )
+        #     else:
+        #         self.cache_encode_with_indexes["symbols"] = self._cache_concat(self.cache_encode_with_indexes["symbols"], self._init_tensor(symbols))
+        #         self.cache_encode_with_indexes["indexes"] = self._cache_concat(self.cache_encode_with_indexes["indexes"], self._init_tensor(indexes))
+        # else:
+        raise NotImplementedError()
+
+    def decode_with_freqs(self, encoded: str, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Decodes encoded data using per-symbol frequencies.
 
         Args:
             encoded (str): Encoded stream.
-            indexes (torch.Tensor): Distribution indexes for each symbol.
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
             **kwargs: Additional arguments.
 
         Returns:
@@ -404,28 +564,14 @@ class TorchEntropyCoderBaseInterface(object):
         """
         raise NotImplementedError()
 
-    def decode_with_freqs(self, encoded: str, freqs: Optional[torch.Tensor], num_freqs: Optional[torch.Tensor], **kwargs) -> torch.Tensor:
+    def decode_stream_with_freqs(self, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, **kwargs) -> torch.Tensor:
         """
-        Decodes encoded data using explicit frequency tables.
+        Decodes a stream using provided per-symbol frequencies.
 
         Args:
-            encoded (str): Encoded stream.
-            freqs (torch.Tensor, optional): Frequency tables.
-            num_freqs (torch.Tensor, optional): Number of frequencies per table.
-            **kwargs: Additional arguments.
-
-        Returns:
-            torch.Tensor: Decoded symbols.
-        """
-        raise NotImplementedError()
-
-    def decode_symbols(self, encoded: str, embedded_freqs=False, **kwargs) -> torch.Tensor:
-        """
-        Decodes encoded symbols, optionally with embedded frequencies.
-
-        Args:
-            encoded (str): Encoded stream.
-            embedded_freqs (bool): If True, decode with embedded frequency tables.
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
             **kwargs: Additional arguments.
 
         Returns:
@@ -441,12 +587,23 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
     Args:
         impl (str): rANS implementation variant ("rans64", "rans32", etc.).
+        bypass_coding (bool): Enable bypass coding for out-of-range symbols. 
+                              This may not be supported in all implementations, or may reduce throughput!
+        bypass_precision (int): Precision for bypass coding.
         num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
         **kwargs: Passed to TorchEntropyCoderBaseInterface.
     """
-    def __init__(self, impl="rans64", num_parallel_states=None, num_bytes_code_length=4, **kwargs) -> None:
+    def __init__(self, 
+                 impl="rans64", 
+                 bypass_coding: bool = True, 
+                 bypass_precision: int = 4, 
+                 num_parallel_states=None, 
+                 num_bytes_code_length=4, 
+                 **kwargs) -> None:
         self.impl = impl
+        self.bypass_coding = bypass_coding
+        self.bypass_precision = bypass_precision
         self.num_parallel_states = num_parallel_states
         self.num_bytes_code_length = num_bytes_code_length
         super().__init__(**kwargs)
@@ -473,6 +630,14 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         else:
             raise NotImplementedError(f"Unknown impl {self.impl}")
 
+    def _init_stream(self, num_parallel_states=None, **kwargs) -> torch.Tensor:
+        """
+        Initializes the rANS stream tensor with the configured number of parallel states.
+        """
+        num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
+        num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
+        return self._init_tensor(self.ans_init_func(num_parallel_states))
+
     def init_params(self, freqs, num_freqs, offsets) -> None:
         """
         Initializes coder parameters and quantized CDFs for rANS encoding/decoding.
@@ -490,9 +655,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         #     cdf = pmf_to_quantized_cdf(prob, self.freq_precision)
         #     cdfs[i, : len(cdf)] = torch.as_tensor(cdf, dtype=torch.int32)
         if self.bypass_coding:
-            freqs = torch.cat([freqs.clone(), torch.zeros(freqs.shape[0], 1).type_as(freqs) + 1e-10], dim=1)
-        pmf = freqs / freqs.sum(1, keepdim=True)
-        cdfs = rans_pmf_to_quantized_cdf(pmf, self.freq_precision)
+            freqs = torch.cat([freqs.clone(), torch.zeros_like(freqs[..., :1]) + 1e-10], dim=-1)
+        pmf = freqs.float() / freqs.sum(-1, keepdim=True)
+        cdfs = rans_pmf_to_quantized_cdf(pmf.to(device=self.device), self.freq_precision)
         cdfs_sizes = num_freqs + (2 if self.bypass_coding else 1)
         if self.impl_use_inverse_cdf:
             inversed_cdfs = inverse_quantized_cdf(cdfs, freq_precision=self.freq_precision)
@@ -503,19 +668,104 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             )
             self.cdfs_with_alias_table = self._init_tensor(cdfs_with_alias_table).contiguous()
 
-        self.cdfs = cdfs
-        self.cdfs_sizes = cdfs_sizes
-        self.offsets = offsets
-
-        self.cdfs = self._init_tensor(self.cdfs).contiguous()
-        self.cdfs_sizes = self._init_tensor(self.cdfs_sizes).contiguous()
-        self.offsets = self._init_tensor(self.offsets).contiguous()
+        self.cdfs = self._init_tensor(cdfs).contiguous()
+        self.cdfs_sizes = self._init_tensor(cdfs_sizes).contiguous()
+        self.offsets = self._init_tensor(offsets).contiguous()
 
         # if self.device is not None:
         #     self.cdfs = self.cdfs.to(device=self.device)
         #     self.cdfs_sizes = self.cdfs_sizes.to(device=self.device)
         #     self.offsets = self.offsets.to(device=self.device)
+
+    def _encode_func(self, symbols, 
+                     stream: Optional[torch.Tensor]=None,
+                     dist_indexes: Optional[torch.Tensor]=None,
+                     dist_freqs: Optional[torch.Tensor]=None, # aka freqs
+                     dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
+                     dist_min: Optional[torch.Tensor]=None, # aka offsets
+                     **kwargs) -> torch.Tensor:
         
+        if stream is None:
+            num_parallel_states = symbols.size(0) if self.num_parallel_states is None else self.num_parallel_states
+            # assert num_parallel_states == symbols.size(0)
+            stream = self._init_stream(num_parallel_states=num_parallel_states)
+        else:
+            num_parallel_states = stream.size(0)
+
+        if dist_indexes is not None:
+            self.ans_encode_func(stream, 
+                symbols.reshape(num_parallel_states, -1).contiguous(), 
+                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                self.cdfs, self.cdfs_sizes, self.offsets,
+                freq_precision=self.freq_precision, 
+                bypass_coding=self.bypass_coding, 
+                bypass_precision=self.bypass_precision
+            )
+        elif dist_freqs is not None:
+            self.init_params(
+                dist_freqs.reshape(-1, dist_freqs.shape[-1]), 
+                dist_num_freqs.reshape(-1), 
+                dist_min.reshape(-1)
+            )
+            dist_indexes = torch.arange(symbols.numel(), dtype=self.dtype, device=stream.device)\
+                .reshape_as(symbols)
+            self.ans_encode_func(stream, 
+                symbols.reshape(num_parallel_states, -1).contiguous(), 
+                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                self.cdfs, self.cdfs_sizes, self.offsets,
+                freq_precision=self.freq_precision, 
+                bypass_coding=self.bypass_coding, 
+                bypass_precision=self.bypass_precision
+            )
+        else:
+            # TODO: implement encode_symbols pattern if needed
+            raise NotImplementedError("Unsupported encoding pattern. Please provide either dist_indexes or dist_freqs.")
+
+        return stream
+
+    def _decode_func(self, stream, 
+                     dist_indexes: Optional[torch.Tensor]=None,
+                     dist_freqs: Optional[torch.Tensor]=None, # aka freqs
+                     dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
+                     dist_min: Optional[torch.Tensor]=None, # aka offsets
+                     **kwargs) -> torch.Tensor:
+        num_parallel_states = stream.size(0) if self.num_parallel_states is None else self.num_parallel_states
+        if dist_indexes is not None:
+            cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
+
+            decoded = self.ans_decode_func(stream, 
+                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                cdfs, self.cdfs_sizes, self.offsets,
+                freq_precision=self.freq_precision, 
+                bypass_coding=self.bypass_coding, 
+                bypass_precision=self.bypass_precision,
+            )
+            decoded = decoded.reshape_as(dist_indexes)
+        elif dist_freqs is not None:
+            self.init_params(
+                dist_freqs.reshape(-1, dist_freqs.shape[-1]), 
+                dist_num_freqs.reshape(-1), 
+                dist_min.reshape(-1)
+            )
+            dist_indexes = torch.arange(dist_num_freqs.numel(), dtype=self.dtype, device=stream.device)\
+                .reshape_as(dist_num_freqs)
+            cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
+            decoded = self.ans_decode_func(stream, 
+                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                cdfs, self.cdfs_sizes, self.offsets,
+                freq_precision=self.freq_precision, 
+                bypass_coding=self.bypass_coding, 
+                bypass_precision=self.bypass_precision,
+            )
+            decoded = decoded.reshape_as(dist_num_freqs)
+        else:
+            # TODO: implement decode_symbols pattern if needed
+            raise NotImplementedError("Unsupported decoding pattern. Please provide either dist_indexes or dist_freqs.")
+
+        return decoded.to(device=stream.device)
+
+    ####### CompressAI/FSAR like API functions #########
+    # NOTE: these functions should represent streams as bytes instead of torch.Tensor, following CompressAI's API design. 
     def set_cdfs(self, cdfs: torch.Tensor, cdfs_sizes: torch.Tensor, offsets: torch.Tensor) -> None:
         """
         Sets coder CDFs, sizes, and offsets directly.
@@ -538,10 +788,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         """
         Initializes decoder stream for rANS decoding.
         """
-        self._stream = None
+        # self._stream = None
         return super()._init_decoder(**kwargs)
 
-    def encode_with_indexes(self, symbols: torch.Tensor, indexes: torch.Tensor, cache=False, **kwargs) -> bytes:
+    def encode_with_indexes(self, symbols: torch.Tensor, indexes: torch.Tensor, cache=False, **kwargs) -> Optional[bytes]:
         """
         Encodes symbols using indexes with rANS.
 
@@ -554,29 +804,35 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         Returns:
             bytes: Encoded byte stream.
         """
+        stream = self.encode(symbols, dist_indexes=indexes, cache=cache, **kwargs)
         if cache:
-            return super().encode_with_indexes(symbols, indexes, cache, **kwargs)
+            return
         else:
-            num_parallel_states = symbols.size(0) if self.num_parallel_states is None else self.num_parallel_states
-            # assert num_parallel_states == symbols.size(0)
-            
-            stream = self._init_tensor(self.ans_init_func(num_parallel_states)) #, device=self.device)) # TODO: create stream on device
-            # if self.device is not None:
-            #     stream = stream.to(device=self.device)
-            #     symbols = symbols.to(device=self.device)
-            #     indexes = indexes.to(device=self.device)
-
-            self.ans_encode_func(stream, 
-                self._init_tensor(symbols).reshape(num_parallel_states, -1).contiguous(), 
-                self._init_tensor(indexes).reshape(num_parallel_states, -1).contiguous(), 
-                self.cdfs, self.cdfs_sizes, self.offsets,
-                freq_precision=self.freq_precision, 
-                bypass_coding=self.bypass_coding, 
-                bypass_precision=self.bypass_precision
-            )
             byte_strings = rans_stream_to_byte_strings(stream)
-            
             return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
+        # if cache:
+        #     return super().encode_with_indexes(symbols, indexes, cache, **kwargs)
+        # else:
+        #     num_parallel_states = symbols.size(0) if self.num_parallel_states is None else self.num_parallel_states
+        #     # assert num_parallel_states == symbols.size(0)
+            
+        #     stream = self._init_stream(num_parallel_states=num_parallel_states)
+        #     # if self.device is not None:
+        #     #     stream = stream.to(device=self.device)
+        #     #     symbols = symbols.to(device=self.device)
+        #     #     indexes = indexes.to(device=self.device)
+
+        #     self.ans_encode_func(stream, 
+        #         self._init_tensor(symbols).reshape(num_parallel_states, -1).contiguous(), 
+        #         self._init_tensor(indexes).reshape(num_parallel_states, -1).contiguous(), 
+        #         self.cdfs, self.cdfs_sizes, self.offsets,
+        #         freq_precision=self.freq_precision, 
+        #         bypass_coding=self.bypass_coding, 
+        #         bypass_precision=self.bypass_precision
+        #     )
+        #     byte_strings = rans_stream_to_byte_strings(stream)
+            
+        #     return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
         
     def decode_with_indexes(self, encoded: str, indexes: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -590,29 +846,32 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         Returns:
             torch.Tensor: Decoded symbols.
         """
+
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
         stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+
+        return self.decode(stream=stream, dist_indexes=indexes, **kwargs)
         
-        num_parallel_states = indexes.size(0) if self.num_parallel_states is None else self.num_parallel_states
-        # assert num_parallel_states == indexes.size(0)
+        # num_parallel_states = indexes.size(0) if self.num_parallel_states is None else self.num_parallel_states
+        # # assert num_parallel_states == indexes.size(0)
 
-        cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
+        # cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
 
-        # if self.device is not None:
-        #     stream = stream.to(device=self.device)
-        #     indexes = indexes.to(device=self.device)
+        # # if self.device is not None:
+        # #     stream = stream.to(device=self.device)
+        # #     indexes = indexes.to(device=self.device)
 
-        decoded = self.ans_decode_func(stream, 
-            self._init_tensor(indexes).reshape(num_parallel_states, -1).contiguous(), 
-            cdfs, self.cdfs_sizes, self.offsets,
-            freq_precision=self.freq_precision, 
-            bypass_coding=self.bypass_coding, 
-            bypass_precision=self.bypass_precision,
-        )
+        # decoded = self.ans_decode_func(stream, 
+        #     self._init_tensor(indexes).reshape(num_parallel_states, -1).contiguous(), 
+        #     cdfs, self.cdfs_sizes, self.offsets,
+        #     freq_precision=self.freq_precision, 
+        #     bypass_coding=self.bypass_coding, 
+        #     bypass_precision=self.bypass_precision,
+        # )
         
-        decoded = decoded.reshape_as(indexes).to(device=indexes.device)
+        # decoded = decoded.reshape_as(indexes).to(device=indexes.device)
          
-        return decoded
+        # return decoded
 
     def set_stream(self, encoded: str) -> None:
         """
@@ -622,7 +881,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             encoded (str): Encoded byte stream.
         """
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
-        self._stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+        self._encoded_stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
 
     def decode_stream(self, indexes: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -635,15 +894,75 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         Returns:
             torch.Tensor: Decoded symbols.
         """
-        decoded = self.ans_decode_func(self._stream, 
-            self._init_tensor(indexes).contiguous(), 
-            self.cdfs, self.cdfs_sizes, self.offsets,
-            freq_precision=self.freq_precision, 
-            bypass_coding=self.bypass_coding, 
-            bypass_precision=self.bypass_precision,
-        )
-        
-        decoded = decoded.reshape_as(indexes).to(device=indexes.device)
+        return self.decode(stream=self._encoded_stream, dist_indexes=indexes, **kwargs)
 
-        return decoded
+        # decoded = self.ans_decode_func(self._encoded_stream, 
+        #     self._init_tensor(indexes).contiguous(), 
+        #     self.cdfs, self.cdfs_sizes, self.offsets,
+        #     freq_precision=self.freq_precision, 
+        #     bypass_coding=self.bypass_coding, 
+        #     bypass_precision=self.bypass_precision,
+        # )
+        
+        # decoded = decoded.reshape_as(indexes).to(device=indexes.device)
+
+        # return decoded
+
+    def encode_with_freqs(self, symbols: torch.Tensor, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, cache=False, **kwargs) -> Optional[bytes]:
+        """
+        Encodes symbols using per-symbol frequencies with rANS.
+
+        Args:
+            symbols (torch.Tensor): Symbols to encode.
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
+            cache (bool): If True, use base class caching.
+            **kwargs: Additional arguments.
+
+        Returns:
+            bytes: Encoded byte stream.
+        """
+        stream = self.encode(symbols, dist_freqs=freqs, dist_num_freqs=num_freqs, dist_min=offsets, cache=cache, **kwargs)
+        if cache:
+            return
+        else:
+            byte_strings = rans_stream_to_byte_strings(stream)
+            return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
+
+    def decode_with_freqs(self, encoded: str, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Decodes encoded data using per-symbol frequencies with rANS.
+
+        Args:
+            encoded (str): Encoded byte stream.
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
+            **kwargs: Additional arguments.
+
+        Returns:
+            torch.Tensor: Decoded symbols.
+        """
+        byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
+        stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+
+        return self.decode(stream=stream, dist_freqs=freqs, dist_num_freqs=num_freqs, dist_min=offsets, **kwargs)
+
+    def decode_stream_with_freqs(self, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Decodes the internal stream using provided per-symbol frequencies with rANS.
+
+        Args:
+            freqs (torch.Tensor): Frequency table tensor.
+            num_freqs (torch.Tensor): Number of frequencies per distribution.
+            offsets (torch.Tensor): Offset tensor for each distribution.
+            **kwargs: Additional arguments.
+
+        Returns:
+            torch.Tensor: Decoded symbols.
+        """
+        return self.decode(stream=self._encoded_stream, dist_freqs=freqs, dist_num_freqs=num_freqs, dist_min=offsets, **kwargs)
+    
+
 

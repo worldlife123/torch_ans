@@ -8,6 +8,7 @@ Goal: help an AI coding agent be immediately productive in this PyTorch C++/CUDA
 - **Key components & files**:
   - `torch_ans/rans_cpu.cpp`, `torch_ans/rans.cpp`, `torch_ans/rans.hpp`, `torch_ans/rans_utils.hpp` — core native implementations and helpers.
   - `torch_ans/utils.py` — high-level Python interface, PMF/CDF helpers, caching, and `TorchANSInterface` used by tests and examples.
+  - `torch_ans/benchmark.py` — built-in CLI benchmark tool for testing rANS throughput across devices and batch sizes.
   - `setup.py`, `pyproject.toml` — extension build config. `setup.py` writes the build-time PyTorch version to `torch_ans/_torch_build_version.py`.
   - `tests/torch_ans_test.py`, `tests/test_high_level_api.py` — concrete examples and test coverage for both low- and high-level APIs.
 
@@ -17,16 +18,17 @@ Goal: help an AI coding agent be immediately productive in this PyTorch C++/CUDA
   - Low-level exported names follow `rans<state>_init_stream`, `rans<state>_push_indexed`, `rans<state>_pop_indexed` (e.g., `rans64_push_indexed`). Tests call these from Python via `torch_ans._C`.
 
 - **Build / local dev workflow** (practical rules discovered from source):
-  - Normal build: `pip install .` (this triggers C++/CUDA extension build via setuptools / torch.utils.cpp_extension).
-  - Avoid PEP517 isolation pulling an unwanted `torch`: when building locally against an existing environment, use `pip install . --no-build-isolation` (recommended in README). To force a CUDA build set `FORCE_CUDA=1` in the environment.
+  - Normal build: `pip install .` (this triggers C++ extension build via setuptools / torch.utils.cpp_extension).
+  - Avoid PEP517 isolation pulling an unwanted `torch`: when building locally against an existing environment, use `pip install . --no-build-isolation` (recommended in README). To build with CUDA support set `WITH_CUDA=1` in the environment. To build with ROCm/AMDGPU support set `WITH_HIP=1` in the environment.
   - When diagnosing build-time PyTorch mismatch, check `torch_ans/_torch_build_version.py` generated at build time.
 
 - **Testing & quick checks**:
   - Run unit tests with `pytest -q tests` (the tests exercise both `TorchANSInterface` and low-level calls).
+  - Run built-in benchmark tool with `python -m torch_ans.benchmark` for throughput testing across devices and batch sizes.
   - Example benchmarks are in `examples/benchmark.py` and useful for reproducing performance/parallel-state behaviour described in README.
 
 - **Common code patterns & guidance for edits**:
-  - CPU/CUDA code paths are separated by compile-time macros and by `setup.py` selecting `CppExtension` vs `CUDAExtension`. When adding GPU kernels, follow existing naming conventions (`rans_*_cuda.cu`) and the `WITH_CUDA` macro.
+  - CPU/CUDA/ROCm code paths are separated by compile-time macros and by `setup.py` selecting `CppExtension` vs `CUDAExtension` vs `ROCMExtension`. When adding GPU kernels, follow existing naming conventions (`rans_*_cuda.cu`) and the `WITH_CUDA` or `WITH_HIP` macro.
   - Many functions are templated by state type / interleaves. Prefer adding new variants by instantiating template wrappers (see `TORCH_LIBRARY_IMPL` at the bottom of `rans_cpu.cpp`).
   - PMF → quantized CDF conversion has CPU and Python implementations: prefer using the native `rans_pmf_to_quantized_cdf` when present, but tests reveal a Python fallback (`pmf_to_quantized_cdf_batched`) is used for experimentation.
 

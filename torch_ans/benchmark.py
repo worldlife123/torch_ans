@@ -3,7 +3,8 @@ import time
 from typing import Iterable, List, Tuple
 
 import torch
-import torch_ans
+# import torch_ans
+from torch_ans._C import rans_pmf_to_quantized_cdf, rans64_init_stream, rans64_push, rans64_pop
 
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 DEFAULT_DEVICES = ["cpu", "cuda"]
@@ -29,7 +30,7 @@ def benchmark_parallel_states(
         raise ValueError(f"Invalid benchmark mode: {mode}. Supported modes: {DEFAULT_MODES}")
 
     pmf = torch.ones(1, num_symbols, dtype=torch.float32, device=device) / num_symbols
-    cdfs = torch_ans.rans_pmf_to_quantized_cdf(pmf, freq_precision)
+    cdfs = rans_pmf_to_quantized_cdf(pmf, freq_precision)
     cdfs_sizes = torch.full((1,), cdfs.size(-1), dtype=torch.int32, device=device)
     offsets = torch.zeros(1, dtype=torch.int32, device=device)
     results: List[Tuple[int, float, float]] = []
@@ -37,12 +38,12 @@ def benchmark_parallel_states(
     for batch_size in batch_sizes:
         num_data = int(data_size_mb * 1024 * 1024 / batch_size / 4)
         symbols = torch.randint(0, num_symbols, (batch_size, num_data), dtype=torch.int32, device=device)
-        stream = torch_ans.rans64_init_stream(batch_size).to(device=device)
+        stream = rans64_init_stream(batch_size).to(device=device)
         indexes = torch.zeros_like(symbols)
 
         if mode == "push":
             start = time.time()
-            torch_ans.rans64_push(
+            rans64_push(
                 stream,
                 symbols,
                 indexes,
@@ -55,7 +56,7 @@ def benchmark_parallel_states(
             if device == "cuda":
                 torch.cuda.synchronize()
         elif mode == "pop":
-            torch_ans.rans64_push(
+            rans64_push(
                 stream,
                 symbols,
                 indexes,
@@ -66,7 +67,7 @@ def benchmark_parallel_states(
                 bypass_coding=False,
             )
             start = time.time()
-            decoded = torch_ans.rans64_pop(
+            decoded = rans64_pop(
                 stream,
                 indexes,
                 cdfs,
@@ -80,7 +81,7 @@ def benchmark_parallel_states(
             _ = decoded
         else:  # both
             start = time.time()
-            torch_ans.rans64_push(
+            rans64_push(
                 stream,
                 symbols,
                 indexes,
@@ -90,7 +91,7 @@ def benchmark_parallel_states(
                 freq_precision,
                 bypass_coding=False,
             )
-            decoded = torch_ans.rans64_pop(
+            decoded = rans64_pop(
                 stream,
                 indexes,
                 cdfs,

@@ -12,21 +12,35 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 ## Features
 
 - **High-speed ANS compression/decompression**: Efficient encoding and decoding using rANS, suitable for large-scale data and neural network applications.
-- **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration for batch processing and high throughput.
+- **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration/asynchronous operators for batch processing and high throughput.
 - **Multi-platform support**: Compatible with Linux/macOS/Windows OS and x86_64/aarch64 based platforms, provided that PyTorch and the necessary build tools (C++ compiler, CUDA toolkit if applicable) are available on that platform.
 - **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
+[CompressAI](https://github.com/InterDigitalInc/CompressAI) like API are also included, see [Cookbook](#cookbook).
 - **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
 
 ## Installation
+It is highly recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
 
 
 ### From PyPI
-It is recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
 
 ```bash
 pip install torch_ans --no-build-isolation
 ```
+
+To build with CUDA support:
+
+```bash
+WITH_CUDA=1 pip install torch_ans --no-build-isolation
+```
+
+To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation (not tested yet):
+
+```bash
+WITH_HIP=1 pip install torch_ans --no-build-isolation
+```
+
 
 ### From source
 ```bash
@@ -39,49 +53,11 @@ To build with CUDA support:
 WITH_CUDA=1 pip install . --no-build-isolation
 ```
 
-To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation:
+To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation (not tested yet):
 
 ```bash
 WITH_HIP=1 pip install . --no-build-isolation
 ```
-
-## Testing and coverage
-
-Install the development dependencies and run the Python unit tests:
-
-```bash
-pip install . --no-build-isolation
-pip install pytest pytest-cov gcovr
-pytest -q
-```
-
-Run Python coverage for the package:
-
-```bash
-pytest --cov=torch_ans --cov-report=term-missing --cov-report=html
-```
-
-To track throughput with `pytest-benchmark`, install the benchmark dependency and run:
-
-```bash
-pip install pytest-benchmark
-pytest --benchmark-only
-```
-
-To collect native C/C++ coverage for the compiled extension, build with coverage instrumentation and run tests from the repository root:
-
-```bash
-ENABLE_COVERAGE=1 python setup.py build_ext --inplace
-ENABLE_COVERAGE=1 pytest -q
-```
-
-Then generate a native coverage report with `gcovr`:
-
-```bash
-gcovr -r . --html-details -o native_coverage.html
-```
-
-This produces Python coverage output in `htmlcov/` and native C/C++ coverage output in `native_coverage.html`.
 
 ## Usage
 
@@ -451,6 +427,7 @@ A: In most cases this is caused by version mismatch between PyTorch during runti
 **Q: How do I choose between CPU and GPU?**
 
 A: Set the `device` argument in API calls to "cpu" or "cuda". For large batches, GPU is recommended; for small data, CPU may be faster.
+Also, as GPU coding process is asynchronous, if some other tasks (such as neural networks in neural compression) are running meanwhile, using GPU coding may increase the overall throughput.
 
 **Q: What is the difference between low-level and high-level APIs?**
 
@@ -474,15 +451,54 @@ This library is developed for research-purpose only, and not as a robust everyda
 
 ## Development
 
-- Requires Python >= 3.7, PyTorch, and a C++17 compiler.
+- Requires Python >= 3.7, PyTorch, and a C++17 compatible compiler.
 - CUDA toolkit required for GPU support.
 - Run tests with:
   ```bash
-  python tests/torch_ans_test.py
+  pytest -q
   ```
 
 ### Known Issues
-- Rans64 coding test fails on some newer GPU architectures.
+- Rans64 cuda coding test fails on some newer GPU architectures.
+
+### Testing and coverage
+
+Install the development dependencies and run the Python unit tests:
+
+```bash
+pip install . --no-build-isolation
+pip install pytest pytest-cov gcovr
+pytest -q
+```
+
+Run Python coverage for the package:
+
+```bash
+pytest --cov=torch_ans --cov-report=term-missing --cov-report=html
+```
+
+To track throughput with `pytest-benchmark`, install the benchmark dependency and run:
+
+```bash
+pip install pytest-benchmark
+pytest --benchmark-only
+```
+
+To collect native C/C++ coverage for the compiled extension, build with coverage instrumentation and run tests from the repository root:
+
+```bash
+ENABLE_COVERAGE=1 python setup.py build_ext --inplace
+ENABLE_COVERAGE=1 pytest -q
+```
+
+Then generate a native coverage report with `gcovr`:
+
+```bash
+gcovr -r . --html-details -o native_coverage.html
+```
+
+This produces Python coverage output in `htmlcov/` and native C/C++ coverage output in `native_coverage.html`.
+
 
 ### TODO
 - Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API

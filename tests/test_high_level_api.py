@@ -4,12 +4,104 @@ import torch
 from torch_ans.utils import TorchANSInterface
 
 
-class TestTorchANSHigherLevelAPI(unittest.TestCase):
+class TestTorchANSHighLevelAPI(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0)
 
-    def test_encode_decode_basic(self):
+    def test_unified_encode_decode_with_indexes(self):
+        """Test the unified encode/decode API with dist_indexes."""
+        batch_size = 2
+        num_dists = 4
+        num_symbols = 16
+        pmf = torch.randint(1, 100, (num_dists, num_symbols), dtype=torch.int32)
+        num_freqs = torch.full((num_dists,), num_symbols, dtype=torch.int32)
+        offsets = torch.zeros(num_dists, dtype=torch.int32)
+
+        coder = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
+        coder.init_params(pmf, num_freqs, offsets)
+
+        seq_len = 32
+        symbols = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
+        indexes = torch.randint(0, num_dists, (batch_size, seq_len), dtype=torch.int32)
+
+        # Encode using unified API
+        encoded_stream = coder.encode(symbols, dist_indexes=indexes)
+        self.assertIsInstance(encoded_stream, torch.Tensor)
+
+        # Decode using unified API
+        decoded = coder.decode(encoded_stream, dist_indexes=indexes)
+        self.assertTrue(torch.equal(decoded, symbols))
+
+    def test_unified_encode_decode_with_freqs(self):
+        """Test the unified encode/decode API with dist_freqs."""
+        batch_size = 2
+        num_symbols = 16
+
+        coder = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
+
+        seq_len = 32
+        symbols = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
+        dist_freqs = torch.randint(1, 100, (batch_size, seq_len, num_symbols), dtype=torch.int32)
+        dist_num_freqs = torch.full((batch_size, seq_len), num_symbols, dtype=torch.int32)
+        dist_offsets = torch.zeros((batch_size, seq_len), dtype=torch.int32)
+
+        # Encode using with_freqs API
+        encoded_stream = coder.encode(symbols, dist_freqs=dist_freqs, dist_num_freqs=dist_num_freqs, dist_min=dist_offsets)
+        self.assertIsInstance(encoded_stream, torch.Tensor)
+
+        # Decode using with_freqs API
+        decoded = coder.decode(encoded_stream, dist_freqs=dist_freqs, dist_num_freqs=dist_num_freqs, dist_min=dist_offsets)
+        self.assertTrue(torch.equal(decoded, symbols))
+
+    def test_unified_streaming_coding(self):
+        """Test streamed encode/decode in unified API."""
+        batch_size = 2
+        num_dists = 4
+        num_symbols = 16
+        pmf = torch.randint(1, 100, (num_dists, num_symbols), dtype=torch.int32)
+        num_freqs = torch.full((num_dists,), num_symbols, dtype=torch.int32)
+        offsets = torch.zeros(num_dists, dtype=torch.int32)
+
+        coder = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
+        coder.init_params(pmf, num_freqs, offsets)
+
+        seq_len = 4
+        symbols1 = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
+        indexes1 = torch.randint(0, num_dists, (batch_size, seq_len), dtype=torch.int32)
+        symbols2 = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
+        indexes2 = torch.randint(0, num_dists, (batch_size, seq_len), dtype=torch.int32)
+
+        # Cache two separate batches
+        ret1 = coder.encode(symbols1, dist_indexes=indexes1, cache=True)
+        self.assertIsNone(ret1)
+        ret2 = coder.encode(symbols2, dist_indexes=indexes2, cache=True)
+        self.assertIsNone(ret2)
+
+        # Flush
+        encoded_stream = coder.encode_flush()
+        self.assertIsInstance(encoded_stream, torch.Tensor)
+
+        encoded_stream2 = encoded_stream.clone()  # Ensure flush does not clear the stream for subsequent flushes
+
+        # Decode the stacked segments
+        stacked_indexes = torch.cat([indexes1, indexes2], dim=1)
+        decoded = coder.decode(encoded_stream, dist_indexes=stacked_indexes)
+
+        expected = torch.cat([symbols1, symbols2], dim=1)
+        self.assertTrue(torch.equal(decoded, expected))
+
+        # Decode by streamed interface
+        coder2 = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
+        coder2.init_params(pmf, num_freqs, offsets)
+
+        decoded = coder2.decode(encoded_stream2, dist_indexes=indexes1)
+        self.assertTrue(torch.equal(decoded, symbols1))
+
+        decoded = coder2.decode(encoded_stream2, dist_indexes=indexes2)
+        self.assertTrue(torch.equal(decoded, symbols2))
+
+    def test_compressai_like_encode_decode_basic(self):
         batch_size = 2
         num_dists = 4
         num_symbols = 16
@@ -29,7 +121,7 @@ class TestTorchANSHigherLevelAPI(unittest.TestCase):
 
         self.assertTrue(torch.equal(decoded, symbols))
 
-    def test_encode_with_cache_and_flush(self):
+    def test_compressai_like_streamed(self):
         batch_size = 2
         num_dists = 4
         num_symbols = 16
@@ -52,40 +144,28 @@ class TestTorchANSHigherLevelAPI(unittest.TestCase):
         ret2 = coder.encode_with_indexes(symbols2, indexes2, cache=True)
         self.assertIsNone(ret2)
 
-        # Flush and decode the stacked segments
+        # Flush 
         encoded = coder.flush()
         self.assertIsInstance(encoded, (bytes, bytearray))
 
-        stacked_indexes = torch.stack([indexes1, indexes2], dim=0)
+        # decode the stacked segments
+        stacked_indexes = torch.cat([indexes1, indexes2], dim=1)
         decoded = coder.decode_with_indexes(encoded, stacked_indexes)
 
-        expected = torch.stack([symbols1, symbols2], dim=0)
+        expected = torch.cat([symbols1, symbols2], dim=1)
         self.assertTrue(torch.equal(decoded, expected))
 
-    def test_set_stream_and_decode_stream(self):
-        batch_size = 2
-        num_dists = 4
-        num_symbols = 16
-        pmf = torch.randint(1, 100, (num_dists, num_symbols), dtype=torch.int32)
-        num_freqs = torch.full((num_dists,), num_symbols, dtype=torch.int32)
-        offsets = torch.zeros(num_dists, dtype=torch.int32)
-
-        coder = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
-        coder.init_params(pmf, num_freqs, offsets)
-
-        seq_len = 32
-        symbols1 = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
-        indexes1 = torch.randint(0, num_dists, (batch_size, seq_len), dtype=torch.int32)
-
-        coder.encode_with_indexes(symbols1, indexes1, cache=True)
-        encoded = coder.flush()
-
+        # decode by streamed interface
         coder2 = TorchANSInterface(impl="rans64", freq_precision=12, device="cpu")
         coder2.init_params(pmf, num_freqs, offsets)
         coder2.set_stream(encoded)
 
         decoded = coder2.decode_stream(indexes1)
         self.assertTrue(torch.equal(decoded, symbols1))
+
+        decoded = coder2.decode_stream(indexes2)
+        self.assertTrue(torch.equal(decoded, symbols2))
+
 
     def test_different_implementations(self):
         # Test different rANS implementations
@@ -226,11 +306,11 @@ class TestTorchANSHigherLevelAPI(unittest.TestCase):
 
         # Cache some data
         coder.encode_with_indexes(symbols, indexes, cache=True)
-        self.assertTrue(len(coder.cache_encode_with_indexes) > 0)
+        self.assertTrue(len(coder._encode_queue) > 0)  # Changed to _encode_queue
 
         # Reset cache
         coder.reset_cache()
-        self.assertEqual(len(coder.cache_encode_with_indexes), 0)
+        self.assertEqual(len(coder._encode_queue), 0)
 
     def test_num_parallel_states(self):
         # Test with explicit num_parallel_states
