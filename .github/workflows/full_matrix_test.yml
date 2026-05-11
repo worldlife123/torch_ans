@@ -66,6 +66,7 @@ jobs:
       - name: Run benchmarks
         run: pytest --benchmark-only --benchmark-json=benchmark.json tests/test_benchmarks.py
       - name: Create result file
+        if: ${{ always() }}
         shell: bash
         run: |
           if [ "${{ job.status }}" == "success" ]; then
@@ -74,11 +75,13 @@ jobs:
             echo "FAIL" > result.txt
           fi
       - name: Upload result
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: result.txt
       - name: Upload benchmark artifact
+        if: ${{ success() }}
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
