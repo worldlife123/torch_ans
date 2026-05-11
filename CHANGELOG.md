@@ -5,8 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on "Keep a Changelog" and this project adheres to semantic versioning.
 
 ## [Unreleased]
+- (Beta) Added warp-level primitive based interleaved ANS implementation for GPU coding.
 
 - (Add bullet points for changes that will go into the next release)
+
+## [0.2.0] - 2026-05-11
+
+- Reworked high-level API, adding a unified encode/decode API supporting different coding patterns, keeping CompressAI-like encode/decode_with_indexes API for compability.
 
 ## [0.1.3] - 2026-04-26
 

@@ -1,10 +1,8 @@
-<!-- # Badges
+# torch_ans
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![PyPI](https://img.shields.io/pypi/v/torch_ans?label=PyPI)
-![License](https://img.shields.io/badge/license-TODO-blue) -->
-
-# torch_ans
+![License](https://img.shields.io/badge/license-MIT-green)
 
 **torch_ans** is a high-performance PyTorch extension for ANS (Asymmetric Numeral Systems) entropy coding, supporting both C++ and CUDA backends across multiple platforms including Linux, macOS, and Windows. It enables fast, parallel rANS (range ANS) compression and decompression for deep learning and data compression workflows.
 This extension is designed as an efficient, extensible replacement to [torchac](https://github.com/fab-jul/torchac) and [CompressAI](https://github.com/InterDigitalInc/CompressAI) range coding.
@@ -501,7 +499,7 @@ This produces Python coverage output in `htmlcov/` and native C/C++ coverage out
 
 
 ### TODO
-- Implement per-symbol coding (encode/decode_with_freqs) and direct symbol coding with pre-defined distributions ((encode/decode_symbols)) in high-level API
+- Docs and examples for high-level API
 - Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
 - Implement lookup table logic in push/pop steps for possible acceleration (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
 - Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))

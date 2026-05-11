@@ -25,15 +25,15 @@ def get_extension_config():
     include_dirs = [extension_dir]
 
     # extra_compile_args = {"cxx": ["-std=c++17", "-O3", '-fopenmp', '-march=native']}
-    extra_compile_args = {"cxx": ["-std=c++17", "-O3"]}
+    extra_compile_args = dict()
     extra_link_args = []
 
     if sys.platform == "win32":
         extra_compile_args["cxx"] = ["/std:c++17", "/O2", "/openmp"]
     elif sys.platform == "darwin":
-        extra_compile_args["cxx"] += ["-mmacosx-version-min=10.14"]
+        extra_compile_args["cxx"] = ["-std=c++17", "-O3", "-mmacosx-version-min=10.14"]
     else:
-        extra_compile_args["cxx"] += ["-fopenmp"]
+        extra_compile_args["cxx"] = ["-std=c++17", "-O3", "-fopenmp"]
 
     if platform.machine() == "x86_64":
         extra_compile_args["cxx"] += ["-march=native"]
@@ -109,13 +109,13 @@ setup(
     package_data={
         "torch_ans": [
             "*.hpp",
+            "*.cpp",
             "*.h",
-            "*.hh",
-            "*.inl",
-            "*.ipp",
+            # "*.hh",
+            # "*.inl",
+            # "*.ipp",
             "*.cu",
             "*.cuh",
-            "*.cpp",
         ]
     },
     ext_modules=ext_modules,

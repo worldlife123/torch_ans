@@ -20,6 +20,9 @@ license = { file="LICENSE" }
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "pytest-benchmark", "gcovr"]
 
+[tool.setuptools.packages.find]
+exclude = ["tests"]
+
 [tool.pytest.ini_options]
 # addopts = "--cov=torch_ans --cov-report=html --cov-report=term-missing"
 testpaths = ["tests"]
