@@ -64,6 +64,24 @@ def fetch_pytorch_versions(cuda_versions):
 
     return sorted(python_versions), sorted(cuda_versions_found), sorted(variants)
 
+def python_available_on_runner(py_version, os_name, arch):
+    """Whether actions/setup-python provides this CPython for the runner.
+
+    The torch wheel index lists wheels for Python versions that have no
+    matching runner interpreter yet (e.g. cp315 wheels uploaded ahead of the
+    CPython 3.15 release) and wheels for combinations setup-python does not
+    serve (Python 3.7 has no arm64 Linux build, macOS arm64 starts at 3.9).
+    Generating those entries makes actions/setup-python fail the job.
+    """
+    v = tuple(map(int, py_version.split('.')))
+    if v >= (3, 15):
+        return False  # CPython 3.15 not released yet; no setup-python support
+    if arch == 'aarch64':
+        return v >= (3, 8)  # no official 3.7 arm64 build on setup-python
+    if os_name == 'macos' and arch == 'arm64':
+        return v >= (3, 9)  # Apple Silicon CPython starts at 3.9
+    return True
+
 def main():
 
     # get CUDA versions from command line or use defaults
@@ -97,7 +115,7 @@ def main():
     # Create matrix entries with os, arch, and runner
     matrix = []
     for py, cuda, os_name, arch in variants:
-        if py in python_versions:
+        if py in python_versions and python_available_on_runner(py, os_name, arch):
             matrix.append({
                 "python-version": py,
                 "cuda-version": cuda,

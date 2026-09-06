@@ -93,6 +93,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        # A tag trigger checks out the tag in detached HEAD, where
+        # add-and-commit cannot create a branch commit; check out main
+        # explicitly since the status tables belong there.
+        with:
+          ref: main
+          fetch-depth: 0
       - name: Download all results
         uses: actions/download-artifact@v7
         with:
