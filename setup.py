@@ -120,10 +120,15 @@ elif want_build:
         )
 
 
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"), encoding="utf-8") as _f:
+    _long_description = _f.read()
+
 setup(
     name="torch_ans",
     version="0.2.1",
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
+    long_description=_long_description,
+    long_description_content_type="text/markdown",
     author="worldlife",
     author_email="worldlife@sjtu.edu.cn",
     url="https://github.com/worldlife123/torch_ans",
