@@ -129,6 +129,7 @@ setup(
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     long_description=_long_description,
     long_description_content_type="text/markdown",
+    license="MIT",
     author="worldlife",
     author_email="worldlife@sjtu.edu.cn",
     url="https://github.com/worldlife123/torch_ans",
