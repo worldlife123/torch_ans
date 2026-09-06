@@ -74,9 +74,10 @@ jobs:
 
 
       - name: Install libomp on macOS
+        # No `brew update` here: it can fail on runner-broken third-party
+        # taps, and libomp is available from the pre-seeded index.
         if: runner.os == 'macOS'
         run: |
-          brew update
           brew install libomp
 
       - name: Install PyTorch
@@ -144,6 +145,21 @@ jobs:
         run: |
           brew update
           brew install libomp
+
+      - name: Install libomp on macOS
+        # No `brew update` here: it can fail on runner-broken third-party
+        # taps, and libomp is available from the pre-seeded index. Needed so
+        # the dynamically built extension keeps OpenMP (at::parallel_for)
+        # multi-threaded.
+        if: runner.os == 'macOS'
+        run: |
+          brew install libomp
+
+      - name: Activate MSVC environment on Windows
+        # torch's cpp_extension requires cl.exe on PATH for JIT builds
+        # (unlike setuptools, it does not locate MSVC by itself).
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install PyTorch (CPU) and pytest
         run: |

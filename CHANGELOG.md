@@ -6,6 +6,7 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 
 ## [Unreleased]
 
+- Fix runtime build on machines where every CUDA configuration fails: the `cuda_build_state="cpu"` shortcut no longer compiles the CPU-only extension with `-DWITH_CUDA` (it produced a `.so` with undefined symbols that failed to load and forced a second, pure-CPU rebuild on every fresh import — ~76s per process). Also pass `-DWITH_CUDA` to nvcc explicitly (torch only forwards `extra_cflags` to the C++ compiler and, unlike `WITH_HIP`, does not define it itself), so a successful CUDA toolchain no longer goes undetected.
 - (Add bullet points for changes that will go into the next release)
 
 ## [0.2.1] - 2026-09-07

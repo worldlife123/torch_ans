@@ -28,12 +28,30 @@ def get_extension_config():
     extra_compile_args = dict()
     extra_link_args = []
 
+    # torch's cpp_extension appends its own -std (c++14 for torch 1.x, c++17
+    # /c++20 for newer) and our headers need C++17 (std::optional / if
+    # constexpr), so supply -std=c++17 only when torch's own default is older
+    # (torch 1.x); for torch >= 2.0 never pass one — a user-supplied -std
+    # comes later on the command line and would override torch's choice,
+    # breaking builds against newer torch releases that require C++20.
+    # (See torch_ans/_dynamic_build.py for the same logic in the runtime
+    # build.)
+    try:
+        _torch_major = int(torch.__version__.split("+")[0].split(".")[0])
+    except Exception:
+        _torch_major = 2
+    std_flag = "/std:c++17" if sys.platform == "win32" else "-std=c++17"
+    std_flags = [std_flag] if _torch_major < 2 else []
+    # Xcode 16's clang turns the std::is_arithmetic specialization in torch
+    # 2.7's c10/util/strong_type.h into an error (-Winvalid-specialization).
+    darwin_extra = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
+
     if sys.platform == "win32":
-        extra_compile_args["cxx"] = ["/O2", "/openmp"]
+        extra_compile_args["cxx"] = ["/O2", "/openmp"] + std_flags
     elif sys.platform == "darwin":
-        extra_compile_args["cxx"] = ["-O3", "-mmacosx-version-min=10.14"]
+        extra_compile_args["cxx"] = ["-O3", "-mmacosx-version-min=10.14"] + darwin_extra + std_flags
     else:
-        extra_compile_args["cxx"] = ["-O3", "-fopenmp"]
+        extra_compile_args["cxx"] = ["-O3", "-fopenmp"] + std_flags
 
     if platform.machine() == "x86_64":
         extra_compile_args["cxx"] += ["-march=native"]

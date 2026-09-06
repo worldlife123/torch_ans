@@ -81,6 +81,28 @@ def _darwin_cpu_flag_variants():
     return variants
 
 
+def _record_build_metadata(pkg_dir: Path, build_with_cuda: bool) -> None:
+    """Record build metadata for the runtime torch-version check in __init__."""
+    try:
+        import torch
+        build_ver_path = pkg_dir / "_torch_build_version.py"
+        with open(build_ver_path, "w") as f:
+            f.write(f"BUILD_TORCH_VERSION = {repr(torch.__version__)}\n")
+            f.write(f"BUILD_WITH_CUDA = {repr(build_with_cuda)}\n")
+            f.write(f"BUILD_WITH_HIP = {repr(False)}\n")
+    except Exception:
+        pass
+
+
+def _torch_major_version() -> int:
+    """Major version of the installed torch (2 when it cannot be determined)."""
+    try:
+        import torch
+        return int(torch.__version__.split("+")[0].split(".")[0])
+    except Exception:
+        return 2
+
+
 def _reset_jit_versioner(module_name: str) -> None:
     """Make the next torch JIT build reuse the base module name.
 
@@ -178,17 +200,26 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         raise RuntimeError("No C++ sources found in package for runtime compilation")
 
     # Per-platform CPU compile flags, as (cflags, ldflags) variants tried in
-    # order. NOTE: no `-std=` flag is passed here on purpose — torch's
-    # cpp_extension always appends the C++ standard matching its own headers
-    # (c++14/17/20 depending on the torch version), and a user-supplied
-    # `-std=` comes later on the command line and would override it, breaking
-    # builds against newer torch releases that require C++20.
+    # order. The C++ standard is chosen as follows: torch's cpp_extension
+    # always appends the standard matching its own headers (c++14 for torch
+    # 1.x, c++17 for 2.x up to ~2.13, c++20 for newer) and a user-supplied
+    # `-std=` comes later on the command line and would override it — so we
+    # supply `-std=c++17` (needed for `std::optional`/`if constexpr` in our
+    # headers) only when torch's own default is older (torch 1.x), and never
+    # downgrade newer torch releases that require C++20.
+    torch_major = _torch_major_version()
+    std_flags = ["/std:c++17" if sys.platform == "win32" else "-std=c++17"] if torch_major < 2 else []
+
+    # Xcode 16's clang turns the std::is_arithmetic specialization in torch
+    # 2.7's c10/util/strong_type.h into an error (-Winvalid-specialization).
+    darwin_extra = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
+
     if sys.platform == "win32":
-        cpu_flag_variants = [(["/O2", "/openmp"], [])]
+        cpu_flag_variants = [(["/O2", "/openmp"] + std_flags, [])]
     elif sys.platform == "darwin":
-        cpu_flag_variants = _darwin_cpu_flag_variants()
+        cpu_flag_variants = [(c + darwin_extra, ld) for c, ld in _darwin_cpu_flag_variants()]
     else:
-        cflags = ["-O3", "-fopenmp"]
+        cflags = ["-O3", "-fopenmp"] + std_flags
         if platform.machine() == "x86_64":
             cflags.append("-march=native")
         cpu_flag_variants = [(cflags, [])]
@@ -196,6 +227,12 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     # setup.py's CUDAExtension defines WITH_CUDA for install-time builds; the
     # JIT loader does not, so the CUDA dispatch branches in rans.hpp would be
     # compiled out and CUDA tensors would hit "not compiled with GPU support".
+    # The macro is only correct for the full CUDA build (cpp + cu sources):
+    # the guarded dispatch calls functions defined in the .cu sources, so a
+    # cpp-only build with it produces a .so with undefined symbols that fails
+    # to load. `cpu_only_flag_variants` stays free of it and is used for
+    # every cpp-only build below (including the failed-CUDA shortcut).
+    cpu_only_flag_variants = cpu_flag_variants
     if with_cuda:
         cpu_flag_variants = [(c + ["-DWITH_CUDA"], ld) for c, ld in cpu_flag_variants]
 
@@ -220,9 +257,9 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
                 verbose=verbose,
             )
 
-    if not with_cuda:
+    def _build_cpu_only():
         last_err = None
-        for extra_cflags, extra_ldflags in cpu_flag_variants:
+        for extra_cflags, extra_ldflags in cpu_only_flag_variants:
             try:
                 module = _load(cpp_sources, [], extra_cflags, extra_ldflags)
                 last_err = None
@@ -231,17 +268,11 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
                 last_err = e
         if last_err is not None:
             raise last_err
-        # Record build metadata for the runtime torch-version check in __init__.
-        try:
-            import torch
-            build_ver_path = pkg_dir / "_torch_build_version.py"
-            with open(build_ver_path, "w") as f:
-                f.write(f"BUILD_TORCH_VERSION = {repr(torch.__version__)}\n")
-                f.write(f"BUILD_WITH_CUDA = {repr(False)}\n")
-                f.write(f"BUILD_WITH_HIP = {repr(False)}\n")
-        except Exception:
-            pass
+        _record_build_metadata(pkg_dir, False)
         return module
+
+    if not with_cuda:
+        return _build_cpu_only()
 
     # CUDA build orchestration with failure memory (see _cuda_state_path).
     state_path = _cuda_state_path(module_name)
@@ -259,8 +290,10 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
                 "Remove the cuda_build_state file in the torch extensions cache directory "
                 "after fixing the CUDA toolchain to retry."
             )
-        cuda_cflags, cuda_ldflags = cpu_flag_variants[0]
-        return _load(cpp_sources, [], cuda_cflags, cuda_ldflags)
+        # CPU-only flags (no -DWITH_CUDA): defining it here would reference the
+        # CUDA implementations that live in the .cu sources and are not linked
+        # into this build, making the .so fail to load.
+        return _build_cpu_only()
 
     # Try the remembered-working configuration first (if any), then the plain
     # build, then older host compilers that work around nvcc <= 12.1 vs
@@ -277,7 +310,10 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         attempt_order = [plain]
     attempt_order += ccbin_candidates
 
-    extra_cuda_cflags = ["-O3"]
+    # WITH_CUDA must reach nvcc explicitly: torch's cpp_extension passes
+    # extra_cflags to the C++ compiler only and (unlike WITH_HIP) does not
+    # define WITH_CUDA itself, and rans_cuda.cu is empty without it.
+    extra_cuda_cflags = ["-O3", "-DWITH_CUDA"]
     base_cflags, base_ldflags = cpu_flag_variants[0]
     last_err = None
     for cc in attempt_order:
@@ -299,16 +335,7 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         if cc is not None and verbose:
             print(f"CUDA build succeeded with host compiler {cc}")
 
-        # Record build metadata for the runtime torch-version check in __init__.
-        try:
-            import torch
-            build_ver_path = pkg_dir / "_torch_build_version.py"
-            with open(build_ver_path, "w") as f:
-                f.write(f"BUILD_TORCH_VERSION = {repr(torch.__version__)}\n")
-                f.write(f"BUILD_WITH_CUDA = {repr(True)}\n")
-                f.write(f"BUILD_WITH_HIP = {repr(False)}\n")
-        except Exception:
-            pass
+        _record_build_metadata(pkg_dir, True)
         return module
 
     # Every CUDA configuration failed: remember to build CPU-only next time.
