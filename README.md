@@ -517,6 +517,7 @@ import torch_ans
   - The build is triggered by importing `torch_ans._C` or `torch_ans.utils` (e.g. when using `TorchANSInterface`) if the compiled extension is not present. The first import compiles the extension (about a minute); later imports reuse the cached build under the torch extensions directory (`~/.cache/torch_extensions/`).
   - Runtime compilation requires a C/C++ toolchain and `ninja` (installed automatically as a dependency).
   - The runtime build tries CUDA first and falls back to CPU-only automatically when no usable CUDA runtime or toolchain is available. For CUDA builds you must have a compatible CUDA toolkit and driver installed (see Known Issues for nvcc/GCC compatibility).
+  - CPU parallel coding relies on OpenMP: `at::parallel_for` in the native code is multi-threaded only when the extension is compiled with OpenMP enabled. The runtime build enables it automatically on Linux (GCC `-fopenmp`) and Windows (MSVC `/openmp`); on macOS it uses Homebrew libomp (`-Xpreprocessor -fopenmp -lomp`) when installed, and falls back to single-threaded coding otherwise.
   - If your runtime PyTorch ABI differs from the build-time one, `torch_ans` will warn by default. Set `TORCH_ANS_STRICT_CHECK=1` to re-enable a strict ImportError on mismatch.
   - To keep CI/tests stable, the bundled test for dynamic build is guarded; enable it with `RUN_DYNAMIC_BUILD_TEST=1` when you want to run the rebuild test locally.
 

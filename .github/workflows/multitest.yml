@@ -96,3 +96,94 @@ jobs:
       - name: Run tests
         run: |
           pytest -q
+
+  lazy-compile-test:
+    # Tests the lazy compile installation mode (0.2.1): the package is
+    # installed via a PEP 517 isolated build, where torch is not importable so
+    # setup.py skips the native extension and installs a pure-Python package.
+    # The extension must then be compiled automatically at first import.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python-version: 3.9
+            torch: 2.1.1
+          - os: ubuntu-latest
+            python-version: 3.11
+            torch: 2.7.1
+          - os: windows-latest
+            python-version: 3.11
+            torch: 2.7.1
+          - os: macos-latest
+            python-version: 3.11
+            torch: 2.7.1
+    env:
+      RUN_DYNAMIC_BUILD_TEST: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-lazy-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-lazy-${{ matrix.python-version }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install libomp on macOS
+        # Enables OpenMP (at::parallel_for) for the dynamically built extension.
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install libomp
+
+      - name: Install PyTorch (CPU) and pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install "torch==${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Show versions
+        run: |
+          python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+
+      - name: Install package in lazy compile mode (PEP 517 isolated build)
+        run: |
+          # The isolated build environment has no torch, so setup.py skips the
+          # native extension build and installs a pure-Python package.
+          python -m pip install .
+
+      - name: Verify pure-Python install (no prebuilt extension)
+        # Run outside the checkout so "import torch_ans" resolves to the
+        # installed site-packages copy, not the source tree.
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import glob, os, torch_ans
+          pkg_dir = os.path.dirname(torch_ans.__file__)
+          binaries = glob.glob(os.path.join(pkg_dir, "*.so")) + glob.glob(os.path.join(pkg_dir, "*.pyd"))
+          assert not binaries, f"expected a pure-Python install, found binaries: {binaries}"
+          print("pure-Python install verified:", pkg_dir)
+
+      - name: Verify dynamic build on first import
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import torch_ans._C as m
+          assert "torch_extensions" in m.__file__, f"extension was not dynamically built: {m.__file__}"
+          print("dynamic build OK:", m.__file__)
+
+      - name: Run tests
+        # Run from outside the checkout so the tests exercise the installed
+        # (lazily built) package rather than the source tree.
+        working-directory: ${{ runner.temp }}
+        run: |
+          pytest -q ${{ github.workspace }}/tests

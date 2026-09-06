@@ -10,6 +10,7 @@ This is intentionally small and conservative: it mirrors enough of
 from __future__ import annotations
 
 import os
+import platform
 import sys
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,34 @@ def _older_host_compilers():
         if path:
             compilers.append(path)
     return compilers
+
+
+def _darwin_cpu_flag_variants():
+    """CPU compile flag variants for macOS, fastest (OpenMP) first.
+
+    `rans_cpu.cpp` parallelizes batch coding with `at::parallel_for`, which is
+    multi-threaded only when the extension is compiled with OpenMP enabled
+    (`_OPENMP` selects ATen's AT_PARALLEL_OPENMP backend; ~3-4x throughput on
+    many-core machines). Apple clang has no built-in OpenMP, so when Homebrew
+    libomp is available use the standard `-Xpreprocessor -fopenmp` + `-lomp`
+    recipe; otherwise (or if the OpenMP attempt fails) fall back to flags
+    that still build, at the cost of a serial at::parallel_for.
+    """
+    base = ["-std=c++17", "-O3", "-mmacosx-version-min=10.14"]
+    variants = []
+    try:
+        import subprocess
+        out = subprocess.run(["brew", "--prefix", "libomp"], capture_output=True, text=True, timeout=10)
+        prefix = out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        prefix = ""
+    if prefix and os.path.exists(os.path.join(prefix, "include", "omp.h")):
+        variants.append((
+            base + ["-Xpreprocessor", "-fopenmp", f"-I{prefix}/include"],
+            [f"-L{prefix}/lib", "-lomp", f"-Wl,-rpath,{prefix}/lib"],
+        ))
+    variants.append((base, []))
+    return variants
 
 
 def _reset_jit_versioner(module_name: str) -> None:
@@ -108,15 +137,27 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     if len(cpp_sources) == 0:
         raise RuntimeError("No C++ sources found in package for runtime compilation")
 
-    extra_cflags = ["-std=c++17", "-O3", "-fopenmp"]
+    # Per-platform CPU compile flags, as (cflags, ldflags) variants tried in
+    # order: MSVC on Windows does not accept GCC-style flags, and on macOS
+    # OpenMP needs Homebrew libomp (see _darwin_cpu_flag_variants) to keep
+    # at::parallel_for multi-threaded.
+    if sys.platform == "win32":
+        cpu_flag_variants = [(["/std:c++17", "/O2", "/openmp"], [])]
+    elif sys.platform == "darwin":
+        cpu_flag_variants = _darwin_cpu_flag_variants()
+    else:
+        cflags = ["-std=c++17", "-O3", "-fopenmp"]
+        if platform.machine() == "x86_64":
+            cflags.append("-march=native")
+        cpu_flag_variants = [(cflags, [])]
 
     # setup.py's CUDAExtension defines WITH_CUDA for install-time builds; the
     # JIT loader does not, so the CUDA dispatch branches in rans.hpp would be
     # compiled out and CUDA tensors would hit "not compiled with GPU support".
     if with_cuda:
-        extra_cflags = extra_cflags + ["-DWITH_CUDA"]
+        cpu_flag_variants = [(c + ["-DWITH_CUDA"], ld) for c, ld in cpu_flag_variants]
 
-    def _load(sources, extra_cuda_cflags):
+    def _load(sources, extra_cuda_cflags, extra_cflags, extra_ldflags=None):
         _reset_jit_versioner(module_name)
         try:
             return torch_ext_load(
@@ -124,10 +165,12 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
                 sources=sources,
                 extra_cflags=extra_cflags,
                 extra_cuda_cflags=extra_cuda_cflags,
+                extra_ldflags=extra_ldflags,
                 verbose=verbose,
             )
         except TypeError:
-            # some torch versions have different signature; try without extra_cuda_cflags
+            # some torch versions have different signature; try without the
+            # optional flag arguments
             return torch_ext_load(
                 name=module_name,
                 sources=sources,
@@ -136,7 +179,16 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
             )
 
     if not with_cuda:
-        module = _load(cpp_sources, [])
+        last_err = None
+        for extra_cflags, extra_ldflags in cpu_flag_variants:
+            try:
+                module = _load(cpp_sources, [], extra_cflags, extra_ldflags)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            raise last_err
         # Record build metadata for the runtime torch-version check in __init__.
         try:
             import torch
@@ -165,7 +217,8 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
                 "Remove the cuda_build_state file in the torch extensions cache directory "
                 "after fixing the CUDA toolchain to retry."
             )
-        return _load(cpp_sources, [])
+        cuda_cflags, cuda_ldflags = cpu_flag_variants[0]
+        return _load(cpp_sources, [], cuda_cflags, cuda_ldflags)
 
     # Try the remembered-working configuration first (if any), then the plain
     # build, then older host compilers that work around nvcc <= 12.1 vs
@@ -183,11 +236,12 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     attempt_order += ccbin_candidates
 
     extra_cuda_cflags = ["-O3", "-std=c++17"]
+    base_cflags, base_ldflags = cpu_flag_variants[0]
     last_err = None
     for cc in attempt_order:
         flags = extra_cuda_cflags if cc is None else extra_cuda_cflags + ["-ccbin", cc]
         try:
-            module = _load(cpp_sources + cu_sources, flags)
+            module = _load(cpp_sources + cu_sources, flags, base_cflags, base_ldflags)
         except Exception as e:
             last_err = e
             continue

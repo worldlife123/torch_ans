@@ -8,9 +8,10 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 
 - (Add bullet points for changes that will go into the next release)
 
-## [0.2.1] - 2026-05-22
+## [0.2.1] - 2026-09-07
 
-- (Beta, CI pending) Add lazy compile mode during installation: Users can now directly use `pip install torch_ans` without `--no-build-isolation` to skip building when install. In this case the building will occur during first-time import.
+- (Beta) Add lazy compile mode during installation: Users can now directly use `pip install torch_ans` without `--no-build-isolation` to skip building when install. In this case the building will occur during first-time import. A dedicated `lazy-compile-test` CI job covers this flow on Linux/Windows/macOS, and the runtime build works around the nvcc <= 12.1 vs GCC >= 11.4 libstdc++ header incompatibility (see README Known Issues).
+- Runtime dynamic build: platform-appropriate compile flags (MSVC / Apple clang / GCC), OpenMP kept enabled so `at::parallel_for` stays multi-threaded for CPU coding (with Homebrew libomp support on macOS), and build results cached in the torch extensions directory.
 - Add index range check in C++/CUDA rans_push/pop code, improving its stability and reduce "Segmentation fault" issues.
 - Fix cached encode in high-level API: adding CompressAI params to encode queue, and properly reset cache after flush.
 
