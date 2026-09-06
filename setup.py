@@ -29,11 +29,11 @@ def get_extension_config():
     extra_link_args = []
 
     if sys.platform == "win32":
-        extra_compile_args["cxx"] = ["/std:c++17", "/O2", "/openmp"]
+        extra_compile_args["cxx"] = ["/O2", "/openmp"]
     elif sys.platform == "darwin":
-        extra_compile_args["cxx"] = ["-std=c++17", "-O3", "-mmacosx-version-min=10.14"]
+        extra_compile_args["cxx"] = ["-O3", "-mmacosx-version-min=10.14"]
     else:
-        extra_compile_args["cxx"] = ["-std=c++17", "-O3", "-fopenmp"]
+        extra_compile_args["cxx"] = ["-O3", "-fopenmp"]
 
     if platform.machine() == "x86_64":
         extra_compile_args["cxx"] += ["-march=native"]
@@ -43,13 +43,13 @@ def get_extension_config():
         sources += glob(f"{extension_dir}/*.cu")
         ext_type = CUDAExtension
         define_macros += [("WITH_CUDA", None)]
-        extra_compile_args["nvcc"] = ["-O3", "-std=c++17"]
+        extra_compile_args["nvcc"] = ["-O3"]
     elif (getattr(torch.version, "hip", None) is not None and os.getenv("WITH_HIP", "0") == "1") or os.getenv("FORCE_ROCM", "0") == "1":
         sources += glob(f"{extension_dir}/*.cu")
         if ROCMExtension is not None:
             ext_type = ROCMExtension
             define_macros += [("WITH_HIP", None)]
-            extra_compile_args["hipcc"] = ["-O3", "-std=c++17"]
+            extra_compile_args["hipcc"] = ["-O3"]
         else:
             ext_type = CppExtension  # fallback if ROCMExtension not available
     else:

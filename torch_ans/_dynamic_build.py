@@ -64,7 +64,7 @@ def _darwin_cpu_flag_variants():
     recipe; otherwise (or if the OpenMP attempt fails) fall back to flags
     that still build, at the cost of a serial at::parallel_for.
     """
-    base = ["-std=c++17", "-O3", "-mmacosx-version-min=10.14"]
+    base = ["-O3", "-mmacosx-version-min=10.14"]
     variants = []
     try:
         import subprocess
@@ -101,6 +101,42 @@ def _reset_jit_versioner(module_name: str) -> None:
         pass
 
 
+def _patch_file_baton_stale_lock(stale_seconds: int = 600) -> None:
+    """Make torch's FileBaton treat ancient lock files as stale.
+
+    A build killed mid-way (CI timeout, OOM, Ctrl-C) leaves the baton lock
+    file behind, and every later import would spin on ``baton.wait()``
+    forever (it has no timeout). With this patch, acquiring fails only for
+    *fresh* locks; stale ones are removed and the acquire retried, so
+    imports never deadlock. Best effort: silently skipped on torch versions
+    where the patch cannot be applied.
+    """
+    try:
+        import time
+        from torch.utils import file_baton as _fb
+
+        if getattr(_fb.FileBaton, "_torch_ans_stale_patch", False):
+            return
+        original_try_acquire = _fb.FileBaton.try_acquire
+
+        def try_acquire(self):
+            ok = original_try_acquire(self)
+            if not ok:
+                try:
+                    age = time.time() - os.path.getmtime(self.lock_file_path)
+                    if age > stale_seconds:
+                        os.remove(self.lock_file_path)
+                        ok = original_try_acquire(self)
+                except OSError:
+                    pass
+            return ok
+
+        _fb.FileBaton.try_acquire = try_acquire
+        _fb.FileBaton._torch_ans_stale_patch = True
+    except Exception:
+        pass
+
+
 def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bool] = None, verbose: bool = False):
     """Build the native extension under `module_name` and return the module.
 
@@ -131,6 +167,10 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     except Exception as e:
         raise RuntimeError("torch.utils.cpp_extension.load is required for runtime compilation: " + str(e))
 
+    # A previous build killed mid-way leaves a stale baton lock behind, which
+    # would make every later import spin on FileBaton.wait() forever.
+    _patch_file_baton_stale_lock()
+
     pkg_dir = Path(__file__).resolve().parent
     cpp_sources = [str(p) for p in pkg_dir.glob("*.cpp")]
     cu_sources = [str(p) for p in pkg_dir.glob("*.cu")]
@@ -138,15 +178,17 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         raise RuntimeError("No C++ sources found in package for runtime compilation")
 
     # Per-platform CPU compile flags, as (cflags, ldflags) variants tried in
-    # order: MSVC on Windows does not accept GCC-style flags, and on macOS
-    # OpenMP needs Homebrew libomp (see _darwin_cpu_flag_variants) to keep
-    # at::parallel_for multi-threaded.
+    # order. NOTE: no `-std=` flag is passed here on purpose — torch's
+    # cpp_extension always appends the C++ standard matching its own headers
+    # (c++14/17/20 depending on the torch version), and a user-supplied
+    # `-std=` comes later on the command line and would override it, breaking
+    # builds against newer torch releases that require C++20.
     if sys.platform == "win32":
-        cpu_flag_variants = [(["/std:c++17", "/O2", "/openmp"], [])]
+        cpu_flag_variants = [(["/O2", "/openmp"], [])]
     elif sys.platform == "darwin":
         cpu_flag_variants = _darwin_cpu_flag_variants()
     else:
-        cflags = ["-std=c++17", "-O3", "-fopenmp"]
+        cflags = ["-O3", "-fopenmp"]
         if platform.machine() == "x86_64":
             cflags.append("-march=native")
         cpu_flag_variants = [(cflags, [])]
@@ -235,7 +277,7 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         attempt_order = [plain]
     attempt_order += ccbin_candidates
 
-    extra_cuda_cflags = ["-O3", "-std=c++17"]
+    extra_cuda_cflags = ["-O3"]
     base_cflags, base_ldflags = cpu_flag_variants[0]
     last_err = None
     for cc in attempt_order:
