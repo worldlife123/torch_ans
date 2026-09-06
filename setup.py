@@ -143,7 +143,7 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"),
 
 setup(
     name="torch_ans",
-    version="0.2.1",
+    version="0.2.1.post1",
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     long_description=_long_description,
     long_description_content_type="text/markdown",

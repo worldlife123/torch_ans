@@ -6,8 +6,12 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 
 ## [Unreleased]
 
-- Fix runtime build on machines where every CUDA configuration fails: the `cuda_build_state="cpu"` shortcut no longer compiles the CPU-only extension with `-DWITH_CUDA` (it produced a `.so` with undefined symbols that failed to load and forced a second, pure-CPU rebuild on every fresh import — ~76s per process). Also pass `-DWITH_CUDA` to nvcc explicitly (torch only forwards `extra_cflags` to the C++ compiler and, unlike `WITH_HIP`, does not define it itself), so a successful CUDA toolchain no longer goes undetected.
 - (Add bullet points for changes that will go into the next release)
+
+## [0.2.1.post1] - 2026-09-07
+
+- Packaging fixes surfaced by the v0.2.1 CI run: supply `-std=c++17` only for torch 1.x (torch >= 2.x selects its own C++ standard, up to C++20 for newer releases, and a user-supplied `-std=` would override it), silence Xcode 16's `-Winvalid-specialization` error for torch 2.7 headers on macOS, and skip `brew update` in CI.
+- Fix runtime build on machines where every CUDA configuration fails: the `cuda_build_state="cpu"` shortcut no longer compiles the CPU-only extension with `-DWITH_CUDA` (it produced a `.so` with undefined symbols that failed to load and forced a second, pure-CPU rebuild on every fresh import — ~76s per process). Also pass `-DWITH_CUDA` to nvcc explicitly (torch only forwards `extra_cflags` to the C++ compiler and, unlike `WITH_HIP`, does not define it itself), so a successful CUDA toolchain no longer goes undetected.
 
 ## [0.2.1] - 2026-09-07
 
