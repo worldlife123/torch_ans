@@ -5,9 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on "Keep a Changelog" and this project adheres to semantic versioning.
 
 ## [Unreleased]
-- (Beta) Added warp-level primitive based interleaved ANS implementation for GPU coding.
 
 - (Add bullet points for changes that will go into the next release)
+
+## [0.2.1] - 2026-05-22
+
+- (Beta, CI pending) Add lazy compile mode during installation: Users can now directly use `pip install torch_ans` without `--no-build-isolation` to skip building when install. In this case the building will occur during first-time import.
+- Add index range check in C++/CUDA rans_push/pop code, improving its stability and reduce "Segmentation fault" issues.
+- Fix cached encode in high-level API: adding CompressAI params to encode queue, and properly reset cache after flush.
+
 
 ## [0.2.0] - 2026-05-11
 

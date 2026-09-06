@@ -112,24 +112,25 @@ class TestTorchANS(unittest.TestCase):
         stream = init_func()
         if hasattr(stream, 'to'):
             stream = stream.to(device)
-        print(f"{name} init time: {time.time() - start_time}")
+        print(f"{name} on {device} init time: {time.time() - start_time}")
 
         start_time = time.time()
         try:
             push_func(stream, data)
         except RuntimeError as e:
+            print(e)
             # If the native extension wasn't compiled with GPU support, skip this CUDA variant gracefully
             if device == "cuda" and "not compiled with GPU support" in str(e):
                 # print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
                 self.skipTest("torch_ans is not compiled with GPU support")
                 return
-            raise
+            raise e
         byte_strings = rans_stream_to_byte_strings(stream.cpu() if device == "cuda" else stream)
         if device == "cuda":
             # Ensure CUDA kernels finish before timing
             torch.cuda.synchronize()
-        print(f"{name} encoding time: {time.time() - start_time}")
-        print(f"{name} encoding bytes: {stream[:, 0].sum()}")
+        print(f"{name} on {device} encoding time: {time.time() - start_time}")
+        print(f"{name} on {device} encoding bytes: {stream[:, 0].sum()}")
         start_time = time.time()
         stream = rans_byte_strings_to_stream(byte_strings)
         if device == "cuda" and hasattr(stream, 'cuda'):
@@ -144,7 +145,7 @@ class TestTorchANS(unittest.TestCase):
             raise
         if device == "cuda":
             torch.cuda.synchronize()
-        print(f"{name} decoding time: {time.time() - start_time}")
+        print(f"{name} on {device} decoding time: {time.time() - start_time}")
 
         self.assertFalse((data.cpu() != decoded.cpu()).any())
         # self.assertEqual(data.reshape(-1).tolist(), decoded.reshape(-1).tolist())
@@ -435,7 +436,6 @@ class TestTorchANS(unittest.TestCase):
 
     # High-level API tests moved to tests/test_high_level_api.py
 
-
     # def test_torchac_cuda(self):
         # import arithmetic
 
@@ -473,8 +473,6 @@ class TestTorchANS(unittest.TestCase):
         # print(f"torchac(cuda) decoding time: {time.time() - start_time}")
         
         # self.assertFalse((data_in.cpu() != decoded.cpu()).any())
-
-
 
 if __name__ == "__main__":
     unittest.main()

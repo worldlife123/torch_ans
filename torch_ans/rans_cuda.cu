@@ -11,7 +11,12 @@
 
 #include "rans_utils.hpp"
 
-#define DEFAULT_NUM_THREADS_PER_BLOCK 1 // 256
+// NOTE: using 256 threads per block causes significant slowdown, 
+// likely due to the fact that each thread processes different amount of work or 
+// there is not enough parallelism to keep the GPU fully utilized. 
+// Using 1 thread per block allows us to process each stream sequentially without the overhead of synchronization between threads,
+// which can be more efficient for small batch sizes or short streams. 
+#define DEFAULT_NUM_THREADS_PER_BLOCK 1 // 256 
 #define DEFAULT_SHARED_STREAM_CACHE_SIZE (4096 / sizeof(RANS_STREAM_TYPE))
 #define DEFAULT_SHARED_CDF_CACHE_SIZE (4096 / sizeof(TORCH_TENSOR_TYPE))
 
@@ -83,6 +88,10 @@ __global__ void rans_push_indexed_cuda_kernel(
     // reverse coding
     for (auto i = num_symbols-1; i >= 0; i--) {
       auto index = indexes_ptr[i];
+      // check index range, skip on invalid indexes
+      if (index < 0 || index >= cdfs_accessor.size(0)) {
+        continue;
+      }
       auto cdf_ptr = cdfs_accessor[index].data();
       auto cdf_size = cdfs_sizes_accessor[index];
       auto cdf_alias_remap_ptr = (USE_ALIAS_SAMPLING_CDF) ? cdf_ptr + cdf_size : nullptr;
@@ -110,62 +119,6 @@ __global__ void rans_push_indexed_cuda_kernel(
     }
 
 }
-
-
-template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
-void rans_push_indexed_cuda(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& symbols, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
-  int64_t freq_precision,
-  bool bypass_coding, 
-  int64_t bypass_precision)
-{
-  // TORCH_CHECK(stream.dtype() == TORCH_TENSOR_DTYPE);
-  // TORCH_CHECK(symbols.dtype() == TORCH_TENSOR_DTYPE);
-  TORCH_INTERNAL_ASSERT(stream.device().type() == torch::DeviceType::CUDA);
-  TORCH_INTERNAL_ASSERT(symbols.device().type() == torch::DeviceType::CUDA);
-  
-  TORCH_CHECK(indexes.sizes() == symbols.sizes());
-  // TORCH_CHECK(indexes.dtype() == TORCH_TENSOR_DTYPE);
-  TORCH_INTERNAL_ASSERT(indexes.device().type() == torch::DeviceType::CUDA);
-
-  // TORCH_CHECK(cdfs.dtype() == TORCH_TENSOR_DTYPE);
-  TORCH_INTERNAL_ASSERT(cdfs.device().type() == torch::DeviceType::CUDA);
-
-  TORCH_CHECK(cdfs_sizes.size(0) == cdfs.size(0));
-  // TORCH_CHECK(cdfs_sizes.dtype() == TORCH_TENSOR_DTYPE);
-  TORCH_INTERNAL_ASSERT(cdfs_sizes.device().type() == torch::DeviceType::CUDA);
-
-  TORCH_CHECK(offsets.size(0) == cdfs.size(0));
-  // TORCH_CHECK(offsets.dtype() == TORCH_TENSOR_DTYPE);
-  TORCH_INTERNAL_ASSERT(offsets.device().type() == torch::DeviceType::CUDA);
-
-  AT_DISPATCH_INTEGRAL_TYPES(indexes.scalar_type(), "rans_push_indexed_cuda", [&] {
-
-    auto batch_size = stream.size(0);
-
-    const int num_threads_per_block = USE_INTERLEAVED_KERNEL_THREADS ? NUM_INTERLEAVES : DEFAULT_NUM_THREADS_PER_BLOCK;
-    const int num_blocks = (batch_size + num_threads_per_block - 1) / num_threads_per_block;
-    
-    rans_push_indexed_cuda_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t, USE_ALIAS_SAMPLING_CDF, NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
-        stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-        offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-        freq_precision, bypass_coding, bypass_precision
-    );
-
-  });
-  
-  // cudaDeviceSynchronize();
-}
-
 
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename TORCH_TENSOR_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
@@ -210,6 +163,11 @@ __global__ void rans_pop_indexed_cuda_kernel(
 
     for (int64_t i = 0; i < num_symbols; i++) {
       auto index = indexes_ptr[i];
+      // check index range, skip on invalid indexes
+      if (index < 0 || index >= cdfs_accessor.size(0)) {
+        symbols_ptr[i] = 0;
+        continue;
+      }
       auto cdf_size = cdfs_sizes_accessor[index];
       auto cdf_ptr = cdfs_accessor[index].data();
       auto inversed_cdf_ptr = (USE_INVERSED_CDF) ? (cdf_ptr + cdf_size) : nullptr;
@@ -231,6 +189,66 @@ __global__ void rans_pop_indexed_cuda_kernel(
     }
 
 }
+
+
+
+template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
+void rans_push_indexed_cuda(// ANSStream stream,
+  torch::Tensor stream, 
+  const torch::Tensor& symbols, 
+  const torch::Tensor& indexes, 
+  const torch::Tensor& cdfs, 
+  const torch::Tensor& cdfs_sizes, 
+  const torch::Tensor& offsets,
+  int64_t freq_precision,
+  bool bypass_coding, 
+  int64_t bypass_precision)
+{
+  // TORCH_CHECK(stream.dtype() == TORCH_TENSOR_DTYPE);
+  // TORCH_CHECK(symbols.dtype() == TORCH_TENSOR_DTYPE);
+  TORCH_INTERNAL_ASSERT(stream.device().type() == torch::DeviceType::CUDA);
+  TORCH_INTERNAL_ASSERT(symbols.device().type() == torch::DeviceType::CUDA);
+  
+  TORCH_CHECK(indexes.sizes() == symbols.sizes());
+  // TORCH_CHECK(indexes.dtype() == TORCH_TENSOR_DTYPE);
+  TORCH_INTERNAL_ASSERT(indexes.device().type() == torch::DeviceType::CUDA);
+
+  // TORCH_CHECK(cdfs.dtype() == TORCH_TENSOR_DTYPE);
+  TORCH_INTERNAL_ASSERT(cdfs.device().type() == torch::DeviceType::CUDA);
+
+  TORCH_CHECK(cdfs_sizes.size(0) == cdfs.size(0));
+  // TORCH_CHECK(cdfs_sizes.dtype() == TORCH_TENSOR_DTYPE);
+  TORCH_INTERNAL_ASSERT(cdfs_sizes.device().type() == torch::DeviceType::CUDA);
+
+  TORCH_CHECK(offsets.size(0) == cdfs.size(0));
+  // TORCH_CHECK(offsets.dtype() == TORCH_TENSOR_DTYPE);
+  TORCH_INTERNAL_ASSERT(offsets.device().type() == torch::DeviceType::CUDA);
+
+  AT_DISPATCH_INTEGRAL_TYPES(indexes.scalar_type(), "rans_push_indexed_cuda", [&] {
+
+    auto batch_size = stream.size(0);
+
+
+    {
+      const int num_threads_per_block = USE_INTERLEAVED_KERNEL_THREADS ? NUM_INTERLEAVES : DEFAULT_NUM_THREADS_PER_BLOCK;
+      const int num_blocks = (batch_size + num_threads_per_block - 1) / num_threads_per_block;
+
+      rans_push_indexed_cuda_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t, USE_ALIAS_SAMPLING_CDF, NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
+          stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+          offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+          freq_precision, bypass_coding, bypass_precision
+      );
+    }
+
+  });
+  
+  // cudaDeviceSynchronize();
+}
+
 
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
@@ -263,21 +281,22 @@ torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
 
   AT_DISPATCH_INTEGRAL_TYPES(indexes.scalar_type(), "rans_pop_indexed_cuda", [&] {
 
-
     auto batch_size = stream.size(0);
 
-    const int num_threads_per_block = USE_INTERLEAVED_KERNEL_THREADS ? NUM_INTERLEAVES : DEFAULT_NUM_THREADS_PER_BLOCK;
-    const int num_blocks = (batch_size + num_threads_per_block - 1) / num_threads_per_block;
+    {
+      const int num_threads_per_block = USE_INTERLEAVED_KERNEL_THREADS ? NUM_INTERLEAVES : DEFAULT_NUM_THREADS_PER_BLOCK;
+      const int num_blocks = (batch_size + num_threads_per_block - 1) / num_threads_per_block;
 
-    rans_pop_indexed_cuda_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t, USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
-        stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-        offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-        freq_precision, bypass_coding, bypass_precision
-    );
+      rans_pop_indexed_cuda_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t, USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
+          stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
+          cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+          offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+          freq_precision, bypass_coding, bypass_precision
+      );
+    }
 
   });
 
@@ -321,7 +340,7 @@ __global__ void fix_cdf_batch_kernel(int32_t* cdf_ptr, int B, int N) {
 // Batched PMF to quantized CDF (CUDA, parallel over batch)
 torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t precision) {
   TORCH_CHECK(pmf.is_cuda(), "Input must be CUDA tensor");
-  TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
+  // TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
   auto dtype = torch::kInt32;
   torch::Tensor pmf_batched;
   int64_t B, N;
@@ -329,10 +348,13 @@ torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t p
     pmf_batched = pmf.unsqueeze(0);
     B = 1;
     N = pmf.size(0);
-  } else {
-    pmf_batched = pmf;
-    B = pmf.size(0);
-    N = pmf.size(1);
+  } 
+  else 
+  // If pmf has higher dimensions, we treat the last dimension as the symbol dimension and batch over the preceding dimensions
+  {
+    pmf_batched = pmf.reshape({-1, pmf.size(-1)});
+    B = pmf_batched.size(0);
+    N = pmf_batched.size(1);
   }
   auto freq = torch::round(pmf_batched * (1 << precision)).to(dtype);
   auto cdf = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(pmf.device()));
@@ -346,7 +368,7 @@ torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t p
   auto cdf_ptr = cdf_contig.data_ptr<int32_t>();
 
   // CUDA kernel for parallel batch CDF fix
-  int threads = 256;
+  int threads = DEFAULT_NUM_THREADS_PER_BLOCK;
   int blocks = (B + threads - 1) / threads;
   fix_cdf_batch_kernel<<<blocks, threads>>>(cdf_ptr, B, N);
 #if defined(WITH_CUDA)
@@ -358,9 +380,12 @@ torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t p
   if (pmf.dim() == 1) {
     return cdf_contig[0];
   } else {
-    return cdf_contig;
+    auto sizes = std::vector<int64_t>(pmf.sizes().begin(), pmf.sizes().end()-1);
+    sizes.push_back(N+1);
+    return cdf_contig.reshape(sizes);
   }
 }
+
 
 
 TORCH_LIBRARY_IMPL(torch_ans, CUDA, m) {
@@ -388,4 +413,5 @@ TORCH_LIBRARY_IMPL(torch_ans, CUDA, m) {
     m.impl("rans32_16_i4_push_indexed", &rans_push_indexed_cuda<uint32_t, uint16_t, false, 4>);
     m.impl("rans32_16_i4_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, false, 4>);
     m.impl("rans32_16_i4_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, true, 4>);
+    
 }

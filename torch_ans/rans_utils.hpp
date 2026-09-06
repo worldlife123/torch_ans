@@ -71,6 +71,11 @@
     value = (RANS_SYMBOL_TYPE) (state & ((1u << nbits) - 1)); state = state >> bypass_precision; RANS_POP_STATE_RENORM(state, pptr)
 
 
+
+// ============================================================================
+// Alias sampling table element
+// ============================================================================
+
 template <typename RANS_FREQ_TYPE>
 struct RANSAliasSamplingCDFTableElement
 {

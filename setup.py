@@ -93,13 +93,36 @@ def get_extension_config():
 # `pip install . --no-build-isolation` if desired.
 ext_modules = []
 cmdclass = {}
-if any(arg in sys.argv for arg in ("build_ext", "bdist_wheel", "bdist_egg", "install", "develop")):
-    ext_modules, cmdclass = get_extension_config()
+# Allow skipping building of native extensions at install time via env var.
+SKIP_BUILD_EXT = os.getenv("SKIP_BUILD_EXT", "0") == "1"
+# Detect whether we are actually able to import torch at build time. When
+# pip runs a PEP 517 isolated build it creates a temporary environment that
+# often does not contain the user's installed `torch`. In that case we
+# should avoid trying to import torch (which would raise) and skip building
+# the extension so the package can still be installed as a pure-Python
+# distribution and the native extension can be compiled later at runtime.
+want_build = any(arg in sys.argv for arg in ("build_ext", "bdist_wheel", "bdist_egg", "install", "develop"))
+if SKIP_BUILD_EXT:
+    print("SKIP_BUILD_EXT=1: skipping build of C++/CUDA extensions at install time")
+elif want_build:
+    # Try to import torch in a safe manner; if it's not available we assume
+    # an isolated build environment and skip building the native extension.
+    try:
+        import importlib
+        _torch = importlib.import_module("torch")
+        # If import succeeded, proceed to get extension config and build.
+        ext_modules, cmdclass = get_extension_config()
+    except Exception:
+        print(
+            "torch is not importable during build; skipping native extension build. "
+            "If you want to build the extension during install, ensure torch is pre-installed "
+            "in the build environment (e.g. use `pip install . --no-build-isolation`)."
+        )
 
 
 setup(
     name="torch_ans",
-    version="0.2.0",
+    version="0.2.1",
     description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     author="worldlife",
     author_email="worldlife@sjtu.edu.cn",
@@ -120,6 +143,6 @@ setup(
     },
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    install_requires=["torch>=1.10", "pybind11"],
+    install_requires=["torch>=1.10", "pybind11", "ninja"],
     python_requires=">=3.7",
 )

@@ -377,7 +377,7 @@ assert torch.equal(decoded, symbols)
 
 A: Parallel states corresponds to individual bitstreams, so they require extra space to store bitstream lengths. Despite from this drawback, parallel states are more efficient (especially with a large number of ANS states), easy to implement (device specific code is hardly required) and robust to bit error (corruption in one bitstream will not propagate to another).
 
-In constrast, interleaved states corresponds to a single bitstream, and is sequentially processed. In fact, SIMD ops (such as AVX2 and AVX512) could be used to accelerate interleaved ANS coding, but in our experiments 8 parallel states has better acceleration than the 8 interleaved states with AVX2 ops. 
+In constrast, interleaved states corresponds to a single bitstream, and is sequentially processed. See [Fabian's paper](https://ar5iv.labs.arxiv.org/html/1402.3392) for more information. In fact, SIMD ops (such as AVX2 and AVX512) could be used to accelerate interleaved ANS coding, but in our experiments 8 parallel states has better acceleration than the 8 interleaved states with AVX2 ops. 
 
 **Q: How to choose parameters like State Bits, Stream Bits and Freq Bits? What is their relation to stream size and memory occupation?**
 
@@ -458,6 +458,10 @@ This library is developed for research-purpose only, and not as a robust everyda
 
 ### Known Issues
 - Rans64 cuda coding test fails on some newer GPU architectures.
+- **CUDA build fails with `std_function.h: parameter packs not expanded with '...'`**: `nvcc <= 12.1` cannot parse the `std::function` headers shipped with `libstdc++` from GCC >= 11.4 (e.g. Ubuntu 22.04.3+), so compiling CUDA extensions with the default `g++` fails. Fixes (any one of them):
+  - Use an older host compiler for nvcc, e.g. `g++-10` (install with `apt install g++-10`). The runtime dynamic build detects this automatically: when a CUDA build fails, it retries with `g++-10`/`g++-9`/`g++-8` (`-ccbin`) before falling back to CPU-only, and remembers the working configuration in the torch extensions cache directory (`cuda_build_state`).
+  - Use `nvcc >= 12.2`, which supports the newer libstdc++ headers.
+  - Also make sure the CUDA toolkit version matches the one your PyTorch wheel was built with (e.g. `nvcc` 11.8 for `torch ...+cu118`); mismatched toolchains are unsupported.
 
 ### Testing and coverage
 
@@ -496,6 +500,26 @@ gcovr -r . --html-details -o native_coverage.html
 ```
 
 This produces Python coverage output in `htmlcov/` and native C/C++ coverage output in `native_coverage.html`.
+
+## Runtime dynamic build
+
+If you installed a prebuilt wheel the native extension `torch_ans._C` is used automatically.
+If the compiled extension is not present (for example when installing from source without building),
+`torch_ans` can compile the native C++/CUDA sources at runtime using PyTorch's `cpp_extension`.
+
+- Trigger runtime build programmatically:
+
+```py
+import torch_ans
+```
+
+- Notes:
+  - The build is triggered by importing `torch_ans._C` or `torch_ans.utils` (e.g. when using `TorchANSInterface`) if the compiled extension is not present. The first import compiles the extension (about a minute); later imports reuse the cached build under the torch extensions directory (`~/.cache/torch_extensions/`).
+  - Runtime compilation requires a C/C++ toolchain and `ninja` (installed automatically as a dependency).
+  - The runtime build tries CUDA first and falls back to CPU-only automatically when no usable CUDA runtime or toolchain is available. For CUDA builds you must have a compatible CUDA toolkit and driver installed (see Known Issues for nvcc/GCC compatibility).
+  - If your runtime PyTorch ABI differs from the build-time one, `torch_ans` will warn by default. Set `TORCH_ANS_STRICT_CHECK=1` to re-enable a strict ImportError on mismatch.
+  - To keep CI/tests stable, the bundled test for dynamic build is guarded; enable it with `RUN_DYNAMIC_BUILD_TEST=1` when you want to run the rebuild test locally.
+
 
 
 ### TODO

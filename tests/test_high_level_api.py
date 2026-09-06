@@ -333,6 +333,29 @@ class TestTorchANSHighLevelAPI(unittest.TestCase):
 
         self.assertTrue(torch.equal(decoded, symbols))
 
+    def test_parallel_states_with_padding(self):
+        # Test parallel states with padding (when num_parallel_states does not divide batch_size * seq_len)
+        # seq_len is not a multiple of num_parallel_states
+        num_parallel_states = 5
+        batch_size = 4  
+        num_dists = 4
+        num_symbols = 16
+        pmf = torch.randint(1, 100, (num_dists, num_symbols), dtype=torch.int32)
+        num_freqs = torch.full((num_dists,), num_symbols, dtype=torch.int32)
+        offsets = torch.zeros(num_dists, dtype=torch.int32)
+
+        coder = TorchANSInterface(impl="rans64", freq_precision=12, num_parallel_states=num_parallel_states, device="cpu")
+        coder.init_params(pmf, num_freqs, offsets)
+
+        seq_len = 32
+        symbols = torch.randint(0, num_symbols, (batch_size, seq_len), dtype=torch.int32)
+        indexes = torch.randint(0, num_dists, (batch_size, seq_len), dtype=torch.int32)
+
+        encoded = coder.encode_with_indexes(symbols, indexes)
+        decoded = coder.decode_with_indexes(encoded, indexes)
+
+        self.assertTrue(torch.equal(decoded, symbols))
+
 
 if __name__ == "__main__":
     unittest.main()

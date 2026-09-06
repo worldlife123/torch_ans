@@ -4,7 +4,8 @@ from typing import Iterable, List, Tuple
 
 import torch
 # import torch_ans
-from torch_ans._C import rans_pmf_to_quantized_cdf, rans64_init_stream, rans64_push, rans64_pop
+# from torch_ans._C import rans_pmf_to_quantized_cdf, rans64_init_stream, rans64_push, rans64_pop
+from torch_ans.utils import TorchANSInterface
 
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 DEFAULT_DEVICES = ["cpu", "cuda"]
@@ -17,6 +18,7 @@ def benchmark_parallel_states(
     device: str = "cpu",
     mode: str = "both",
     num_symbols: int = 256,
+    num_dists: int = 8,
     freq_precision: int = 16,
 ) -> List[Tuple[int, float, float]]:
     """Benchmark rANS throughput for a list of parallel batch sizes."""
@@ -29,76 +31,59 @@ def benchmark_parallel_states(
     if mode not in DEFAULT_MODES:
         raise ValueError(f"Invalid benchmark mode: {mode}. Supported modes: {DEFAULT_MODES}")
 
-    pmf = torch.ones(1, num_symbols, dtype=torch.float32, device=device) / num_symbols
-    cdfs = rans_pmf_to_quantized_cdf(pmf, freq_precision)
-    cdfs_sizes = torch.full((1,), cdfs.size(-1), dtype=torch.int32, device=device)
-    offsets = torch.zeros(1, dtype=torch.int32, device=device)
+    freqs = torch.randint(0, num_symbols, (num_dists, num_symbols), dtype=torch.float32, device=device)
+    num_freqs = torch.full((num_dists,), num_symbols, dtype=torch.int32, device=device)
+    # cdfs = rans_pmf_to_quantized_cdf(freqs / freqs.sum(dim=-1, keepdim=True), freq_precision)
+    # cdfs_sizes = torch.full((num_dists,), cdfs.size(-1), dtype=torch.int32, device=device)
+    offsets = torch.zeros(num_dists, dtype=torch.int32, device=device)
     results: List[Tuple[int, float, float]] = []
 
     for batch_size in batch_sizes:
-        num_data = int(data_size_mb * 1024 * 1024 / batch_size / 4)
-        symbols = torch.randint(0, num_symbols, (batch_size, num_data), dtype=torch.int32, device=device)
-        stream = rans64_init_stream(batch_size).to(device=device)
+        # num_data = int(data_size_mb * 1024 * 1024 / batch_size / 4)
+        # symbols = torch.randint(0, num_symbols, (batch_size, num_data), dtype=torch.int32, device=device)
+        symbols = torch.randint(0, num_symbols, (int(data_size_mb * 1024 * 1024 / 4) - 5, ), dtype=torch.int32, device=device)
+        # stream = rans64_init_stream(batch_size).to(device=device)
         indexes = torch.zeros_like(symbols)
+
+        ans_interface = TorchANSInterface(
+            num_parallel_states=batch_size, 
+            device=device, 
+            bypass_coding=False, 
+            freq_precision=freq_precision,
+        )
+        ans_interface.init_params(freqs, num_freqs, offsets)
+        # ans_interface.set_cdfs(cdfs, cdfs_sizes, offsets)
 
         if mode == "push":
             start = time.time()
-            rans64_push(
-                stream,
+            ans_interface.encode(
                 symbols,
                 indexes,
-                cdfs,
-                cdfs_sizes,
-                offsets,
-                freq_precision,
-                bypass_coding=False,
             )
             if device == "cuda":
                 torch.cuda.synchronize()
         elif mode == "pop":
-            rans64_push(
-                stream,
+            stream = ans_interface.encode(
                 symbols,
                 indexes,
-                cdfs,
-                cdfs_sizes,
-                offsets,
-                freq_precision,
-                bypass_coding=False,
             )
             start = time.time()
-            decoded = rans64_pop(
+            decoded = ans_interface.decode(
                 stream,
                 indexes,
-                cdfs,
-                cdfs_sizes,
-                offsets,
-                freq_precision,
-                bypass_coding=False,
             )
             if device == "cuda":
                 torch.cuda.synchronize()
             _ = decoded
         else:  # both
             start = time.time()
-            rans64_push(
-                stream,
+            stream = ans_interface.encode(
                 symbols,
                 indexes,
-                cdfs,
-                cdfs_sizes,
-                offsets,
-                freq_precision,
-                bypass_coding=False,
             )
-            decoded = rans64_pop(
+            decoded = ans_interface.decode(
                 stream,
                 indexes,
-                cdfs,
-                cdfs_sizes,
-                offsets,
-                freq_precision,
-                bypass_coding=False,
             )
             if device == "cuda":
                 torch.cuda.synchronize()

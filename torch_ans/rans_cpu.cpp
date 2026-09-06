@@ -75,8 +75,9 @@ void rans_push_indexed_cpu(// ANSStream stream,
     auto cdfs_accessor = cdfs.accessor<scalar_t, 2>();
     auto cdfs_sizes_accessor = cdfs_sizes.accessor<scalar_t, 1>();
     auto offsets_accessor = offsets.accessor<scalar_t, 1>();
-
+    // std::cout << "num_threads" << at::get_num_threads();
     at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
+      // std::cout << "range:" << start << end << std::endl;
       for (size_t b = start; b < end; b++) {
         const auto stream_length = stream_accessor[b][0];
         const auto stream_ptr_offset = stream_length / sizeof(RANS_STREAM_TYPE);
@@ -90,6 +91,10 @@ void rans_push_indexed_cpu(// ANSStream stream,
         int64_t i = num_symbols-1;
         for (; i >= num_symbols-first_interleave; i--) {
           const auto index = indexes_ptr[i];
+          // check index range, skip on invalid indexes
+          if (index < 0 || index >= cdfs_accessor.size(0)) {
+            continue;
+          }
           const auto cdf_ptr = cdfs_accessor[index].data();
           const auto cdf_size = cdfs_sizes_accessor[index];
           const auto offsets = offsets_accessor[index];
@@ -111,6 +116,10 @@ void rans_push_indexed_cpu(// ANSStream stream,
             if (bypass_coding) {
               for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) {
                 const auto index = indexes_ptr[i-j];
+                // check index range, skip on invalid indexes
+                if (index < 0 || index >= cdfs_accessor.size(0)) {
+                  continue;
+                }
                 // const auto cdf_ptr = cdfs_accessor[index].data();
                 const auto cdf_size = cdfs_sizes_accessor[index];
                 const auto max_value = cdf_size - 2;
@@ -132,6 +141,10 @@ void rans_push_indexed_cpu(// ANSStream stream,
               }
               for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) {
                 const auto index = indexes_ptr[i-j];
+                // check index range, skip on invalid indexes
+                if (index < 0 || index >= cdfs_accessor.size(0)) {
+                  continue;
+                }
                 const auto cdf_ptr = cdfs_accessor[index].data();
                 const auto cdf_size = cdfs_sizes_accessor[index];
                 const auto cdf_alias_remap_ptr = (USE_ALIAS_SAMPLING_CDF) ? cdf_ptr + cdf_size : nullptr;
@@ -146,6 +159,10 @@ void rans_push_indexed_cpu(// ANSStream stream,
             else {
               for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) {
                 const auto index = indexes_ptr[i-j];
+                // check index range, skip on invalid indexes
+                if (index < 0 || index >= cdfs_accessor.size(0)) {
+                  continue;
+                }
                 const auto cdf_ptr = cdfs_accessor[index].data();
                 const auto cdf_size = cdfs_sizes_accessor[index];
                 const auto cdf_alias_remap_ptr = (USE_ALIAS_SAMPLING_CDF) ? cdf_ptr + cdf_size : nullptr;
@@ -161,6 +178,10 @@ void rans_push_indexed_cpu(// ANSStream stream,
           }
           else {
             const auto index = indexes_ptr[i];
+            // check index range, skip on invalid indexes
+            if (index < 0 || index >= cdfs_accessor.size(0)) {
+              continue;
+            }
             const auto cdf_ptr = cdfs_accessor[index].data();
             const auto cdf_size = cdfs_sizes_accessor[index];
             const auto offset = offsets_accessor[index];
@@ -236,6 +257,11 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
             for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) {
             // constexpr_for<0, NUM_INTERLEAVES, 1>([&](auto j){
               const auto index = indexes_ptr[i+j];
+              // check index range, skip on invalid indexes
+              if (index < 0 || index >= cdfs_accessor.size(0)) {
+                symbols_ptr[i+j] = 0;
+                continue;
+              }
               const auto cdf_ptr = cdfs_accessor[index].data();
               const auto cdf_size = cdfs_sizes_accessor[index];
               const auto offset = offsets_accessor[index];
@@ -255,6 +281,11 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
               for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) {
               // constexpr_for<0, NUM_INTERLEAVES, 1>([&](auto j){
                 const auto index = indexes_ptr[i+j];
+                // check index range, skip on invalid indexes
+                if (index < 0 || index >= cdfs_accessor.size(0)) {
+                  symbols_ptr[i+j] = 0;
+                  continue;
+                }
                 // const auto cdf_ptr = cdfs_accessor[index].data();
                 const auto cdf_size = cdfs_sizes_accessor[index];
                 const auto offset = offsets_accessor[index];
@@ -279,6 +310,11 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
           }
           else {
             const auto index = indexes_ptr[i];
+            // check index range, skip on invalid indexes
+            if (index < 0 || index >= cdfs_accessor.size(0)) {
+              symbols_ptr[i] = 0;
+              continue;
+            }
             const auto cdf_ptr = cdfs_accessor[index].data();
             const auto cdf_size = cdfs_sizes_accessor[index];
             const auto offset = offsets_accessor[index];
@@ -297,6 +333,12 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
         // final symbols
         for (; i < num_symbols; i++) {
             const auto index = indexes_ptr[i];
+            // check index range, skip on invalid indexes
+            if (index < 0 || index >= cdfs_accessor.size(0)) {
+              symbols_ptr[i] = 0;
+              continue;
+            }
+
             const auto cdf_ptr = cdfs_accessor[index].data();
             const auto cdf_size = cdfs_sizes_accessor[index];
             const auto offsets = offsets_accessor[index];
@@ -324,7 +366,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
 
 // Batched PMF to quantized CDF (CPU, parallel over batch)
 torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision) {
-  TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
+  // TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
   auto device = pmf.device();
   auto dtype = torch::kInt32;
   torch::Tensor pmf_batched;
@@ -333,10 +375,13 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
     pmf_batched = pmf.unsqueeze(0);
     B = 1;
     N = pmf.size(0);
-  } else {
-    pmf_batched = pmf;
-    B = pmf.size(0);
-    N = pmf.size(1);
+  } 
+  else 
+  // If pmf has higher dimensions, we treat the last dimension as the symbol dimension and batch over the preceding dimensions
+  {
+    pmf_batched = pmf.reshape({-1, pmf.size(-1)});
+    B = pmf_batched.size(0);
+    N = pmf_batched.size(1);
   }
   auto freq = torch::round(pmf_batched * (1 << precision)).to(dtype);
   auto cdf = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(device));
@@ -380,7 +425,9 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
   if (pmf.dim() == 1) {
     return cdf_contig[0];
   } else {
-    return cdf_contig;
+    auto sizes = std::vector<int64_t>(pmf.sizes().begin(), pmf.sizes().end()-1);
+    sizes.push_back(N+1);
+    return cdf_contig.reshape(sizes);
   }
 }
 

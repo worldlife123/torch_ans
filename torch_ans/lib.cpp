@@ -70,15 +70,22 @@
 
 
 
-PYBIND11_MODULE(_C, m){
+// TORCH_EXTENSION_NAME is provided by torch's build systems (BuildExtension
+// defines it as the last component of the extension name, and JIT builds via
+// torch.utils.cpp_extension.load define it as the module name). Using it here
+// keeps the PyInit symbol in sync with JIT version bumps (e.g. `*_v1` after a
+// CUDA->CPU fallback re-build in the same process).
+#ifndef TORCH_EXTENSION_NAME
+#define TORCH_EXTENSION_NAME _C
+#endif
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.doc() = "PyTorch based ANS entropy coding library.";
 
     // m.def("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf);
-    
+
     TORCH_EXTENSION_RANS_BINDINGS(m);
 }
-
-// PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
 
 
 // Defines the operators

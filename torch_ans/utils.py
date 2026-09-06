@@ -7,13 +7,59 @@ import io
 # TODO: provide a better impl of pmf_to_quantized_cdf in torch_ans
 # from cbench.rans import pmf_to_quantized_cdf, pmf_to_quantized_cdf_np
 
-try:
-    from torch_ans._C import rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_pmf_to_quantized_cdf, rans_alias_build_table
-    from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
-    from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
-    from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
-except:
-    print("Torch ANS is not compiled properly!")
+# _C = None
+
+from torch_ans._C import rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_pmf_to_quantized_cdf, rans_alias_build_table
+from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
+from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
+from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
+
+
+# def _bind_from_C(module):
+#     global _C
+#     _C = module
+#     global rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_pmf_to_quantized_cdf, rans_alias_build_table
+#     global rans64_init_stream, rans64_push, rans64_pop
+#     global rans32_init_stream, rans32_push, rans32_pop
+#     global rans32_16_init_stream, rans32_16_push, rans32_16_pop
+
+#     rans_stream_to_byte_strings = module.rans_stream_to_byte_strings
+#     rans_byte_strings_to_stream = module.rans_byte_strings_to_stream
+#     rans_pmf_to_quantized_cdf = module.rans_pmf_to_quantized_cdf
+#     # alias table helper may not exist on older builds
+#     rans_alias_build_table = getattr(module, "rans_alias_build_table", None)
+
+#     rans64_init_stream = module.rans64_init_stream
+#     rans64_push = module.rans64_push
+#     rans64_pop = module.rans64_pop
+
+#     rans32_init_stream = module.rans32_init_stream
+#     rans32_push = module.rans32_push
+#     rans32_pop = module.rans32_pop
+
+#     rans32_16_init_stream = module.rans32_16_init_stream
+#     rans32_16_push = module.rans32_16_push
+#     rans32_16_pop = module.rans32_16_pop
+
+
+# def _ensure_C():
+#     """Ensure the native `_C` module is loaded, building it at runtime if needed."""
+#     global _C
+#     if _C is not None:
+#         return
+#     try:
+#         import importlib
+#         module = importlib.import_module("torch_ans._C")
+#     except Exception:
+#         try:
+#             from ._dynamic_build import load_or_get_extension
+#             module = load_or_get_extension()
+#         except Exception as e:
+#             # surface a helpful error
+#             raise ImportError(
+#                 "Torch ANS native extension is not available and dynamic build failed: " + str(e)
+#             )
+#     _bind_from_C(module)
 
 from typing import Dict, Optional, List, Tuple
 
@@ -193,6 +239,7 @@ class TorchEntropyCoderBaseInterface(object):
         symbol_precision (int): Precision of symbols in bits.
         freq_precision (int): Precision of frequencies in bits.
         mode (str): "encoder", "decoder", or "encdec".
+        check_validity (bool): Whether to check validity of input tensors (e.g. index ranges).
         dtype (torch.dtype): Tensor dtype for internal buffers.
         device (str or torch.device, optional): Device for tensors.
         **kwargs: Additional arguments for encoder/decoder initialization.
@@ -201,6 +248,7 @@ class TorchEntropyCoderBaseInterface(object):
                  symbol_precision: int = 8, 
                  freq_precision: int = 16, 
                  mode="encdec", 
+                 check_validity=False,
                  dtype=torch.int32, 
                  device=None, 
                  **kwargs) -> None:
@@ -212,6 +260,8 @@ class TorchEntropyCoderBaseInterface(object):
             self._init_encoder(**kwargs)
         if self.mode == "decoder" or self.mode == "encdec":
             self._init_decoder(**kwargs)
+
+        self.check_validity = check_validity
             
         self._set_dtype(dtype)
         self._set_device(device)
@@ -346,6 +396,10 @@ class TorchEntropyCoderBaseInterface(object):
         if dist_indexes is not None:
             assert symbols.shape == dist_indexes.shape, "For encode_with_indexes pattern, symbols and dist_indexes should have the same shape"
             dist_indexes = self._init_tensor(dist_indexes)
+            # check index range for validity
+            if self.check_validity:
+                if (dist_indexes < 0).any() or (dist_indexes >= self.offsets.size(0)).any():
+                    raise ValueError("dist_indexes contain out-of-range values.")
         elif dist_freqs is not None:
             assert symbols.shape == dist_freqs.shape[:-1], "For encode_with_freqs pattern, symbols.shape should match dist_freqs.shape[:-1]"
             dist_freqs = self._init_tensor(dist_freqs)
@@ -390,6 +444,7 @@ class TorchEntropyCoderBaseInterface(object):
             # NOTE: reverse the queue to encode in LIFO order
             for item in reversed(self._encode_queue): 
                 stream = self._encode_func(stream=stream, **item, **kwargs)
+        self.reset_cache()
         return stream
         # Deprecated calls (not working properly)
         # if len(self.cache_encode_with_indexes) > 0:
@@ -422,6 +477,10 @@ class TorchEntropyCoderBaseInterface(object):
 
         if dist_indexes is not None:
             dist_indexes = self._init_tensor(dist_indexes)
+            # check index range for validity
+            if self.check_validity:
+                if (dist_indexes < 0).any() or (dist_indexes >= self.offsets.size(0)).any():
+                    raise ValueError("dist_indexes contain out-of-range values.")
         elif dist_freqs is not None:
             dist_freqs = self._init_tensor(dist_freqs)
             dist_num_freqs = self._init_tensor(dist_num_freqs if dist_num_freqs is not None else torch.zeros_like(dist_freqs[..., 0]) + dist_freqs.shape[-1])
@@ -601,6 +660,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                  num_parallel_states=None, 
                  num_bytes_code_length=4, 
                  **kwargs) -> None:
+        # _ensure_C()
         self.impl = impl
         self.bypass_coding = bypass_coding
         self.bypass_precision = bypass_precision
@@ -637,6 +697,17 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
         num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
         return self._init_tensor(self.ans_init_func(num_parallel_states))
+
+    def _reshape_for_parallel(self, tensor : torch.Tensor, num_parallel_states=None, padding_value=0, **kwargs) -> torch.Tensor:
+        """
+        Reshapes the input tensor for parallel processing with the configured number of parallel states.
+        """
+        num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
+        num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
+        # If reshape is not possible, pad the tensor with padding_value and then reshape
+        if tensor.numel() % num_parallel_states != 0:
+            tensor = torch.cat([tensor.reshape(-1), torch.zeros(num_parallel_states - (tensor.numel() % num_parallel_states), dtype=tensor.dtype, device=tensor.device) + padding_value], dim=0)
+        return tensor.reshape(num_parallel_states, -1).contiguous()
 
     def init_params(self, freqs, num_freqs, offsets) -> None:
         """
@@ -683,6 +754,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                      dist_freqs: Optional[torch.Tensor]=None, # aka freqs
                      dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
                      dist_min: Optional[torch.Tensor]=None, # aka offsets
+                     # compressai-like API patterns:
+                     cdfs: Optional[torch.Tensor]=None,
+                     cdfs_sizes: Optional[torch.Tensor]=None,
+                     offsets: Optional[torch.Tensor]=None,
                      **kwargs) -> torch.Tensor:
         
         if stream is None:
@@ -693,10 +768,13 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             num_parallel_states = stream.size(0)
 
         if dist_indexes is not None:
+            cdfs = self.cdfs if cdfs is None else self._init_tensor(cdfs)
+            cdfs_sizes = self.cdfs_sizes if cdfs_sizes is None else self._init_tensor(cdfs_sizes)
+            offsets = self.offsets if offsets is None else self._init_tensor(offsets)
             self.ans_encode_func(stream, 
-                symbols.reshape(num_parallel_states, -1).contiguous(), 
-                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
-                self.cdfs, self.cdfs_sizes, self.offsets,
+                self._reshape_for_parallel(symbols, num_parallel_states=num_parallel_states),
+                self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
+                cdfs, cdfs_sizes, offsets,
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
                 bypass_precision=self.bypass_precision
@@ -710,8 +788,8 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             dist_indexes = torch.arange(symbols.numel(), dtype=self.dtype, device=stream.device)\
                 .reshape_as(symbols)
             self.ans_encode_func(stream, 
-                symbols.reshape(num_parallel_states, -1).contiguous(), 
-                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                self._reshape_for_parallel(symbols, num_parallel_states=num_parallel_states),
+                self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
                 self.cdfs, self.cdfs_sizes, self.offsets,
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
@@ -728,19 +806,29 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                      dist_freqs: Optional[torch.Tensor]=None, # aka freqs
                      dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
                      dist_min: Optional[torch.Tensor]=None, # aka offsets
+                     # compressai-like API patterns:
+                     cdfs: Optional[torch.Tensor]=None,
+                     cdfs_sizes: Optional[torch.Tensor]=None,
+                     offsets: Optional[torch.Tensor]=None,
                      **kwargs) -> torch.Tensor:
         num_parallel_states = stream.size(0) if self.num_parallel_states is None else self.num_parallel_states
+        
+        
         if dist_indexes is not None:
-            cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
+            cdfs = (self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs) \
+                if cdfs is None else self._init_tensor(cdfs)
+            cdfs_sizes = self.cdfs_sizes if cdfs_sizes is None else self._init_tensor(cdfs_sizes)
+            offsets = self.offsets if offsets is None else self._init_tensor(offsets)
 
             decoded = self.ans_decode_func(stream, 
-                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
-                cdfs, self.cdfs_sizes, self.offsets,
+                self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
+                cdfs, cdfs_sizes, offsets,
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
                 bypass_precision=self.bypass_precision,
             )
-            decoded = decoded.reshape_as(dist_indexes)
+            # filter out invalid decoded symbols (if any) caused by padding, and reshape to the same shape as dist_indexes
+            decoded = decoded.reshape(-1)[:dist_indexes.numel()].reshape_as(dist_indexes)
         elif dist_freqs is not None:
             self.init_params(
                 dist_freqs.reshape(-1, dist_freqs.shape[-1]), 
@@ -751,13 +839,14 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                 .reshape_as(dist_num_freqs)
             cdfs = self.cdfs_with_alias_table if self.impl_use_alias_table else self.cdfs
             decoded = self.ans_decode_func(stream, 
-                dist_indexes.reshape(num_parallel_states, -1).contiguous(), 
+                self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
                 cdfs, self.cdfs_sizes, self.offsets,
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
                 bypass_precision=self.bypass_precision,
             )
-            decoded = decoded.reshape_as(dist_num_freqs)
+            # filter out invalid decoded symbols (if any) caused by padding, and reshape to the same shape as dist_num_freqs
+            decoded = decoded.reshape(-1)[:dist_num_freqs.numel()].reshape_as(dist_num_freqs)
         else:
             # TODO: implement decode_symbols pattern if needed
             raise NotImplementedError("Unsupported decoding pattern. Please provide either dist_indexes or dist_freqs.")
@@ -804,7 +893,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         Returns:
             bytes: Encoded byte stream.
         """
-        stream = self.encode(symbols, dist_indexes=indexes, cache=cache, **kwargs)
+        stream = self.encode(symbols, dist_indexes=indexes, cache=cache, 
+                             cdfs=self.cdfs, cdfs_sizes=self.cdfs_sizes, offsets=self.offsets,
+                             **kwargs)
         if cache:
             return
         else:
@@ -850,7 +941,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
         stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
 
-        return self.decode(stream=stream, dist_indexes=indexes, **kwargs)
+        return self.decode(stream=stream, dist_indexes=indexes, 
+                           cdfs=self.cdfs, cdfs_sizes=self.cdfs_sizes, offsets=self.offsets,
+                           **kwargs)
         
         # num_parallel_states = indexes.size(0) if self.num_parallel_states is None else self.num_parallel_states
         # # assert num_parallel_states == indexes.size(0)
