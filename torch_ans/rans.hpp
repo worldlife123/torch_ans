@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "rans_utils.hpp"
 
@@ -48,10 +49,15 @@ torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
   const torch::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
-  int64_t bypass_precision=4);
+  int64_t bypass_precision=4,
+  int64_t inverse_cdf_precision=-1);
 
   // Batched PMF to quantized CDF declarations
 torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t precision);
+
+// B2: fused "cdf ++ inverse-CDF table" construction (device side, one launch)
+torch::Tensor rans_build_inverse_cdf_cuda(const torch::Tensor& cdfs, int64_t freq_precision,
+                                          int64_t table_precision);
 
 #endif
 
@@ -76,10 +82,15 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
   const torch::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
-  int64_t bypass_precision=4);
+  int64_t bypass_precision=4,
+  int64_t inverse_cdf_precision=-1);
 
 // Batched PMF to quantized CDF declarations
 torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision);
+
+// B2: fused "cdf ++ inverse-CDF table" construction (host side)
+torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq_precision,
+                                         int64_t table_precision);
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
 void rans_push(// ANSStream stream,
@@ -103,19 +114,53 @@ void rans_push(// ANSStream stream,
   }
 
   AT_DISPATCH_INTEGRAL_TYPES(stream.scalar_type(), "rans_push_resize_stream", [&] {
-    // resize stream to worse-case size
-    auto max_byte_length = stream.index({torch::indexing::Slice(), 0}).max().item<scalar_t>();
-    auto safe_byte_length = max_byte_length + (num_symbols * freq_precision + 7) / 8;
-    // TODO: confirm the safe length for bypass_coding
+    // Resize the stream to its worst-case size. Per coded symbol the stream
+    // grows by at most:
+    //   * freq_precision bits -- the rANS state absorbs
+    //     log2(2^freq_precision / freq) <= freq_precision bits before a
+    //     renormalization flush;
+    //   * with bypass_coding, an out-of-range symbol additionally pushes a raw
+    //     value in bypass_precision-sized chunks (see rans_push_raw_value_step):
+    //     ceil(symbol_bits / bypass_precision) chunks for the value itself, one
+    //     chunk holding the chunk count, plus one chunk per carry of that count
+    //     (a carry every max_bypass_val).
+    const int64_t max_byte_length =
+        (int64_t)stream.index({torch::indexing::Slice(), 0}).max().item<scalar_t>();
+    int64_t bits_per_symbol = freq_precision;
     if (bypass_coding) {
-      safe_byte_length += num_symbols * sizeof(scalar_t);
+      TORCH_CHECK(bypass_precision >= 1, "bypass_precision must be >= 1");
+      const int64_t symbol_bits = (int64_t)sizeof(scalar_t) * 8;
+      const int64_t max_bypass_val = ((int64_t)1 << bypass_precision) - 1;
+      const int64_t n_bypass = (symbol_bits + bypass_precision - 1) / bypass_precision;
+      const int64_t n_chunks = n_bypass + 1 + n_bypass / max_bypass_val;
+      bits_per_symbol += n_chunks * bypass_precision;
     }
+    // +7 rounds the bit total up to whole bytes. On top of that, every rANS
+    // state can hold up to one not-yet-flushed stream word, so reserve one word
+    // per interleave (the amortized bit estimate above does not account for it).
+    const int64_t safe_byte_length = max_byte_length
+        + (num_symbols * bits_per_symbol + 7) / 8
+        + (int64_t)NUM_INTERLEAVES * (int64_t)sizeof(RANS_STREAM_TYPE);
 
     if (safe_byte_length < max_byte_length) {
       throw py::value_error("Overflow!");
     }
 
-    const auto safe_tensor_length = safe_byte_length/((scalar_t) sizeof(scalar_t)) + 1;
+    // NOTE: the computation above is deliberately kept in int64_t rather than a
+    // platform-width type. The intermediate num_symbols * bits_per_symbol already
+    // exceeds 2^31 for realistic workloads (1e8 symbols at 51 bits each is
+    // ~5e9), and signed overflow is undefined behaviour, so a 32-bit type would
+    // corrupt the result rather than merely trip the check below.
+    //
+    // The result is then range-checked against size_t, which *is* platform-width
+    // (32-bit on 32-bit systems, where no allocation can exceed 4 GiB), so an
+    // unrepresentable stream fails here instead of being silently truncated.
+    const int64_t safe_tensor_length = safe_byte_length / (int64_t)sizeof(scalar_t) + 1;
+    const uint64_t total_bytes =
+        (uint64_t)batch_size * (uint64_t)safe_tensor_length * (uint64_t)sizeof(scalar_t);
+    TORCH_CHECK(total_bytes <= (uint64_t)std::numeric_limits<size_t>::max(),
+                "rans_push: the stream would need ", total_bytes,
+                " bytes, which is not addressable on this platform");
     if (safe_tensor_length > stream.size(1)) {
       const auto stream_copy = stream.clone();
       stream = stream.resize_({batch_size, safe_tensor_length}).contiguous();
@@ -227,7 +272,8 @@ torch::Tensor rans_pop(// ANSStream stream,
   int64_t symbol_precision=8,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
-  int64_t bypass_precision=4)
+  int64_t bypass_precision=4,
+  int64_t inverse_cdf_precision=-1)
 {
   torch::Tensor symbols;
   const bool use_cuda = stream.device().is_cuda();
@@ -252,7 +298,7 @@ torch::Tensor rans_pop(// ANSStream stream,
         stream.contiguous().cuda(),
         indexes.value().contiguous().cuda(), cdfs.value().contiguous().cuda(), 
         cdfs_sizes.value().contiguous().cuda(), offsets_tensor.contiguous().cuda(), 
-        freq_precision, bypass_coding, bypass_precision);
+        freq_precision, bypass_coding, bypass_precision, inverse_cdf_precision);
 #else
       AT_ERROR("torch_ans is not compiled with GPU support!");
 #endif
@@ -262,7 +308,7 @@ torch::Tensor rans_pop(// ANSStream stream,
         stream.contiguous(),
         indexes.value().contiguous(), cdfs.value().contiguous(), 
         cdfs_sizes.value().contiguous(), offsets_tensor.contiguous(), 
-        freq_precision, bypass_coding, bypass_precision);
+        freq_precision, bypass_coding, bypass_precision, inverse_cdf_precision);
 
   }
   else {
@@ -288,38 +334,61 @@ inline torch::Tensor rans_pmf_to_quantized_cdf(const torch::Tensor& pmfs, int64_
   }
 }
 
+// B2: build the combined cdf ++ inverse-CDF table in a single op. Python used
+// to spend 3-5 torch calls (arange/expand, searchsorted, sub, cat) on it, and
+// each torch call costs ~40 us of dispatch on this machine - more than the
+// coding itself for small tensors, because init_params runs per encode/decode
+// call in the dist_freqs API.
+inline torch::Tensor rans_build_inverse_cdf(const torch::Tensor& cdfs, int64_t freq_precision,
+                                            int64_t table_precision) {
+  if (cdfs.device().is_cuda()) {
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    return rans_build_inverse_cdf_cuda(cdfs, freq_precision, table_precision);
+#else
+    AT_ERROR("torch_ans is not compiled with GPU support!");
+#endif
+  } else {
+    return rans_build_inverse_cdf_cpu(cdfs, freq_precision, table_precision);
+  }
+}
+
 
 #define TORCH_EXTENSION_RANS_BINDINGS(m) \
     m.def("rans_stream_to_byte_strings", &rans_stream_to_byte_strings);\
     m.def("rans_byte_strings_to_stream", &rans_byte_strings_to_stream);\
     m.def("rans_alias_build_table", &rans_alias_build_table, py::arg("cdfs"), py::arg("cdfs_sizes"), py::arg("symbol_precision")=8, py::arg("freq_precision")=16);\
     m.def("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf, py::arg("pmfs"), py::arg("precision")=16);\
+    m.def("rans_build_inverse_cdf", &rans_build_inverse_cdf, py::arg("cdfs"), py::arg("freq_precision")=16, py::arg("table_precision")=16);\
     m.def("rans64_init_stream", &rans_init_stream<uint64_t, uint32_t>, py::arg("size"), py::arg("num_interleaves")=1, py::arg("preallocate_size")=0);\
     m.def("rans64_push", &rans_push<uint64_t, uint32_t>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans64_pop", &rans_pop<uint64_t, uint32_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans64_pop", &rans_pop<uint64_t, uint32_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans64_i4_push", &rans_push<uint64_t, uint32_t, false, 4>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans64_i4_pop", &rans_pop<uint64_t, uint32_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans64_i4_pop", &rans_pop<uint64_t, uint32_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans64_alias_push", &rans_push<uint64_t, uint32_t, true>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans64_alias_pop", &rans_pop<uint64_t, uint32_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans64_invcdf_pop", &rans_pop<uint64_t, uint32_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans64_alias_pop", &rans_pop<uint64_t, uint32_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans64_invcdf_pop", &rans_pop<uint64_t, uint32_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans64_i4_invcdf_pop", &rans_pop<uint64_t, uint32_t, false, true, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_init_stream", &rans_init_stream<uint32_t, uint8_t>, py::arg("size"), py::arg("num_interleaves")=1, py::arg("preallocate_size")=0);\
     m.def("rans32_push", &rans_push<uint32_t, uint8_t>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_pop", &rans_pop<uint32_t, uint8_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_pop", &rans_pop<uint32_t, uint8_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_i4_push", &rans_push<uint32_t, uint8_t, false, 4>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_i4_pop", &rans_pop<uint32_t, uint8_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_i4_invcdf_pop", &rans_pop<uint32_t, uint8_t, false, true, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_i4_pop", &rans_pop<uint32_t, uint8_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_i4_invcdf_pop", &rans_pop<uint32_t, uint8_t, false, true, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_alias_push", &rans_push<uint32_t, uint8_t, true>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_alias_pop", &rans_pop<uint32_t, uint8_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_invcdf_pop", &rans_pop<uint32_t, uint8_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_alias_pop", &rans_pop<uint32_t, uint8_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_invcdf_pop", &rans_pop<uint32_t, uint8_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_16_init_stream", &rans_init_stream<uint32_t, uint16_t>, py::arg("size"), py::arg("num_interleaves")=1, py::arg("preallocate_size")=0);\
     m.def("rans32_16_push", &rans_push<uint32_t, uint16_t>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_16_pop", &rans_pop<uint32_t, uint16_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_16_pop", &rans_pop<uint32_t, uint16_t>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_16_i4_push", &rans_push<uint32_t, uint16_t, false, 4>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_16_i4_pop", &rans_pop<uint32_t, uint16_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_16_i4_invcdf_pop", &rans_pop<uint32_t, uint16_t, false, true, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_16_i4_pop", &rans_pop<uint32_t, uint16_t, false, false, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_16_i4_invcdf_pop", &rans_pop<uint32_t, uint16_t, false, true, 4>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_16_i32_push", &rans_push<uint32_t, uint16_t, false, 32>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_16_i32_pop", &rans_pop<uint32_t, uint16_t, false, false, 32>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_16_i32_invcdf_pop", &rans_pop<uint32_t, uint16_t, false, true, 32>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
     m.def("rans32_16_alias_push", &rans_push<uint32_t, uint16_t, true>, py::arg("stream"), py::arg("symbols"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_16_alias_pop", &rans_pop<uint32_t, uint16_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
-    m.def("rans32_16_invcdf_pop", &rans_pop<uint32_t, uint16_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4);\
+    m.def("rans32_16_alias_pop", &rans_pop<uint32_t, uint16_t, true, false>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
+    m.def("rans32_16_invcdf_pop", &rans_pop<uint32_t, uint16_t, false, true>, py::arg("stream"), py::arg("indexes")=py::none(), py::arg("cdfs")=py::none(), py::arg("cdfs_sizes")=py::none(), py::arg("offsets")=py::none(), py::arg("symbol_precision")=8, py::arg("freq_precision")=16, py::arg("bypass_coding")=true, py::arg("bypass_precision")=4, py::arg("inverse_cdf_precision")=-1);\
 
 // #define TORCH_LIBRARY_RANS_BINDINGS(m)
 //     m.def("rans64_init_stream", &rans_init_stream<uint64_t, uint32_t>);\

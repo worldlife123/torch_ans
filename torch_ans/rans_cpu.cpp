@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 
 // #include <x86intrin.h>
+#include <cmath>
 #include <vector>
 // #include <span>
 // #include <bit>
@@ -218,7 +219,8 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
   const torch::Tensor& offsets,
   int64_t freq_precision,
   bool bypass_coding, 
-  int64_t bypass_precision)
+  int64_t bypass_precision,
+  int64_t inverse_cdf_precision)
 {
   torch::Tensor symbols = torch::zeros_like(indexes);
 
@@ -272,7 +274,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
                 state_ptr+j, &stream_ptr,
                 cdf_ptr, cdf_size, offset,
                 freq_precision, false, bypass_precision,
-                inversed_cdf_ptr, cdf_alias_table_ptr
+                inversed_cdf_ptr, cdf_alias_table_ptr, inverse_cdf_precision
               );
             }//);
 
@@ -325,7 +327,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
               state_ptr, &stream_ptr,
               cdf_ptr, cdf_size, offset,
               freq_precision, bypass_coding, bypass_precision,
-              inversed_cdf_ptr, cdf_alias_table_ptr
+              inversed_cdf_ptr, cdf_alias_table_ptr, inverse_cdf_precision
             );
           }
         }
@@ -349,7 +351,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
               state_ptr+(i%NUM_INTERLEAVES), &stream_ptr,
               cdf_ptr, cdf_size, offsets,
               freq_precision, bypass_coding, bypass_precision,
-              inversed_cdf_ptr, cdf_alias_table_ptr
+              inversed_cdf_ptr, cdf_alias_table_ptr, inverse_cdf_precision
             );
         }
         // update stream length
@@ -365,8 +367,16 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
 
 
 // Batched PMF to quantized CDF (CPU, parallel over batch)
+//
+// B4: the previous implementation was a chain of ~10 torch ops followed by a
+// fix-up pass; every op costs a dispatch and a temporary, and init_params runs
+// this on every encode/decode call of the dist_freqs API. The loop below does
+// the whole thing per row in one pass and is bit-identical to the old chain
+// (verified by scripts/bench_cdf_build.py):
+//   freq = round(pmf * 2**p) -> cdf = [0, freq...] -> total = sum -> 0 becomes 1
+//   -> cdf = (cdf * 2**p) // total  (int32 wrap, truncating division)
+//   -> inclusive cumsum -> cdf[N] = 2**p -> "steal frequency" fix-up
 torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision) {
-  // TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
   auto device = pmf.device();
   auto dtype = torch::kInt32;
   torch::Tensor pmf_batched;
@@ -383,44 +393,63 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
     B = pmf_batched.size(0);
     N = pmf_batched.size(1);
   }
-  auto freq = torch::round(pmf_batched * (1 << precision)).to(dtype);
-  auto cdf = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(device));
-  cdf.index_put_({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)}, freq);
-  auto total = cdf.sum(1, true).to(dtype);
-  total = torch::where(total == 0, torch::ones_like(total), total);
-  cdf = ((cdf * (1 << precision)) / total).to(dtype);
-  cdf = torch::cumsum(cdf, 1).to(dtype);
-  cdf.index_put_({torch::indexing::Slice(), N}, 1 << precision);
-  auto cdf_contig = cdf.contiguous();
+  const int64_t scale = (int64_t)1 << precision;
+  auto cdf_contig = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(device));
   auto cdf_ptr = cdf_contig.data_ptr<int32_t>();
-  at::parallel_for(0, B, 0, [&](size_t start, size_t end) {
-    for (size_t b = start; b < end; b++) {
-      int32_t* row = cdf_ptr + b * (N + 1);
-      for (int i = 0; i < N; ++i) {
-        if (row[i] == row[i + 1]) {
-          int32_t best_freq = INT32_MAX;
-          int best_steal = -1;
-          for (int j = 0; j < N; ++j) {
-            int32_t f = row[j + 1] - row[j];
-            if (f > 1 && f < best_freq) {
-              best_freq = f;
-              best_steal = j;
+
+  const torch::Tensor pmf_contig = pmf_batched.contiguous();
+  AT_DISPATCH_FLOATING_TYPES(pmf_contig.scalar_type(), "rans_pmf_to_quantized_cdf_cpu", [&] {
+    const scalar_t* pmf_ptr = pmf_contig.data_ptr<scalar_t>();
+    at::parallel_for(0, B, 0, [&](size_t start, size_t end) {
+      for (size_t b = start; b < end; b++) {
+        const scalar_t* pmf_row = pmf_ptr + b * N;
+        int32_t* row = cdf_ptr + b * (N + 1);
+        // freq -> cdf[1..N], cdf[0] = 0
+        row[0] = 0;
+        int64_t total = 0;
+        for (int64_t j = 0; j < N; ++j) {
+          const double rounded = std::nearbyint((double)(pmf_row[j] * (scalar_t)scale));
+          const int32_t f = (int32_t)rounded;
+          row[j + 1] = f;
+          total += (int64_t)f;
+        }
+        int32_t total32 = (int32_t)total;
+        if (total32 == 0) total32 = 1;
+        // scale, then inclusive cumsum; both wrap like the int32 torch ops did
+        int64_t acc = 0;
+        for (int64_t j = 0; j <= N; ++j) {
+          const int32_t prod = (int32_t)((int64_t)row[j] * scale);
+          acc += (int64_t)(prod / total32);
+          row[j] = (int32_t)acc;
+        }
+        row[N] = (int32_t)scale;
+        // "steal frequency" fix-up: every symbol must own at least one unit
+        for (int64_t i = 0; i < N; ++i) {
+          if (row[i] == row[i + 1]) {
+            int32_t best_freq = INT32_MAX;
+            int best_steal = -1;
+            for (int64_t j = 0; j < N; ++j) {
+              int32_t f = row[j + 1] - row[j];
+              if (f > 1 && f < best_freq) {
+                best_freq = f;
+                best_steal = (int)j;
+              }
             }
-          }
-          TORCH_CHECK(best_steal != -1, "No symbol to steal frequency from");
-          if (best_steal < i) {
-            for (int j = best_steal + 1; j <= i; ++j) {
-              row[j] -= 1;
-            }
-          } else {
-            TORCH_CHECK(best_steal > i, "best_steal must be > i");
-            for (int j = i + 1; j <= best_steal; ++j) {
-              row[j] += 1;
+            TORCH_CHECK(best_steal != -1, "No symbol to steal frequency from");
+            if (best_steal < i) {
+              for (int64_t j = best_steal + 1; j <= i; ++j) {
+                row[j] -= 1;
+              }
+            } else {
+              TORCH_CHECK(best_steal > i, "best_steal must be > i");
+              for (int64_t j = i + 1; j <= best_steal; ++j) {
+                row[j] += 1;
+              }
             }
           }
         }
       }
-    }
+    });
   });
   if (pmf.dim() == 1) {
     return cdf_contig[0];
@@ -429,6 +458,47 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
     sizes.push_back(N+1);
     return cdf_contig.reshape(sizes);
   }
+}
+
+
+// B2: build the combined "cdf ++ inverse-CDF table" tensor the kernels expect.
+// Entry i of the table answers the query for the bucket start i << (p - q):
+// the largest symbol index whose cdf value is <= that start. cdf[0] is always 0,
+// so the binary search below (largest i with cdf[i] <= value) is exactly the
+// value the decoder wants - no off-by-one fix-up afterwards.
+torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq_precision,
+                                         int64_t table_precision) {
+  TORCH_CHECK(table_precision >= 1 && table_precision <= freq_precision,
+              "table_precision must be in [1, ", freq_precision, "], got ", table_precision);
+  const bool was_1d = cdfs.dim() == 1;
+  const torch::Tensor cdf = (was_1d ? cdfs.unsqueeze(0) : cdfs).contiguous();
+  const int64_t B = cdf.size(0);
+  const int64_t M = cdf.size(1);
+  const int64_t T = (int64_t)1 << table_precision;
+  const int64_t shift = freq_precision - table_precision;
+
+  torch::Tensor out = torch::empty({B, M + T}, cdf.options());
+  AT_DISPATCH_INTEGRAL_TYPES(cdf.scalar_type(), "rans_build_inverse_cdf_cpu", [&] {
+    const scalar_t* cdf_ptr = cdf.data_ptr<scalar_t>();
+    scalar_t* out_ptr = out.data_ptr<scalar_t>();
+    at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t b = begin; b < end; ++b) {
+        const scalar_t* row = cdf_ptr + b * M;
+        scalar_t* out_row = out_ptr + b * (M + T);
+        for (int64_t c = 0; c < M; ++c) out_row[c] = row[c];
+        // cdf and the bucket starts are both sorted, so a single merge sweep
+        // (O(M + T)) replaces T independent binary searches (O(T log M))
+        int64_t sym = 0;  // cdf[0] is always 0 <= the first bucket start
+        for (int64_t bucket = 0; bucket < T; ++bucket) {
+          const int64_t value = bucket << shift;
+          while (sym + 1 < M && (int64_t)row[sym + 1] <= value) ++sym;
+          out_row[M + bucket] = (scalar_t)sym;
+        }
+      }
+    });
+  });
+
+  return was_1d ? out[0] : out;
 }
 
 
@@ -442,6 +512,7 @@ TORCH_LIBRARY_IMPL(torch_ans, CPU, m) {
     m.impl("rans64_alias_push_indexed", &rans_push_indexed_cpu<uint64_t, uint32_t, true, 1>);
     m.impl("rans64_alias_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, true, false>);
     m.impl("rans64_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, false, true>);
+    m.impl("rans64_i4_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint64_t, uint32_t, false, true, 4>);
     m.impl("rans32_init_stream", &rans_init_stream<uint32_t, uint8_t>);
     m.impl("rans32_push_indexed", &rans_push_indexed_cpu<uint32_t, uint8_t, false, 1>);
     m.impl("rans32_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint8_t>);
@@ -457,6 +528,9 @@ TORCH_LIBRARY_IMPL(torch_ans, CPU, m) {
     m.impl("rans32_16_i4_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, false, 4>);
     m.impl("rans32_16_i4_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, false, 4>);
     m.impl("rans32_16_i4_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, true, 4>);
+    m.impl("rans32_16_i32_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, false, 32>);
+    m.impl("rans32_16_i32_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, false, 32>);
+    m.impl("rans32_16_i32_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, true, 32>);
     m.impl("rans32_16_alias_push_indexed", &rans_push_indexed_cpu<uint32_t, uint16_t, true, 1>);
     m.impl("rans32_16_alias_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, true, false>);
     m.impl("rans32_16_invcdf_pop_indexed", &rans_pop_indexed_cpu<uint32_t, uint16_t, false, true>);

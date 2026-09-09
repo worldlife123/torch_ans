@@ -11,6 +11,7 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 
 - **High-speed ANS compression/decompression**: Efficient encoding and decoding using rANS, suitable for large-scale data and neural network applications.
 - **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration/asynchronous operators for batch processing and high throughput.
+- **Warp-level decoding on CUDA**: `rans32_16` with `num_interleaves=32` maps each stream onto the 32 lanes of a warp, stages the CDF and lookup tables in shared memory and picks the symbol with a tunable inverse-CDF lookup — achieving **up to 25.8 Gsymbol/s decode (~29 GB/s of payload) on an RTX 2080 Ti**.
 - **Multi-platform support**: Compatible with Linux/macOS/Windows OS and x86_64/aarch64 based platforms, provided that PyTorch and the necessary build tools (C++ compiler, CUDA toolkit if applicable) are available on that platform.
 - **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
@@ -69,12 +70,14 @@ Below we list currently supported variants:
 | rans64_i4              | 64         | 32          | 16            | 4                  | CPU           | -                        | rans64_i4_push           | rans64_i4_pop           |
 | rans64_alias           | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_alias_push        | rans64_alias_pop        |
 | rans64_invcdf          | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_push              | rans64_invcdf_pop       |
+| rans64_i4_invcdf       | 64         | 32          | 16            | 4                  | CPU, CUDA     | -                        | rans64_i4_push           | rans64_i4_invcdf_pop    |
 | rans32                 | 32         | 8           | 16             | 1                  | CPU, CUDA     | rans32_init_stream       | rans32_push              | rans32_pop              |
 | rans32_i4              | 32         | 8           | 16             | 4                  | CPU           | -                        | rans32_i4_push           | rans32_i4_pop           |
 | rans32_alias           | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_alias_push        | rans32_alias_pop        |
 | rans32_invcdf          | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_push              | rans32_invcdf_pop       |
 | rans32_16              | 32         | 16          | 15            | 1                  | CPU, CUDA     | rans32_16_init_stream    | rans32_16_push           | rans32_16_pop           |
-| rans32_16_i4           | 32         | 16          | 15            | 4                  | CPU           | -                        | rans32_16_i4_push        | rans32_16_i4_pop        |
+| rans32_16_i4           | 32         | 16          | 15            | 4                  | CPU, CUDA     | -                        | rans32_16_i4_push        | rans32_16_i4_pop        |
+| rans32_16_i32          | 32         | 16          | 15            | 32                 | CPU, CUDA     | -                        | rans32_16_i32_push       | rans32_16_i32_pop       |
 | rans32_16_alias        | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_alias_push     | rans32_16_alias_pop     |
 | rans32_16_invcdf       | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_push           | rans32_16_invcdf_pop    |
 
@@ -82,7 +85,7 @@ Below we list currently supported variants:
 - *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
 - *Stream Bits*: Number of bits per stream element. This affects the frequency of overflowed state to be written into/read from bitstream, slightly affecting speed.
 - *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In torch_ans implementation, State Bits > Stream Bits + Max Freq Bits.
-- *Interleaved States*: Number of interleaved states for sequential coding in one step. Effective when combined with SIMD instructions (not implemented in torch_ans).
+- *Interleaved States*: Number of interleaved states for sequential coding in one step. On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, `rans32_16_i4` uses 4-lane sub-warp groups and `rans32_16_i32` maps its 32 interleaved states onto the 32 lanes of a warp using warp-level primitives (`__ballot_sync`/`__shfl_xor_sync`, technique referenced from [Recoil](https://github.com/lin-toto/recoil)), with one shared bitstream cursor per warp. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
 - *Device Support*: Indicates if variant is available on CPU and/or CUDA GPU.
 - *init_func/push_func/pop_func*: Main API functions for this variant.
 
@@ -90,9 +93,14 @@ In addition to standard and interleaved rANS, two advanced coding types are supp
 
 **Alias Coding**: Alias coding modifies both the push (encode) and pop (decode) steps. It accelerates the pop (decode) process by enabling constant-time symbol lookup, but increases memory usage during the push (encode) step due to the need for additional alias tables.
 
-**Inverse CDF decoding**: Inverse CDF decoding only changes the pop (decode) step. It accelerates decoding by allowing direct symbol lookup from the state, but requires much more memory during the pop step because of large inverse CDF tables. However, it seems that reading large inverse CDF tables does not result in prominent acceleration compared to standard coding.
+**Inverse CDF decoding**: Inverse CDF decoding only changes the pop (decode) step. Instead of the data-dependent divided search + binary refine, the decoder loads the symbol from a table keyed by the low bits of the ANS state. The table precision is tunable via `inverse_cdf_precision`:
+- `inverse_cdf_precision = freq_precision` builds a *dense* table (one entry per quantized frequency, `2**freq_precision` entries per distribution — exact `O(1)` lookup);
+- any smaller value builds a *sparse* table with only `2**q` entries per distribution plus a short bounded linear walk (`2**(freq_precision - q)` steps at most) — `2**(freq_precision - q)`x less memory, usually as fast or faster;
+- `inverse_cdf_precision = "auto"` picks `q` from the alphabet size at `init_params` time (about `log2(alphabet) - 1`, tuned so the row fits the shared-memory staging budget on CUDA), and skips the table entirely for alphabets below 64 symbols where it buys less than ~3%.
 
-Use alias coding for fast decoding when memory usage during encoding is not a concern. Use inverse CDF coding for maximum decoding speed when memory usage during decoding is acceptable.
+With a sparse table the memory footprint is modest and the decode speedup is real: up to **+80% on CUDA** (large alphabets) and up to **2.8x on CPU** over the default lookup (measured, see `scripts/bench_sparse_invcdf.py`).
+
+Use alias coding for fast decoding when memory usage during encoding is not a concern. Use inverse CDF coding (usually with `"auto"`) for maximum decoding speed when a small per-distribution table is acceptable.
 
 ### Parallel ANS stream
 
@@ -110,6 +118,8 @@ Increasing the number of parallel states (`B`) generally improves throughput, bu
 - For small datasets (<100MB), CPUs with fewer parallel states (e.g., 8 for desktop, 32 for server) are usually optimal.
 - For large datasets, GPUs become advantageous only with a large number of parallel states (typically >256).
 - Example: On an i7-6800k (6C12T) CPU and RTX 2080Ti GPU, rans64 encoding speed is similar for CPU and GPU with 128 parallel states, while with 256 parallel states GPU is 2 times faster than CPU.
+
+On CUDA, throughput of the warp-level interleaved path (`rans32_16` + `num_interleaves=32`) is governed by **how many warps the batch provides**: each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`. On a 68-SM GPU, `rows >= 2048` saturates the GPU; below that, decode throughput scales almost linearly with `rows` (measured: 6.6 -> 25.8 Gsymbol/s going from 256 to 2048 rows, `inverse_cdf_precision="auto"`). See the [performance FAQ](#faq) for the full checklist.
 
 
 ### Command-line benchmark tool
@@ -210,6 +220,12 @@ Encodes symbols into the rANS stream in parallel.
 - **freq_precision** (int): Frequency precision in bits.
 - **bypass_coding** (bool): Enable bypass coding for out-of-range symbols.
 - **bypass_precision** (int): Precision for bypass coding.
+
+  > **Range limit:** an out-of-range symbol is zig-zag encoded into a raw value
+  > stored in the symbol dtype (`int32` by default), so its distance from the
+  > coded range `[offset, offset + cdf_size - 2)` must stay below 2^(bits-2) —
+  > about **2^30 (~1.07e9)** for `int32`. Symbols further out of range overflow
+  > the raw value and are silently mis-coded.
 
 **torch_ans.rans*_pop**
 
@@ -356,7 +372,22 @@ encoded = coder.encode_with_indexes(symbols, indexes)
 decoded = coder.decode_with_indexes(encoded, indexes)
 
 assert torch.equal(decoded, symbols)
+
+# Fastest GPU decode path: warp-level 32-way interleaved coding + auto lookup
+gpu_coder = TorchANSInterface(impl="rans32_16", freq_precision=15, device="cuda",
+                              num_interleaves=32, inverse_cdf_precision="auto")
+gpu_coder.init_params(freqs, num_freqs, offsets)
+gpu_stream = gpu_coder.encode_with_indexes(
+    symbols.to("cuda"), indexes.to("cuda"))
+gpu_decoded = gpu_coder.decode_with_indexes(gpu_stream, indexes.to("cuda"))
+assert torch.equal(gpu_decoded.cpu(), symbols)
 ```
+
+Notes on the GPU example:
+- `num_interleaves=32` selects the warp-level kernels (one warp per stream).
+- `freq_precision=15` is the maximum supported by the warp-level path.
+- `inverse_cdf_precision="auto"` builds a symbol-lookup table sized from the alphabet (and skips it for alphabets < 64 symbols).
+- Batch at least ~2048 rows (`symbols.shape[0]`) to saturate the GPU; streams encoded on CPU decode on CUDA and vice versa.
 
 ## Troubleshooting
 
@@ -386,16 +417,35 @@ If data size is extremely small, you could try rans32 or rans32_16 to reduce ini
 
 **Q: Why isn't GPU throughput significantly higher than CPU? Some existing implementation like [dietgpu](https://github.com/facebookresearch/dietgpu) achieve over 200GB/s but torch_ans have only 6GB/s throughput!**
 
-A: The foundamental idea of torch_ans acceleration is simply parallel ANS coding. 
-For simplicity, we use the same set of implementation logic for both CPU and GPU in `rans_utils.hpp`, which indicates that hardware-specific optimizations are not adopted.
-For example, dietgpu adopt [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) to efficiently distribute interleaved push/pop steps over threads. 
-On the contrary, torch_ans implement non-interleaved push/pop steps based on conditional blocks (if-else) similar to [FSE](https://github.com/Cyan4973/FiniteStateEntropy), which results in different threads in a warp take separate paths, reducing throughput. Currently we define DEFAULT_NUM_THREADS_PER_BLOCK=1 to achieve best GPU throughput, and using more threads reduces throughput.
+A: This was true for the old non-interleaved path (one thread per stream, divergent branches, `DEFAULT_NUM_THREADS_PER_BLOCK=1`), which still exists for `rans64`/`rans32`. The `rans32_16` variant now has a dedicated warp-level interleaved CUDA path (technique from [Recoil](https://github.com/lin-toto/recoil)/[dietgpu](https://github.com/facebookresearch/dietgpu)): each stream is decoded by one warp, the CDF and lookup tables are staged in shared memory, the symbol lookup uses a tunable inverse-CDF table, and the bypass phase is skipped by a group ballot when no lane needs it.
 
-**Q: How to achieve even higher throughput on GPU?**
+On an RTX 2080 Ti this reaches **~25.8 Gsymbol/s decode (~29 GB/s of payload at ~9 bits/symbol)** with `rows >= 2048`, which is the same order of magnitude as dietgpu's numbers. Two things to keep in mind when comparing:
 
-A: Personally I'm not familiar with CUDA programming. You can refer to [Recoil](https://github.com/lin-toto/recoil) or [dietgpu](https://github.com/facebookresearch/dietgpu), which share the same idea of using parallel ANS stream but reports much better GPU performance. From my observation of their code, both of them implement 32-lane interleaved ANS with CUDA warp-level primitives, so this might be the trick.
+- rANS decode throughput in symbols/s depends on the payload entropy: at ~9 bits/symbol, 25.8 Gsymbol/s already moves ~29 GB/s; benchmarks reporting 200 GB/s usually assume fixed 2-byte symbols on data-center GPUs (A100/H100) and no per-symbol distribution routing or bypass coding.
+- torch_ans targets the learned-compression use case: multiple distributions per tensor, `int32` symbols with per-symbol CDF indexes, and bypass coding for out-of-range values.
 
 ### Technical
+
+**Q: How do I optimize encoding/decoding speed on CPU and GPU?**
+
+A: In order of impact (measured on an RTX 2080 Ti and a 6-core CPU):
+
+On GPU:
+
+1. **Use `impl="rans32_16"` with `num_interleaves=32`** — this selects the warp-level interleaved CUDA kernels (one warp per stream). It requires `freq_precision <= 15`.
+2. **Batch enough rows.** Each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`: use `rows >= 4 * SM count` (e.g. >= 2048 on a 68-SM GPU) to saturate the GPU. Below that, decode throughput scales almost linearly with `rows`, and no launch-configuration trick can recover it.
+3. **Enable the inverse-CDF lookup for faster decoding** with `inverse_cdf_precision="auto"`: for alphabets with >= 64 symbols it builds a `2**q` table (`q ~= log2(alphabet) - 1`) sized so the whole row fits the shared-memory staging budget. Worth +5% to +80% over the default binary search depending on the alphabet.
+4. **Keep `freq_precision <= 15`** — smaller states renormalize less often, and `rans32_16` is the only variant with the warp-level path.
+5. **Avoid bypass coding when symbols are guaranteed in range** — the bypass phase is inherently sequential across the warp lanes (its per-symbol skeleton was worth 2.5-3.3x in our ablations).
+6. `init_params` rebuilds the quantized CDFs and the lookup table and costs ~0.2 ms on CUDA. It runs on every call of the `dist_freqs` API, so for many small tensors prefer passing `dist_indexes` (precomputed CDF indexes), or reuse the coder.
+
+On CPU:
+
+1. `torch.set_num_threads(n)` controls the OpenMP parallelism used by push/pop.
+2. `inverse_cdf_precision="auto"` also helps on CPU decoding — up to ~2.8x for large alphabets (the table is built with a single sorted merge, so it is cheap).
+3. Using interleaved variants may also boost performance on modern CPUs with OoO (Out-of-Order) execution support.
+4. `rans64` remains the most robust default; `rans32_16` reduces the initial-state overhead for small payloads.
+
 
 **Q: What Python and PyTorch versions are supported?**
 
@@ -426,6 +476,7 @@ A: In most cases this is caused by version mismatch between PyTorch during runti
 
 A: Set the `device` argument in API calls to "cpu" or "cuda". For large batches, GPU is recommended; for small data, CPU may be faster.
 Also, as GPU coding process is asynchronous, if some other tasks (such as neural networks in neural compression) are running meanwhile, using GPU coding may increase the overall throughput.
+For the fastest GPU decode when you have massive data, use `impl="rans32_16"`, `num_interleaves=32`, `freq_precision <= 15`, `inverse_cdf_precision="auto"` and `rows >= 2048` (see the performance FAQ above).
 
 **Q: What is the difference between low-level and high-level APIs?**
 
@@ -525,8 +576,8 @@ import torch_ans
 
 ### TODO
 - Docs and examples for high-level API
-- Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
-- Implement lookup table logic in push/pop steps for possible acceleration (refer to [dietgpu](https://github.com/facebookresearch/dietgpu) and [Recoil](https://github.com/lin-toto/recoil))
+- ~~Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)~~ Done for `rans32_16_i32` / `rans32_16_i4`: warp-level 32-way (and 4-way sub-warp) interleaved coding on CUDA, bit-compatible with the CPU interleaved streams (see `torch_ans/rans_warp_cuda.cuh`, technique referenced from [Recoil](https://github.com/lin-toto/recoil))
+- ~~Implement lookup table logic in push/pop steps for possible acceleration~~ Done: inverse-CDF lookup with a tunable (dense/sparse/`"auto"`) `2**q` table on CPU and CUDA, warp-level shared-memory staging on CUDA, and a `"auto"` precision heuristic.
 - Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
 - Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression

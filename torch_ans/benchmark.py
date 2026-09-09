@@ -10,6 +10,10 @@ from torch_ans.utils import TorchANSInterface
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 DEFAULT_DEVICES = ["cpu", "cuda"]
 DEFAULT_MODES = ["push", "pop", "both"]
+# (impl, num_interleaves) pairs that torch_ans can build. Interleaved CUDA
+# coding is rans32_16-only and maps to the warp-level kernels (rans_warp_cuda.cuh);
+# the CPU supports the same interleavings via rans_cpu.cpp.
+DEFAULT_INTERLEAVES = [1, 4, 32]
 
 
 def benchmark_parallel_states(
@@ -20,8 +24,19 @@ def benchmark_parallel_states(
     num_symbols: int = 256,
     num_dists: int = 8,
     freq_precision: int = 16,
+    impl: str = "rans64",
+    num_interleaves: int = 1,
+    warmup: int = 0,
+    repeat: int = 1,
 ) -> List[Tuple[int, float, float]]:
-    """Benchmark rANS throughput for a list of parallel batch sizes."""
+    """Benchmark rANS throughput for a list of parallel batch sizes.
+
+    `impl` and `num_interleaves` select the rANS variant: "rans32_16" with
+    num_interleaves=32 uses the warp-level interleaved kernels on CUDA. Note that
+    freq_precision is capped per implementation (rans64: 31, rans32: 23,
+    rans32_16: 15), so pass a freq_precision valid for every implementation when
+    comparing them.
+    """
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available in this environment")
 
@@ -50,46 +65,43 @@ def benchmark_parallel_states(
             device=device, 
             bypass_coding=False, 
             freq_precision=freq_precision,
+            impl=impl,
+            num_interleaves=num_interleaves,
         )
         ans_interface.init_params(freqs, num_freqs, offsets)
         # ans_interface.set_cdfs(cdfs, cdfs_sizes, offsets)
 
-        if mode == "push":
+        def _timed_call() -> float:
+            """Runs one iteration and returns the seconds spent in the timed part."""
+            if mode == "push":
+                start = time.time()
+                ans_interface.encode(symbols, indexes)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                return time.time() - start
+            if mode == "pop":
+                # decoding consumes the stream, so encode a fresh one per run
+                # (outside of the timed region, as in the single-shot version)
+                stream_ = ans_interface.encode(symbols, indexes)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                start = time.time()
+                ans_interface.decode(stream_, indexes)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                return time.time() - start
             start = time.time()
-            ans_interface.encode(
-                symbols,
-                indexes,
-            )
+            stream_ = ans_interface.encode(symbols, indexes)
+            ans_interface.decode(stream_, indexes)
             if device == "cuda":
                 torch.cuda.synchronize()
-        elif mode == "pop":
-            stream = ans_interface.encode(
-                symbols,
-                indexes,
-            )
-            start = time.time()
-            decoded = ans_interface.decode(
-                stream,
-                indexes,
-            )
-            if device == "cuda":
-                torch.cuda.synchronize()
-            _ = decoded
-        else:  # both
-            start = time.time()
-            stream = ans_interface.encode(
-                symbols,
-                indexes,
-            )
-            decoded = ans_interface.decode(
-                stream,
-                indexes,
-            )
-            if device == "cuda":
-                torch.cuda.synchronize()
-            _ = decoded
+            return time.time() - start
 
-        elapsed = time.time() - start
+        for _ in range(max(0, warmup)):
+            _timed_call()
+
+        repeats = max(1, repeat)
+        elapsed = sum(_timed_call() for _ in range(repeats)) / repeats
         throughput = data_size_mb / elapsed if elapsed > 0 else float("inf")
         results.append((batch_size, elapsed, throughput))
     return results
@@ -125,7 +137,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-size-mb",
         type=float,
-        default=50.0,
+        default=200.0,
         help="Total data size per benchmark iteration in megabytes.",
     )
     parser.add_argument(
@@ -140,13 +152,38 @@ def _parse_args() -> argparse.Namespace:
         default=16,
         help="Frequency precision for the quantized CDF.",
     )
+    parser.add_argument(
+        "--impl",
+        default="rans64",
+        help="rANS implementation: rans64, rans32 or rans32_16.",
+    )
+    parser.add_argument(
+        "-i",
+        "--num-interleaves",
+        type=int,
+        default=1,
+        help="Number of interleaved rANS states (1, 4 or 32; 32 requires rans32_16).",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Number of untimed warm-up iterations per batch size.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Number of timed iterations per batch size (the mean is reported).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     print("torch_ans benchmark")
-    print(f"  impl: rans64") # TODO: support other implementations in the future
+    print(f"  impl: {args.impl}")
+    print(f"  num interleaves: {args.num_interleaves}")
     print(f"  mode: {args.mode}")
     print(f"  data size: {args.data_size_mb} MB")
     print(f"  num symbols: {args.num_symbols}")
@@ -163,6 +200,10 @@ def main() -> None:
                 mode=args.mode,
                 num_symbols=args.num_symbols,
                 freq_precision=args.freq_precision,
+                impl=args.impl,
+                num_interleaves=args.num_interleaves,
+                warmup=args.warmup,
+                repeat=args.repeat,
             )
         except RuntimeError as exc:
             print(f"  skipped {device}: {exc}")

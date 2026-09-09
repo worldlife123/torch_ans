@@ -128,8 +128,15 @@ RANS_API inline void rans_push_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_S
     // std::vector<RANS_SYMBOL_TYPE> bypass_syms;
     /* Determine the number of bypasses (in bypass_precision size) needed to
     * encode the raw value. */
+    // NOTE: the shift amount must stay below the symbol width. For a 32-bit
+    // symbol with bypass_precision=4 the count reaches 8, i.e. a shift of 32,
+    // which is undefined behaviour -- on x86 the count wraps to 0 and the loop
+    // never terminates. n_bypass is therefore capped at
+    // ceil(symbol_bits / bypass_precision), which is the largest value the
+    // bypass digits can represent anyway.
     RANS_SYMBOL_TYPE n_bypass = 0;
-    while ((raw_val >> (n_bypass * bypass_precision)) != 0) {
+    while ((int64_t)(n_bypass * bypass_precision) < (int64_t)(sizeof(RANS_SYMBOL_TYPE) * 8) &&
+           ((raw_val >> (n_bypass * bypass_precision)) != 0)) {
       ++n_bypass;
     }
 
@@ -193,6 +200,18 @@ RANS_API inline void rans_push_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE
     }
     assert(max_value >= 0);
 
+    // Bypass coding range limit. An out-of-range symbol is zig-zag encoded into
+    // a raw value held in RANS_SYMBOL_TYPE (int32 for the default tensor
+    // dtype):
+    //     raw_val = 2 * (value - max_value)      for value >= max_value
+    //     raw_val = -2 * value - 1               for value < 0
+    // so the distance from the coded range [0, max_value) must stay below
+    // 2^(8*sizeof(RANS_SYMBOL_TYPE)-2) -- about 2^30 (~1.07e9) for int32
+    // symbols. Beyond that the multiply overflows and the symbol is silently
+    // mis-coded (no error is raised). The bypass digits themselves carry a full
+    // width value; only this zig-zag mapping is the limit. Note this is far
+    // above the point where the digit counter used to overflow (2^28), which is
+    // fixed by the shift guard below.
     RANS_SYMBOL_TYPE raw_val = 0;
     if (bypass_coding) {
       if (value < 0) {
@@ -389,7 +408,8 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
     bool bypass_coding, 
     int64_t bypass_precision,
     const RANS_FREQ_TYPE* inversed_cdf,
-    const RANSAliasSamplingCDFTableElement<RANS_FREQ_TYPE>* cdf_alias_table
+    const RANSAliasSamplingCDFTableElement<RANS_FREQ_TYPE>* cdf_alias_table,
+    int64_t inverse_cdf_precision=-1
     )
 {
     static_assert(RANS_STATE_USED_BITS <= RANS_STATE_BITS);
@@ -423,7 +443,18 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
       cum_freq_offset -= alias_start;
     }
     else if (inversed_cdf != nullptr) {
-      cdf_idx = inversed_cdf[cum_freq];
+      // Sparse inverse CDF: entry i answers the query for the bucket start
+      // i << (freq_precision - inverse_cdf_precision). A bucket start never
+      // exceeds cum_freq, so the entry is a lower bound of the true symbol and
+      // a short linear walk closes the remaining gap. The walk is bounded by
+      // 1 << (freq_precision - inverse_cdf_precision) (every symbol owns at
+      // least one frequency unit) and is empty for a dense table.
+      // Mirrors rans_warp_pop_lookup (rans_warp_cuda.cuh) so that the CPU and
+      // the warp kernels stay bit-compatible.
+      const int64_t inv_cdf_precision = (inverse_cdf_precision > 0) ? inverse_cdf_precision : freq_precision;
+      const int shift = (int)(freq_precision - inv_cdf_precision);
+      cdf_idx = inversed_cdf[cum_freq >> shift];
+      while (cdf[cdf_idx + 1] <= cum_freq) ++cdf_idx;
       cum_freq_offset -= cdf[cdf_idx];
     }
     else {

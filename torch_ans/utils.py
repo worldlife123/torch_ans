@@ -1,5 +1,6 @@
 import torch
 # import numpy as np
+import math
 import struct
 import io
 
@@ -13,6 +14,14 @@ from torch_ans._C import rans_stream_to_byte_strings, rans_byte_strings_to_strea
 from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
 from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
 from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
+from torch_ans._C import rans64_i4_push, rans64_i4_pop
+from torch_ans._C import rans32_i4_push, rans32_i4_pop
+from torch_ans._C import rans32_16_i4_push, rans32_16_i4_pop, rans32_16_i32_push, rans32_16_i32_pop
+# inverse-CDF (dense or sparse) decode variants, selected by inverse_cdf_precision
+from torch_ans._C import rans64_invcdf_pop, rans64_i4_invcdf_pop
+from torch_ans._C import rans32_invcdf_pop, rans32_i4_invcdf_pop
+from torch_ans._C import rans32_16_invcdf_pop, rans32_16_i4_invcdf_pop, rans32_16_i32_invcdf_pop
+from torch_ans._C import rans_build_inverse_cdf
 
 
 # def _bind_from_C(module):
@@ -61,7 +70,7 @@ from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
 #             )
 #     _bind_from_C(module)
 
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 
 
 def _get_bytes_format(num_bytes=4):
@@ -213,21 +222,146 @@ def pmf_to_quantized_cdf_batched(pmf : torch.Tensor, precision=16, add_tail=True
     return cdf
 
 
-def inverse_quantized_cdf(quantized_cdf, freq_precision=16):
+def inverse_quantized_cdf(quantized_cdf, freq_precision=16, table_precision=None):
     """
     Computes the inverse quantized CDF lookup table.
+
+    With ``table_precision < freq_precision`` the table is *sparse*: it only
+    holds ``2 ** table_precision`` entries and entry ``i`` answers the query for
+    the bucket start ``i << (freq_precision - table_precision)``. A bucket start
+    never exceeds the queried cumulative frequency, so the entry is a lower
+    bound of the true symbol and the decoder closes the remaining gap with a
+    short linear walk bounded by ``1 << (freq_precision - table_precision)``
+    steps. ``table_precision=None`` (or equal to ``freq_precision``) builds the
+    dense table, which is the historical behaviour.
 
     Args:
         quantized_cdf (torch.Tensor): Quantized CDF tensor.
         freq_precision (int): Frequency precision in bits.
+        table_precision (int, optional): Precision (in bits) of the lookup
+            table. Defaults to ``freq_precision``, i.e. a dense table.
 
     Returns:
         torch.Tensor: Inverse CDF tensor.
     """
-    table_size = (1<<freq_precision)
-    freq_range = torch.arange(table_size).unsqueeze(0).type_as(quantized_cdf)
-    inversed_cdf = (freq_range.unsqueeze(-1) >= quantized_cdf.unsqueeze(1)).sum(-1, dtype=quantized_cdf.dtype)-1
-    return inversed_cdf # .type_as(quantized_cdf)
+    table_precision = freq_precision if table_precision is None else int(table_precision)
+    if table_precision < 1 or table_precision > freq_precision:
+        raise ValueError(
+            f"table_precision must be in [1, {freq_precision}], got {table_precision}")
+    shift = freq_precision - table_precision
+    table_size = (1 << table_precision)
+    # Sample the inverse CDF at the start of every bucket instead of at every
+    # cumulative frequency -> 2 ** (freq_precision - table_precision) x smaller.
+    #
+    # B1: the original expression `(freq_range >= cdf).sum(-1)` materialised an
+    # (N, 2**q, M) intermediate - 270 MB for a dense 256-symbol table with 8
+    # distributions and gigabytes for larger alphabets (measured 206 ms on CPU
+    # for 1024 symbols). A batched binary search is O(2**q log M) with no big
+    # temporary and is bit-identical: `right=True` counts exactly the cdf
+    # entries <= the bucket start, which is what the old expression counted.
+    # Measured 1.8x-157x faster on CPU and 1.05x-45x on CUDA, verified
+    # bit-exact by scripts/bench_table_build.py.
+    cdf = quantized_cdf.contiguous()
+    values = torch.arange(table_size, device=cdf.device) << shift
+    if cdf.dim() > 1:
+        values = values.unsqueeze(0).expand(cdf.size(0), table_size).contiguous()
+    try:
+        inversed_cdf = torch.searchsorted(cdf, values, right=True, out_int32=True)
+    except TypeError:  # out_int32 needs torch >= 1.9
+        inversed_cdf = torch.searchsorted(cdf, values, right=True)
+    return (inversed_cdf - 1).to(quantized_cdf.dtype)
+
+
+# Must match the shared-memory staging budget in rans_warp_cuda.cuh (A9): a
+# whole cdf++table row is staged when it fits, which is why the auto heuristic
+# below prefers a table precision that keeps the row inside it.
+AUTO_INVERSE_CDF_SHARED_BUDGET_BYTES = 16 * 1024
+
+
+def auto_inverse_cdf_precision(alphabet_size, freq_precision,
+                               num_distributions=1, itemsize=4,
+                               shared_budget_bytes=AUTO_INVERSE_CDF_SHARED_BUDGET_BYTES,
+                               min_alphabet=64):
+    """C1: pick the inverse-CDF table precision for a given alphabet size.
+
+    Rules, derived from the measurements in SPARSE_INVCDF_SUMMARY.md (A5/A9):
+
+    * alphabets below ``min_alphabet`` gain less than ~3% - keep the divided
+      search and build no table (returns ``None``);
+    * otherwise the sweet spot is a walk of about **two** steps, i.e.
+      ``2**q ~= alphabet_size / 2`` (``q = floor(log2(M))``): the measured
+      peaks at M=17/65/257/1025 all sit there. Denser tables only add cache
+      pressure (M=1025: q=10 is 6% slower than q=9), sparser ones stretch the
+      walk;
+    * if that row does not fit the shared-memory staging budget, trade one
+      walk doubling for a staged row (M=257: staged q=7 beats unstaged q=8 by
+      2%); if even the sparser row does not fit, keep the walk in [2, 4)
+      unstaged (M=1025: staged q=8 is 12% slower than unstaged q=9).
+
+    Returns ``None`` (build no table) or an integer in ``[1, freq_precision]``.
+    """
+    alphabet_size = int(alphabet_size)
+    freq_precision = int(freq_precision)
+    if alphabet_size < min_alphabet or freq_precision < 1:
+        return None
+
+    # walk in [1, 2): 2**q ~= alphabet_size / 2
+    q = min(freq_precision, max(1, alphabet_size.bit_length() - 1))
+    cols_budget = max(1, shared_budget_bytes // max(1, num_distributions * itemsize))
+    if alphabet_size + (1 << q) > cols_budget and q > 1:
+        # the row cannot be staged: either shrink the table until it does, or
+        # - when that is not possible - keep the walk in [2, 4) unstaged
+        q -= 1
+    return q
+
+
+_BUCKET_STARTS_CACHE = {}
+_BUCKET_STARTS_CACHE_MAX = 64
+
+
+def _bucket_starts(num_rows, table_size, shift, device, dtype):
+    """Cached ``arange(2**q) << shift`` expanded to (num_rows, 2**q).
+
+    Deterministic per (rows, q, shift, device, dtype), so it is built once and
+    reused - building it costs two kernels on every ``init_params`` call and
+    ``init_params`` runs per encode/decode in the ``dist_freqs`` API.
+    """
+    key = (num_rows, table_size, shift, device, dtype)
+    values = _BUCKET_STARTS_CACHE.get(key)
+    if values is None:
+        if len(_BUCKET_STARTS_CACHE) >= _BUCKET_STARTS_CACHE_MAX:
+            _BUCKET_STARTS_CACHE.clear()
+        values = torch.arange(table_size, device=device, dtype=dtype) << shift
+        values = values.unsqueeze(0).expand(num_rows, table_size).contiguous()
+        _BUCKET_STARTS_CACHE[key] = values
+    return values
+
+
+def build_cdf_with_inverse_table(quantized_cdf, freq_precision=16, table_precision=None):
+    """
+    B2: returns the combined ``cdf ++ inverse_table`` tensor the kernels expect,
+    writing the table straight into it instead of building it separately and
+    concatenating.
+
+    ``init_params`` does ``inverse_quantized_cdf`` + ``torch.cat`` on every call,
+    and the ``dist_freqs`` encode/decode API calls it per tensor: on CUDA that
+    was ~0.14 ms of table build plus ~0.03 ms of concatenation, i.e. more than
+    the coding itself for small tensors. This version is one allocation, one
+    copy of the cdf and one search - no separate table tensor, no ``cat``.
+
+    The entries are bit-identical to :func:`inverse_quantized_cdf`.
+    """
+    table_precision = freq_precision if table_precision is None else int(table_precision)
+    if table_precision < 1 or table_precision > freq_precision:
+        raise ValueError(
+            f"table_precision must be in [1, {freq_precision}], got {table_precision}")
+    shift = freq_precision - table_precision
+    table_size = 1 << table_precision
+
+    # one op: copy the cdf and fill the table in a single launch. The pure
+    # torch version (arange/expand + searchsorted + sub + cat) cost 3-5 dispatches
+    # ~40 us each, and this runs on every init_params call.
+    return rans_build_inverse_cdf(quantized_cdf, freq_precision, table_precision)
 
 
 class TorchEntropyCoderBaseInterface(object):
@@ -645,12 +779,28 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
     Implements encoding/decoding using rANS variants and manages coder parameters.
 
     Args:
-        impl (str): rANS implementation variant ("rans64", "rans32", etc.).
+        impl (str): rANS implementation variant ("rans64", "rans32", "rans32_16", etc.).
         bypass_coding (bool): Enable bypass coding for out-of-range symbols. 
                               This may not be supported in all implementations, or may reduce throughput!
         bypass_precision (int): Precision for bypass coding.
         num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
+        num_interleaves (int): Number of interleaved rANS states per stream (1, 4, or 32).
+                               32 uses the warp-level CUDA interleaved kernels on GPU (rans32_16 only);
+                               interleaved streams are bit-compatible between CPU and GPU implementations.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
+        inverse_cdf_precision (int or "auto", optional): Enables inverse-CDF symbol lookup
+                                               with a table of 2**inverse_cdf_precision
+                                               entries. Must be in [1, freq_precision];
+                                               equal to freq_precision gives the dense
+                                               O(1) table, a smaller value trades space for
+                                               a short bounded linear walk. "auto" picks
+                                               the precision from the alphabet size at
+                                               init_params time (about ceil(log2(alphabet)),
+                                               coarser when that keeps the row inside the
+                                               shared-memory staging budget, and no table
+                                               at all for alphabets < 64 where it buys < 3%).
+                                               None (default) keeps the divided-search +
+                                               binary refine lookup.
         **kwargs: Passed to TorchEntropyCoderBaseInterface.
     """
     def __init__(self, 
@@ -658,37 +808,95 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                  bypass_coding: bool = True, 
                  bypass_precision: int = 4, 
                  num_parallel_states=None, 
+                 num_interleaves: int = 1,
                  num_bytes_code_length=4, 
+                 inverse_cdf_precision: Optional[Union[int, str]] = None,
                  **kwargs) -> None:
         # _ensure_C()
         self.impl = impl
         self.bypass_coding = bypass_coding
         self.bypass_precision = bypass_precision
         self.num_parallel_states = num_parallel_states
+        self.num_interleaves = int(num_interleaves)
         self.num_bytes_code_length = num_bytes_code_length
+        self.inverse_cdf_precision = inverse_cdf_precision
         super().__init__(**kwargs)
         
         # TODO: expose them to options
-        self.impl_use_inverse_cdf = False
+        self.impl_use_inverse_cdf = inverse_cdf_precision is not None
         self.impl_use_alias_table = False
         
+        # NOTE: "rans32_16".startswith("rans32") is True, so rans32_16 must be matched first
         if self.impl.startswith("rans64"):
-            self.ans_init_func = rans64_init_stream
-            self.ans_encode_func = rans64_push
-            self.ans_decode_func = rans64_pop
-            self.freq_precision = min(self.freq_precision, 31)
-        elif self.impl.startswith("rans32") or self.impl.startswith("rans_byte"):
-            self.ans_init_func = rans32_init_stream
-            self.ans_encode_func = rans32_push
-            self.ans_decode_func = rans32_pop
-            self.freq_precision = min(self.freq_precision, 23)
+            base_impl, precision_cap = "rans64", 31
         elif self.impl.startswith("rans32_16"):
-            self.ans_init_func = rans32_16_init_stream
-            self.ans_encode_func = rans32_16_push
-            self.ans_decode_func = rans32_16_pop
-            self.freq_precision = min(self.freq_precision, 15)
+            base_impl, precision_cap = "rans32_16", 15
+        elif self.impl.startswith("rans32") or self.impl.startswith("rans_byte"):
+            base_impl, precision_cap = "rans32", 23
         else:
             raise NotImplementedError(f"Unknown impl {self.impl}")
+        self.freq_precision = min(self.freq_precision, precision_cap)
+
+        impl_funcs = {
+            ("rans64", 1): (rans64_init_stream, rans64_push, rans64_pop),
+            ("rans64", 4): (rans64_init_stream, rans64_i4_push, rans64_i4_pop),
+            ("rans32", 1): (rans32_init_stream, rans32_push, rans32_pop),
+            ("rans32", 4): (rans32_init_stream, rans32_i4_push, rans32_i4_pop),
+            ("rans32_16", 1): (rans32_16_init_stream, rans32_16_push, rans32_16_pop),
+            ("rans32_16", 4): (rans32_16_init_stream, rans32_16_i4_push, rans32_16_i4_pop),
+            # 32-way interleaving maps to the warp-level CUDA kernels on GPU
+            ("rans32_16", 32): (rans32_16_init_stream, rans32_16_i32_push, rans32_16_i32_pop),
+        }
+        impl_key = (base_impl, self.num_interleaves)
+        if impl_key not in impl_funcs:
+            raise NotImplementedError(
+                f"Unsupported num_interleaves={self.num_interleaves} for impl {self.impl} "
+                f"(supported: {sorted(impl_funcs.keys())})"
+            )
+        self.ans_init_func, self.ans_encode_func, self.ans_decode_func = impl_funcs[impl_key]
+        self._binary_decode_func = self.ans_decode_func
+
+        # Swap in the inverse-CDF decode op. NOTE: every (impl, interleaves)
+        # combination that supports push/pop also has an inverse-CDF variant.
+        self._decode_extra_kwargs = {}
+        # C1: inverse_cdf_precision="auto" defers the table precision to
+        # init_params, where the alphabet size is known
+        self._inverse_cdf_auto = (isinstance(self.inverse_cdf_precision, str) and
+                                  self.inverse_cdf_precision.strip().lower() == "auto")
+        self._invcdf_decode_func = None
+        if self.impl_use_inverse_cdf:
+            invcdf_pop_funcs = {
+                ("rans64", 1): rans64_invcdf_pop,
+                ("rans64", 4): rans64_i4_invcdf_pop,
+                ("rans32", 1): rans32_invcdf_pop,
+                ("rans32", 4): rans32_i4_invcdf_pop,
+                ("rans32_16", 1): rans32_16_invcdf_pop,
+                ("rans32_16", 4): rans32_16_i4_invcdf_pop,
+                ("rans32_16", 32): rans32_16_i32_invcdf_pop,
+            }
+            if impl_key not in invcdf_pop_funcs:
+                raise NotImplementedError(
+                    f"inverse CDF decoding is not available for impl={self.impl} with "
+                    f"num_interleaves={self.num_interleaves} "
+                    f"(available: {sorted(invcdf_pop_funcs.keys())})"
+                )
+            self._invcdf_decode_func = invcdf_pop_funcs.get(impl_key)
+            if self._inverse_cdf_auto:
+                # the numeric precision is decided in init_params, once the
+                # alphabet size (cdfs width) is known
+                self.inverse_cdf_precision = "auto"
+                if self._invcdf_decode_func is not None:
+                    self.ans_decode_func = self._invcdf_decode_func
+            else:
+                inverse_cdf_precision = int(self.inverse_cdf_precision)
+                if inverse_cdf_precision < 1 or inverse_cdf_precision > self.freq_precision:
+                    raise ValueError(
+                        f"inverse_cdf_precision must be in [1, {self.freq_precision}] "
+                        f"for impl {self.impl}, got {inverse_cdf_precision}"
+                    )
+                self.inverse_cdf_precision = inverse_cdf_precision
+                self.ans_decode_func = invcdf_pop_funcs[impl_key]
+                self._decode_extra_kwargs = {"inverse_cdf_precision": inverse_cdf_precision}
 
     def _init_stream(self, num_parallel_states=None, **kwargs) -> torch.Tensor:
         """
@@ -696,7 +904,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         """
         num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
         num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
-        return self._init_tensor(self.ans_init_func(num_parallel_states))
+        return self._init_tensor(self.ans_init_func(num_parallel_states, self.num_interleaves))
 
     def _reshape_for_parallel(self, tensor : torch.Tensor, num_parallel_states=None, padding_value=0, **kwargs) -> torch.Tensor:
         """
@@ -730,9 +938,30 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         pmf = freqs.float() / freqs.sum(-1, keepdim=True)
         cdfs = rans_pmf_to_quantized_cdf(pmf.to(device=self.device), self.freq_precision)
         cdfs_sizes = num_freqs + (2 if self.bypass_coding else 1)
+        if self.impl_use_inverse_cdf and self._inverse_cdf_auto:
+            # C1: the alphabet size is only known now - pick the table precision
+            # (or drop the table for tiny alphabets, where it buys < ~3%)
+            q = auto_inverse_cdf_precision(
+                alphabet_size=cdfs.size(-1),
+                freq_precision=self.freq_precision,
+                num_distributions=cdfs.size(0),
+                itemsize=cdfs.element_size())
+            self.impl_use_inverse_cdf = q is not None
+            if q is None:
+                self.inverse_cdf_precision = None
+                self._decode_extra_kwargs = {}
+                self.ans_decode_func = self._binary_decode_func
+            else:
+                self.inverse_cdf_precision = q
+                self._decode_extra_kwargs = {"inverse_cdf_precision": q}
+                self.ans_decode_func = self._invcdf_decode_func
         if self.impl_use_inverse_cdf:
-            inversed_cdfs = inverse_quantized_cdf(cdfs, freq_precision=self.freq_precision)
-            cdfs = torch.cat([cdfs, inversed_cdfs], dim=-1)
+            # B2: single allocation, table written in place (no separate table
+            # tensor, no cat) - init_params runs per encode/decode call in the
+            # dist_freqs API, so this is on the hot path
+            cdfs = build_cdf_with_inverse_table(
+                cdfs, freq_precision=self.freq_precision,
+                table_precision=self.inverse_cdf_precision)
         elif self.impl_use_alias_table:
             cdfs, cdfs_with_alias_table = rans_alias_build_table(
                 cdfs, cdfs_sizes, symbol_precision=self.symbol_precision, freq_precision=self.freq_precision
@@ -826,6 +1055,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
                 bypass_precision=self.bypass_precision,
+                **self._decode_extra_kwargs,
             )
             # filter out invalid decoded symbols (if any) caused by padding, and reshape to the same shape as dist_indexes
             decoded = decoded.reshape(-1)[:dist_indexes.numel()].reshape_as(dist_indexes)
@@ -844,6 +1074,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                 freq_precision=self.freq_precision, 
                 bypass_coding=self.bypass_coding, 
                 bypass_precision=self.bypass_precision,
+                **self._decode_extra_kwargs,
             )
             # filter out invalid decoded symbols (if any) caused by padding, and reshape to the same shape as dist_num_freqs
             decoded = decoded.reshape(-1)[:dist_num_freqs.numel()].reshape_as(dist_num_freqs)
