@@ -9,11 +9,194 @@ This is intentionally small and conservative: it mirrors enough of
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import platform
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Incremental build profiles
+#
+# A profile is the operator subset a single TorchANSInterface instance needs.
+# It maps to (a) the preprocessor gates in torch_ans/rans_build_config.hpp
+# (profile_defines), (b) the JIT module name/build directory
+# (profile_module_name) and (c) the operators the built module must export,
+# which is also what a pre-existing module is checked against before it is
+# reused (profile_op_names). The three must agree with the gated bindings in
+# torch_ans/rans_bindings.hpp.
+# ---------------------------------------------------------------------------
+
+#: Environment variable that turns incremental compilation off (``0``/``false``).
+INCREMENTAL_ENV_VAR = "TORCH_ANS_INCREMENTAL_COMPILE"
+
+#: rANS family -> the macro that enables it, see rans_build_config.hpp
+FAMILY_MACROS = {
+    "rans64": "TORCH_ANS_WITH_RANS64",
+    "rans32": "TORCH_ANS_WITH_RANS32",
+    "rans32_16": "TORCH_ANS_WITH_RANS32_16",
+}
+
+#: short family code used in the module name / build directory
+FAMILY_TAGS = {"rans64": "r64", "rans32": "r32", "rans32_16": "r3216"}
+
+#: operator-name infix per interleave factor (``rans64_i4_push``, ...)
+OP_SUFFIX = {1: "", 2: "_i2", 4: "_i4", 8: "_i8", 32: "_i32"}
+
+#: interleave factors supported per family, and those with alias variants
+#: (32-way interleaving is rans32_16-only and has no alias binding)
+SUPPORTED_INTERLEAVES = {
+    "rans64": (1, 2, 4, 8),
+    "rans32": (1, 2, 4, 8),
+    "rans32_16": (1, 2, 4, 8, 32),
+}
+ALIAS_INTERLEAVES = {
+    "rans64": (1, 2, 4, 8),
+    "rans32": (1, 2, 4, 8),
+    "rans32_16": (1, 2, 4, 8),
+}
+
+#: operators that are not gated (needed by every interface)
+COMMON_OPS = (
+    "rans_stream_to_byte_strings",
+    "rans_byte_strings_to_stream",
+    "rans_alias_build_table",
+    "rans_pmf_to_quantized_cdf",
+    "rans_build_inverse_cdf",
+)
+
+#: JIT name of the full build. Not "torch_ans_C_<something>": it is the name
+#: used before incremental compilation existed, so cached full builds keep
+#: being reused and `torch_ans._C` keeps its historical meaning.
+FULL_MODULE_NAME = "torch_ans_C"
+
+#: Key of the CUDA toolchain state file. Deliberately not the module name:
+#: whether the CUDA toolchain works (and with which host compiler) is a
+#: property of the machine, while incremental builds create one module per
+#: profile - without a shared key every new profile would re-attempt a build
+#: that is already known to fail.
+_CUDA_STATE_KEY = "torch_ans_cuda_toolchain"
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildProfile:
+    """Operator subset a build must provide.
+
+    ``family=None`` selects the minimal "common operators only" profile; the
+    full build is ``None`` (no profile at all) rather than a BuildProfile.
+    """
+
+    family: Optional[str] = None
+    interleave: int = 1
+    alias: bool = False
+    invcdf: bool = False
+
+
+def incremental_enabled(flag: Optional[bool] = None) -> bool:
+    """Whether a build should contain only the operators it needs.
+
+    ``flag`` (the ``incremental_compile=`` argument of
+    :class:`~torch_ans.utils.TorchANSInterface`) wins; otherwise
+    ``TORCH_ANS_INCREMENTAL_COMPILE`` is consulted, defaulting to enabled.
+    """
+    if flag is not None:
+        return bool(flag)
+    value = os.environ.get(INCREMENTAL_ENV_VAR)
+    if value is None:
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def profile_defines(profile: Optional[BuildProfile]) -> Dict[str, int]:
+    """Preprocessor defines that select the operators of ``profile``.
+
+    ``None`` is the full build and needs no defines: without
+    ``TORCH_ANS_INCREMENTAL_BUILD`` every gate in rans_build_config.hpp
+    defaults to 1.
+    """
+    if profile is None:
+        return {}
+    defines = {"TORCH_ANS_INCREMENTAL_BUILD": 1}
+    if profile.family is not None:
+        defines[FAMILY_MACROS[profile.family]] = 1
+    if profile.interleave != 1:
+        defines["TORCH_ANS_WITH_INTERLEAVE_%d" % profile.interleave] = 1
+    if profile.alias:
+        defines["TORCH_ANS_WITH_ALIAS"] = 1
+    if profile.invcdf:
+        defines["TORCH_ANS_WITH_INVCDCDF"] = 1
+    return defines
+
+
+def profile_module_name(profile: Optional[BuildProfile]) -> str:
+    """JIT module name of ``profile`` (also its build cache directory)."""
+    if profile is None:
+        return FULL_MODULE_NAME
+    if profile.family is None:
+        return FULL_MODULE_NAME + "_common"
+    parts = [FULL_MODULE_NAME, FAMILY_TAGS[profile.family]]
+    if profile.interleave != 1:
+        parts.append("i%d" % profile.interleave)
+    if profile.alias:
+        parts.append("alias")
+    if profile.invcdf:
+        parts.append("invcdf")
+    return "_".join(parts)
+
+
+def _ilv_op_names(family: str, interleave: int, alias: bool, invcdf: bool,
+                  alias_ok: bool) -> List[str]:
+    suffix = OP_SUFFIX[interleave]
+    names = ["%s%s_push" % (family, suffix), "%s%s_pop" % (family, suffix)]
+    if invcdf:
+        names.append("%s%s_invcdf_pop" % (family, suffix))
+    if alias and alias_ok:
+        names += ["%s_alias%s_push" % (family, suffix),
+                  "%s_alias%s_pop" % (family, suffix)]
+    return names
+
+
+def profile_op_names(profile: Optional[BuildProfile] = None) -> Tuple[str, ...]:
+    """Operators a module built for ``profile`` must export.
+
+    ``None`` asks for the full operator set. This is what a previously built
+    module is checked against (with ``hasattr``) before it is reused for a
+    different profile, so it must never under-report: a missing name only
+    costs a rebuild, a name that is claimed but not exported would break the
+    first use of the module.
+    """
+    names = list(COMMON_OPS)
+    if profile is None:
+        for family, interleaves in SUPPORTED_INTERLEAVES.items():
+            names.append("%s_init_stream" % family)
+            for interleave in interleaves:
+                names += _ilv_op_names(
+                    family, interleave, alias=True, invcdf=True,
+                    alias_ok=interleave in ALIAS_INTERLEAVES[family])
+        return tuple(names)
+    if profile.family is not None:
+        names.append("%s_init_stream" % profile.family)
+        names += _ilv_op_names(
+            profile.family, profile.interleave, alias=profile.alias,
+            invcdf=profile.invcdf,
+            alias_ok=profile.interleave in ALIAS_INTERLEAVES.get(profile.family, ()))
+    return tuple(names)
+
+
+def _define_flags(defines: Optional[Dict[str, object]]) -> List[str]:
+    """Turn a macro dict into compiler flags (``-DNAME=VALUE``)."""
+    if not defines:
+        return []
+    prefix = "/D" if sys.platform == "win32" else "-D"
+    flags = []
+    for name, value in defines.items():
+        if value is None or value == "":
+            flags.append(prefix + name)
+        else:
+            flags.append("%s%s=%s" % (prefix, name, value))
+    return flags
+
 
 def _detect_cuda_torch():
     try:
@@ -26,6 +209,10 @@ def _detect_cuda_torch():
 def _cuda_state_path(module_name: str) -> Optional[str]:
     """Path of the CUDA build state marker inside the extension build cache.
 
+    `module_name` is really a state key: build_extension passes the constant
+    ``_CUDA_STATE_KEY`` so that all profiles share one state (the toolchain
+    works or it does not - it does not depend on which operators are built).
+
     Records the outcome of previous CUDA build attempts so later first-time
     imports in fresh processes do not re-pay doomed ones:
       - "cpu"    -> the CUDA build failed with every available configuration;
@@ -37,7 +224,9 @@ def _cuda_state_path(module_name: str) -> Optional[str]:
     """
     try:
         from torch.utils.cpp_extension import _get_build_directory
-        return os.path.join(_get_build_directory(module_name, verbose=False), "cuda_build_state")
+        build_dir = _get_build_directory(module_name, verbose=False)
+        os.makedirs(build_dir, exist_ok=True)
+        return os.path.join(build_dir, "cuda_build_state")
     except Exception:
         return None
 
@@ -159,7 +348,7 @@ def _patch_file_baton_stale_lock(stale_seconds: int = 600) -> None:
         pass
 
 
-def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bool] = None, verbose: bool = False):
+def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bool] = None, verbose: bool = False, defines: Optional[Dict[str, object]] = None):
     """Build the native extension under `module_name` and return the module.
 
     This function purposely does not try to import `torch_ans._C` first to avoid
@@ -171,6 +360,11 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     derives the required `PyInit_*` symbol from the module name, and pybind11
     cannot paste dotted names into that symbol. Undotted names additionally
     stay importable when the build is repeated with changed arguments.
+
+    `defines` maps preprocessor macro names to values and is added to both the
+    C++ and the nvcc command lines. Incremental builds use it for the
+    TORCH_ANS_WITH_* gates (see profile_defines); the module name must already
+    identify the profile, since a given name caches exactly one define set.
 
     CUDA availability is detected BEFORE importing torch.utils.cpp_extension:
     that module-level import performs the process's first CUDA call, and doing
@@ -214,12 +408,17 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     # 2.7's c10/util/strong_type.h into an error (-Winvalid-specialization).
     darwin_extra = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
 
+    # Feature gates of an incremental build (empty for a full build). They go
+    # to the C++ compiler and to nvcc alike, since the gates are used by both
+    # translation units.
+    define_flags = _define_flags(defines)
+
     if sys.platform == "win32":
-        cpu_flag_variants = [(["/O2", "/openmp"] + std_flags, [])]
+        cpu_flag_variants = [(["/O2", "/openmp"] + std_flags + define_flags, [])]
     elif sys.platform == "darwin":
-        cpu_flag_variants = [(c + darwin_extra, ld) for c, ld in _darwin_cpu_flag_variants()]
+        cpu_flag_variants = [(c + darwin_extra + define_flags, ld) for c, ld in _darwin_cpu_flag_variants()]
     else:
-        cflags = ["-O3", "-fopenmp"] + std_flags
+        cflags = ["-O3", "-fopenmp"] + std_flags + define_flags
         if platform.machine() == "x86_64":
             cflags.append("-march=native")
         cpu_flag_variants = [(cflags, [])]
@@ -275,7 +474,7 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
         return _build_cpu_only()
 
     # CUDA build orchestration with failure memory (see _cuda_state_path).
-    state_path = _cuda_state_path(module_name)
+    state_path = _cuda_state_path(_CUDA_STATE_KEY)
     state = None
     if state_path is not None and os.path.exists(state_path):
         try:
@@ -313,7 +512,7 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     # WITH_CUDA must reach nvcc explicitly: torch's cpp_extension passes
     # extra_cflags to the C++ compiler only and (unlike WITH_HIP) does not
     # define WITH_CUDA itself, and rans_cuda.cu is empty without it.
-    extra_cuda_cflags = ["-O3", "-DWITH_CUDA"]
+    extra_cuda_cflags = ["-O3", "-DWITH_CUDA"] + define_flags
     base_cflags, base_ldflags = cpu_flag_variants[0]
     last_err = None
     for cc in attempt_order:

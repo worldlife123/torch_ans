@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 
 #include "rans.hpp"
+#include "rans_bindings.hpp"
 
 
 // Optimized: torch tensor input/output
@@ -84,7 +85,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
 
     // m.def("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf);
 
-    TORCH_EXTENSION_RANS_BINDINGS(m);
+    // Gated by the TORCH_ANS_WITH_* feature macros: with incremental
+    // compilation only the (impl, interleaves, lookup) subset an interface
+    // needs is compiled. See rans_bindings.hpp / rans_build_config.hpp.
+    torch_ans_bind_all(m);
 }
 
 

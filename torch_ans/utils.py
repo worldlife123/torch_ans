@@ -8,41 +8,103 @@ import io
 # TODO: provide a better impl of pmf_to_quantized_cdf in torch_ans
 # from cbench.rans import pmf_to_quantized_cdf, pmf_to_quantized_cdf_np
 
-# _C = None
+from torch_ans import _C as _native_C
+from torch_ans import _dynamic_build as _build_config
 
-from torch_ans._C import rans_stream_to_byte_strings, rans_byte_strings_to_stream, rans_pmf_to_quantized_cdf, rans_alias_build_table
-from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
-from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
-from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
-from torch_ans._C import rans64_i4_push, rans64_i4_pop
-from torch_ans._C import rans32_i4_push, rans32_i4_pop
-from torch_ans._C import rans32_16_i4_push, rans32_16_i4_pop, rans32_16_i32_push, rans32_16_i32_pop
-from torch_ans._C import rans64_i2_push, rans64_i2_pop
-from torch_ans._C import rans32_i2_push, rans32_i2_pop
-from torch_ans._C import rans32_16_i2_push, rans32_16_i2_pop
-from torch_ans._C import rans64_i8_push, rans64_i8_pop
-from torch_ans._C import rans32_i8_push, rans32_i8_pop
-from torch_ans._C import rans32_16_i8_push, rans32_16_i8_pop
-# inverse-CDF (dense or sparse) decode variants, selected by inverse_cdf_precision
-from torch_ans._C import rans64_invcdf_pop, rans64_i4_invcdf_pop
-from torch_ans._C import rans32_invcdf_pop, rans32_i4_invcdf_pop
-from torch_ans._C import rans32_16_invcdf_pop, rans32_16_i4_invcdf_pop, rans32_16_i32_invcdf_pop
-from torch_ans._C import rans64_i2_invcdf_pop, rans64_i8_invcdf_pop
-from torch_ans._C import rans32_i2_invcdf_pop, rans32_i8_invcdf_pop
-from torch_ans._C import rans32_16_i2_invcdf_pop, rans32_16_i8_invcdf_pop
-from torch_ans._C import rans64_alias_push, rans64_alias_pop
-from torch_ans._C import rans32_alias_push, rans32_alias_pop
-from torch_ans._C import rans32_16_alias_push, rans32_16_alias_pop
-from torch_ans._C import rans64_alias_i2_push, rans64_alias_i2_pop
-from torch_ans._C import rans64_alias_i4_push, rans64_alias_i4_pop
-from torch_ans._C import rans64_alias_i8_push, rans64_alias_i8_pop
-from torch_ans._C import rans32_alias_i2_push, rans32_alias_i2_pop
-from torch_ans._C import rans32_alias_i4_push, rans32_alias_i4_pop
-from torch_ans._C import rans32_alias_i8_push, rans32_alias_i8_pop
-from torch_ans._C import rans32_16_alias_i2_push, rans32_16_alias_i2_pop
-from torch_ans._C import rans32_16_alias_i4_push, rans32_16_alias_i4_pop
-from torch_ans._C import rans32_16_alias_i8_push, rans32_16_alias_i8_pop
-from torch_ans._C import rans_build_inverse_cdf
+# ---------------------------------------------------------------------------
+# Native operator resolution
+#
+# The operators are not imported at import time any more: which ones exist
+# depends on the build. `torch_ans._C` is either the pre-built extension (which
+# always contains every operator) or the shim, which can build a module with
+# just the subset a TorchANSInterface instance asks for (see
+# torch_ans/_dynamic_build.py). Only the selected (impl, interleaves, lookup)
+# combination is ever resolved - that is what makes an incremental build
+# possible, since a module built for `impl="rans64"` does not export the
+# rans32 ops.
+# ---------------------------------------------------------------------------
+
+
+def _native_module(profile=None, incremental_compile=None):
+    """Return the native module that provides `profile`'s operators.
+
+    Falls back to `torch_ans._C` itself when that is a pre-built extension,
+    which always contains every operator.
+    """
+    ensure = getattr(_native_C, "ensure_module", None)
+    if not callable(ensure):
+        return _native_C
+    if profile is None or not _build_config.incremental_enabled(incremental_compile):
+        return ensure(None)  # the full build
+    return ensure(profile)
+
+
+def _common_native_module():
+    """Module with the operators every build provides."""
+    return _native_module(_build_config.BuildProfile())
+
+
+def _legacy_native_op(name):
+    """Resolve one of the operator names that used to be imported here."""
+    module = _common_native_module()
+    if hasattr(module, name):
+        return getattr(module, name)
+    return getattr(_native_module(), name)
+
+
+def _interleave_suffix(num_interleaves):
+    return _build_config.OP_SUFFIX[num_interleaves]
+
+
+def _impl_op_names(family, num_interleaves):
+    suffix = _interleave_suffix(num_interleaves)
+    return (f"{family}_init_stream", f"{family}{suffix}_push", f"{family}{suffix}_pop")
+
+
+def _alias_op_names(family, num_interleaves):
+    suffix = _interleave_suffix(num_interleaves)
+    return (f"{family}_alias{suffix}_push", f"{family}_alias{suffix}_pop")
+
+
+def _invcdf_op_names(family, num_interleaves):
+    return f"{family}{_interleave_suffix(num_interleaves)}_invcdf_pop"
+
+
+# (impl family, num_interleaves) -> operator names, mirroring the gated
+# bindings in torch_ans/rans_bindings.hpp. The keys double as the validation of
+# what each impl supports.
+RANS_IMPL_OP_NAMES = {
+    (family, interleave): _impl_op_names(family, interleave)
+    for family, interleaves in _build_config.SUPPORTED_INTERLEAVES.items()
+    for interleave in interleaves
+}
+RANS_ALIAS_OP_NAMES = {
+    (family, interleave): _alias_op_names(family, interleave)
+    for family, interleaves in _build_config.ALIAS_INTERLEAVES.items()
+    for interleave in interleaves
+}
+RANS_INVCDCDF_POP_OP_NAMES = {
+    (family, interleave): _invcdf_op_names(family, interleave)
+    for family, interleaves in _build_config.SUPPORTED_INTERLEAVES.items()
+    for interleave in interleaves
+}
+
+#: operator names this module used to re-export at import time; they are
+#: resolved on first attribute access instead (see __getattr__ below)
+_EXPORTED_NATIVE_OPS = frozenset(_build_config.profile_op_names(None))
+
+
+def __getattr__(name):
+    """Lazily expose the native operators that used to be imported here.
+
+    Keeps ``from torch_ans.utils import rans_pmf_to_quantized_cdf`` (and the
+    other low-level operator names) working; the operator is pulled from a
+    module built for it on first use. Anything else raises AttributeError as
+    usual, so a typo cannot trigger a build.
+    """
+    if name in _EXPORTED_NATIVE_OPS:
+        return _legacy_native_op(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # def _bind_from_C(module):
@@ -365,7 +427,7 @@ def _bucket_starts(num_rows, table_size, shift, device, dtype):
     return values
 
 
-def build_cdf_with_inverse_table(quantized_cdf, freq_precision=16, table_precision=None):
+def build_cdf_with_inverse_table(quantized_cdf, freq_precision=16, table_precision=None, native=None):
     """
     B2: returns the combined ``cdf ++ inverse_table`` tensor the kernels expect,
     writing the table straight into it instead of building it separately and
@@ -377,6 +439,11 @@ def build_cdf_with_inverse_table(quantized_cdf, freq_precision=16, table_precisi
     the coding itself for small tensors. This version is one allocation, one
     copy of the cdf and one search - no separate table tensor, no ``cat``.
 
+    ``native`` is the module the operator is taken from
+    (:class:`TorchANSInterface` passes its own, so an incrementally compiled
+    module can provide it); standalone calls fall back to a module built for
+    the operators every build contains.
+
     The entries are bit-identical to :func:`inverse_quantized_cdf`.
     """
     table_precision = freq_precision if table_precision is None else int(table_precision)
@@ -386,10 +453,13 @@ def build_cdf_with_inverse_table(quantized_cdf, freq_precision=16, table_precisi
     shift = freq_precision - table_precision
     table_size = 1 << table_precision
 
+    if native is None:
+        native = _common_native_module()
+
     # one op: copy the cdf and fill the table in a single launch. The pure
     # torch version (arange/expand + searchsorted + sub + cat) cost 3-5 dispatches
     # ~40 us each, and this runs on every init_params call.
-    return rans_build_inverse_cdf(quantized_cdf, freq_precision, table_precision)
+    return native.rans_build_inverse_cdf(quantized_cdf, freq_precision, table_precision)
 
 
 class TorchEntropyCoderBaseInterface(object):
@@ -716,7 +786,7 @@ class TorchEntropyCoderBaseInterface(object):
         if stream is None:
             return b''
         else:
-            byte_strings = rans_stream_to_byte_strings(stream)
+            byte_strings = self._native.rans_stream_to_byte_strings(stream)
             return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
 
     def set_stream(self, encoded: str) -> None:
@@ -843,6 +913,20 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                                                of 257). Measured *slower* than the inverse-CDF
                                                table at every num_interleaves, so it is opt-in
                                                only.
+        incremental_compile (bool, optional): Compile only the operators this
+                                               instance needs instead of every
+                                               operator (True by default,
+                                               ``TORCH_ANS_INCREMENTAL_COMPILE=0``
+                                               disables it). Only relevant for
+                                               the runtime build: a pre-built
+                                               ``torch_ans._C`` already contains
+                                               everything. With ``impl="rans64"``
+                                               and the default settings the JIT
+                                               build then contains the rans64
+                                               push/pop plus the shared helpers,
+                                               instead of all three families
+                                               with every interleave and symbol
+                                               lookup.
         **kwargs: Passed to TorchEntropyCoderBaseInterface.
     """
     def __init__(self, 
@@ -854,6 +938,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                  num_bytes_code_length=4, 
                  inverse_cdf_precision: Optional[Union[int, str]] = None,
                  alias_sampling: bool = False,
+                 incremental_compile: Optional[bool] = None,
                  **kwargs) -> None:
         # _ensure_C()
         self.impl = impl
@@ -881,97 +966,37 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             raise NotImplementedError(f"Unknown impl {self.impl}")
         self.freq_precision = min(self.freq_precision, precision_cap)
 
-        impl_funcs = {
-            ("rans64", 1): (rans64_init_stream, rans64_push, rans64_pop),
-            ("rans64", 2): (rans64_init_stream, rans64_i2_push, rans64_i2_pop),
-            ("rans64", 4): (rans64_init_stream, rans64_i4_push, rans64_i4_pop),
-            ("rans64", 8): (rans64_init_stream, rans64_i8_push, rans64_i8_pop),
-            ("rans32", 1): (rans32_init_stream, rans32_push, rans32_pop),
-            ("rans32", 2): (rans32_init_stream, rans32_i2_push, rans32_i2_pop),
-            ("rans32", 4): (rans32_init_stream, rans32_i4_push, rans32_i4_pop),
-            ("rans32", 8): (rans32_init_stream, rans32_i8_push, rans32_i8_pop),
-            ("rans32_16", 1): (rans32_16_init_stream, rans32_16_push, rans32_16_pop),
-            ("rans32_16", 2): (rans32_16_init_stream, rans32_16_i2_push, rans32_16_i2_pop),
-            ("rans32_16", 4): (rans32_16_init_stream, rans32_16_i4_push, rans32_16_i4_pop),
-            ("rans32_16", 8): (rans32_16_init_stream, rans32_16_i8_push, rans32_16_i8_pop),
-            # 32-way interleaving maps to the warp-level CUDA kernels on GPU
-            ("rans32_16", 32): (rans32_16_init_stream, rans32_16_i32_push, rans32_16_i32_pop),
-        }
+        # The supported (impl family, num_interleaves) combinations mirror the
+        # gated bindings in torch_ans/rans_bindings.hpp. Validating them before
+        # the native module is resolved keeps an unsupported configuration from
+        # triggering a build of a module that cannot provide it.
         impl_key = (base_impl, self.num_interleaves)
-        if impl_key not in impl_funcs:
+        if impl_key not in RANS_IMPL_OP_NAMES:
             raise NotImplementedError(
                 f"Unsupported num_interleaves={self.num_interleaves} for impl {self.impl} "
-                f"(supported: {sorted(impl_funcs.keys())})"
+                f"(supported: {sorted(RANS_IMPL_OP_NAMES.keys())})"
             )
-        self.ans_init_func, self.ans_encode_func, self.ans_decode_func = impl_funcs[impl_key]
-        self._binary_decode_func = self.ans_decode_func
-
+        if self.alias_sampling and impl_key not in RANS_ALIAS_OP_NAMES:
+            raise NotImplementedError(
+                f"alias sampling is not available for impl={self.impl} with "
+                f"num_interleaves={self.num_interleaves} "
+                f"(available: {sorted(RANS_ALIAS_OP_NAMES.keys())})"
+            )
         # Alias sampling overrides both lookups: push uses the remap table, pop
         # the alias table (see rans_alias_build_table).
-        if self.alias_sampling:
-            alias_funcs = {
-                ("rans64", 1): (rans64_alias_push, rans64_alias_pop),
-                ("rans64", 2): (rans64_alias_i2_push, rans64_alias_i2_pop),
-                ("rans64", 4): (rans64_alias_i4_push, rans64_alias_i4_pop),
-                ("rans64", 8): (rans64_alias_i8_push, rans64_alias_i8_pop),
-                ("rans32", 1): (rans32_alias_push, rans32_alias_pop),
-                ("rans32", 2): (rans32_alias_i2_push, rans32_alias_i2_pop),
-                ("rans32", 4): (rans32_alias_i4_push, rans32_alias_i4_pop),
-                ("rans32", 8): (rans32_alias_i8_push, rans32_alias_i8_pop),
-                ("rans32_16", 1): (rans32_16_alias_push, rans32_16_alias_pop),
-                ("rans32_16", 2): (rans32_16_alias_i2_push, rans32_16_alias_i2_pop),
-                ("rans32_16", 4): (rans32_16_alias_i4_push, rans32_16_alias_i4_pop),
-                ("rans32_16", 8): (rans32_16_alias_i8_push, rans32_16_alias_i8_pop),
-            }
-            if impl_key not in alias_funcs:
-                raise NotImplementedError(
-                    f"alias sampling is not available for impl={self.impl} with "
-                    f"num_interleaves={self.num_interleaves} "
-                    f"(available: {sorted(alias_funcs.keys())})"
-                )
-            self.ans_encode_func, self.ans_decode_func = alias_funcs[impl_key]
-            self._binary_decode_func = self.ans_decode_func
-            self._invcdf_decode_func = None
-            self.impl_use_inverse_cdf = False
-
-        # Swap in the inverse-CDF decode op. NOTE: every (impl, interleaves)
-        # combination that supports push/pop also has an inverse-CDF variant.
-        self._decode_extra_kwargs = {}
+        use_invcdf_decode = self.impl_use_inverse_cdf and not self.alias_sampling
         # C1: inverse_cdf_precision="auto" defers the table precision to
         # init_params, where the alphabet size is known
         self._inverse_cdf_auto = (isinstance(self.inverse_cdf_precision, str) and
                                   self.inverse_cdf_precision.strip().lower() == "auto")
-        self._invcdf_decode_func = None
-        if self.impl_use_inverse_cdf and not self.alias_sampling:
-            invcdf_pop_funcs = {
-                ("rans64", 1): rans64_invcdf_pop,
-                ("rans64", 2): rans64_i2_invcdf_pop,
-                ("rans64", 4): rans64_i4_invcdf_pop,
-                ("rans64", 8): rans64_i8_invcdf_pop,
-                ("rans32", 1): rans32_invcdf_pop,
-                ("rans32", 2): rans32_i2_invcdf_pop,
-                ("rans32", 4): rans32_i4_invcdf_pop,
-                ("rans32", 8): rans32_i8_invcdf_pop,
-                ("rans32_16", 1): rans32_16_invcdf_pop,
-                ("rans32_16", 2): rans32_16_i2_invcdf_pop,
-                ("rans32_16", 4): rans32_16_i4_invcdf_pop,
-                ("rans32_16", 8): rans32_16_i8_invcdf_pop,
-                ("rans32_16", 32): rans32_16_i32_invcdf_pop,
-            }
-            if impl_key not in invcdf_pop_funcs:
+        if use_invcdf_decode:
+            if impl_key not in RANS_INVCDCDF_POP_OP_NAMES:
                 raise NotImplementedError(
                     f"inverse CDF decoding is not available for impl={self.impl} with "
                     f"num_interleaves={self.num_interleaves} "
-                    f"(available: {sorted(invcdf_pop_funcs.keys())})"
+                    f"(available: {sorted(RANS_INVCDCDF_POP_OP_NAMES.keys())})"
                 )
-            self._invcdf_decode_func = invcdf_pop_funcs.get(impl_key)
-            if self._inverse_cdf_auto:
-                # the numeric precision is decided in init_params, once the
-                # alphabet size (cdfs width) is known
-                self.inverse_cdf_precision = "auto"
-                if self._invcdf_decode_func is not None:
-                    self.ans_decode_func = self._invcdf_decode_func
-            else:
+            if not self._inverse_cdf_auto:
                 inverse_cdf_precision = int(self.inverse_cdf_precision)
                 if inverse_cdf_precision < 1 or inverse_cdf_precision > self.freq_precision:
                     raise ValueError(
@@ -979,8 +1004,46 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                         f"for impl {self.impl}, got {inverse_cdf_precision}"
                     )
                 self.inverse_cdf_precision = inverse_cdf_precision
-                self.ans_decode_func = invcdf_pop_funcs[impl_key]
-                self._decode_extra_kwargs = {"inverse_cdf_precision": inverse_cdf_precision}
+
+        # Resolve the native operators. With incremental compilation (the
+        # default, see incremental_compile) this builds a module with just the
+        # selected subset; a previously built superset - or a pre-built
+        # torch_ans._C - is reused as is.
+        self._native = _native_module(
+            _build_config.BuildProfile(
+                family=base_impl,
+                interleave=self.num_interleaves,
+                alias=self.alias_sampling,
+                invcdf=use_invcdf_decode),
+            incremental_compile)
+
+        def _bind(names):
+            return tuple(getattr(self._native, name) for name in names)
+
+        self.ans_init_func, self.ans_encode_func, self.ans_decode_func = _bind(RANS_IMPL_OP_NAMES[impl_key])
+        self._binary_decode_func = self.ans_decode_func
+
+        if self.alias_sampling:
+            self.ans_encode_func, self.ans_decode_func = _bind(RANS_ALIAS_OP_NAMES[impl_key])
+            self._binary_decode_func = self.ans_decode_func
+            self._invcdf_decode_func = None
+            self.impl_use_inverse_cdf = False
+
+        # Swap in the inverse-CDF decode op. NOTE: every (impl, interleaves)
+        # combination that supports push/pop also has an inverse-CDF variant.
+        self._decode_extra_kwargs = {}
+        self._invcdf_decode_func = None
+        if use_invcdf_decode:
+            self._invcdf_decode_func = getattr(self._native, RANS_INVCDCDF_POP_OP_NAMES[impl_key])
+            if self._inverse_cdf_auto:
+                # the numeric precision is decided in init_params, once the
+                # alphabet size (cdfs width) is known
+                self.inverse_cdf_precision = "auto"
+                if self._invcdf_decode_func is not None:
+                    self.ans_decode_func = self._invcdf_decode_func
+            else:
+                self.ans_decode_func = self._invcdf_decode_func
+                self._decode_extra_kwargs = {"inverse_cdf_precision": self.inverse_cdf_precision}
 
     def _init_stream(self, num_parallel_states=None, **kwargs) -> torch.Tensor:
         """
@@ -1020,7 +1083,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         if self.bypass_coding:
             freqs = torch.cat([freqs.clone(), torch.zeros_like(freqs[..., :1]) + 1e-10], dim=-1)
         pmf = freqs.float() / freqs.sum(-1, keepdim=True)
-        cdfs = rans_pmf_to_quantized_cdf(pmf.to(device=self.device), self.freq_precision)
+        cdfs = self._native.rans_pmf_to_quantized_cdf(pmf.to(device=self.device), self.freq_precision)
         cdfs_sizes = num_freqs + (2 if self.bypass_coding else 1)
         if self.impl_use_inverse_cdf and self._inverse_cdf_auto:
             # C1: the alphabet size is only known now - pick the table precision
@@ -1045,7 +1108,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             # dist_freqs API, so this is on the hot path
             cdfs = build_cdf_with_inverse_table(
                 cdfs, freq_precision=self.freq_precision,
-                table_precision=self.inverse_cdf_precision)
+                table_precision=self.inverse_cdf_precision, native=self._native)
         elif self.impl_use_alias_table:
             # NOTE: alias sampling needs 2**symbol_precision == cdfs_sizes - 1
             # (the builder raises otherwise) - e.g. an alphabet of 255 with
@@ -1059,7 +1122,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                     raise ValueError(
                         f"alias sampling requires cdfs_sizes - 1 to be a power of two, "
                         f"got {required_symbol_precision} (cdf row {cdfs.size(-1)})")
-            cdfs, cdfs_with_alias_table = rans_alias_build_table(
+            cdfs, cdfs_with_alias_table = self._native.rans_alias_build_table(
                 cdfs, cdfs_sizes, symbol_precision=symbol_precision, freq_precision=self.freq_precision
             )
             self.cdfs_with_alias_table = self._init_tensor(cdfs_with_alias_table).contiguous()
@@ -1226,7 +1289,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         if cache:
             return
         else:
-            byte_strings = rans_stream_to_byte_strings(stream)
+            byte_strings = self._native.rans_stream_to_byte_strings(stream)
             return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
         # if cache:
         #     return super().encode_with_indexes(symbols, indexes, cache, **kwargs)
@@ -1266,7 +1329,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         """
 
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
-        stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+        stream = self._init_tensor(self._native.rans_byte_strings_to_stream(byte_strings))
 
         return self.decode(stream=stream, dist_indexes=indexes, 
                            cdfs=self.cdfs, cdfs_sizes=self.cdfs_sizes, offsets=self.offsets,
@@ -1301,7 +1364,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             encoded (str): Encoded byte stream.
         """
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
-        self._encoded_stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+        self._encoded_stream = self._init_tensor(self._native.rans_byte_strings_to_stream(byte_strings))
 
     def decode_stream(self, indexes: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -1347,7 +1410,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         if cache:
             return
         else:
-            byte_strings = rans_stream_to_byte_strings(stream)
+            byte_strings = self._native.rans_stream_to_byte_strings(stream)
             return merge_bytes(byte_strings, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
 
     def decode_with_freqs(self, encoded: str, freqs: torch.Tensor, num_freqs: torch.Tensor, offsets: torch.Tensor, **kwargs) -> torch.Tensor:
@@ -1365,7 +1428,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             torch.Tensor: Decoded symbols.
         """
         byte_strings = split_merged_bytes(encoded, num_bytes_length=self.num_bytes_code_length, num_segments=self.num_parallel_states)
-        stream = self._init_tensor(rans_byte_strings_to_stream(byte_strings))
+        stream = self._init_tensor(self._native.rans_byte_strings_to_stream(byte_strings))
 
         return self.decode(stream=stream, dist_freqs=freqs, dist_num_freqs=num_freqs, dist_min=offsets, **kwargs)
 

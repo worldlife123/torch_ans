@@ -106,6 +106,36 @@ def test_cuda_build_defines_with_cuda_for_nvcc(monkeypatch):
     assert module is not None
 
 
+def test_incremental_defines_reach_cxx_and_nvcc(monkeypatch):
+    # The TORCH_ANS_WITH_* gates of an incremental build must be seen by the
+    # CUDA sources too (rans_cuda.cu uses the same gates), and a full build must
+    # pass none of them so every gate in rans_build_config.hpp stays at 1.
+    pytest.importorskip("torch")
+    import torch_ans._dynamic_build as db
+
+    captured = {}
+    _install_fake_load(monkeypatch, captured)
+    monkeypatch.setattr(db, "_detect_cuda_torch", lambda: True)
+    monkeypatch.setattr(db, "_record_build_metadata", lambda pkg_dir, with_cuda: None)
+    monkeypatch.setattr(db, "_cuda_state_path", lambda name: None)
+
+    profile = db.BuildProfile(family="rans32_16", interleave=32, invcdf=True)
+    db.build_extension(module_name=db.profile_module_name(profile), with_cuda=True,
+                       verbose=False, defines=db.profile_defines(profile))
+
+    for flag in ("-DTORCH_ANS_INCREMENTAL_BUILD=1", "-DTORCH_ANS_WITH_RANS32_16=1",
+                 "-DTORCH_ANS_WITH_INTERLEAVE_32=1", "-DTORCH_ANS_WITH_INVCDCDF=1"):
+        assert flag in captured["extra_cflags"], flag
+        assert flag in captured["extra_cuda_cflags"], flag
+    assert "-DTORCH_ANS_WITH_RANS64=1" not in captured["extra_cflags"]
+    assert any(s.endswith(".cu") for s in captured["sources"])
+
+    db.build_extension(module_name=db.FULL_MODULE_NAME, with_cuda=False, verbose=False,
+                       defines=db.profile_defines(None))
+    assert not any(f.startswith("-DTORCH_ANS_") for f in captured["extra_cflags"])
+    assert not any(s.endswith(".cu") for s in captured["sources"])
+
+
 def test_cpu_build_without_cuda_has_no_cuda_flags(monkeypatch):
     # with_cuda=False builds cpp-only and must never see -DWITH_CUDA.
     pytest.importorskip("torch")
