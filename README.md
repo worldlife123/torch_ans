@@ -389,6 +389,62 @@ Notes on the GPU example:
 - `inverse_cdf_precision="auto"` builds a symbol-lookup table sized from the alphabet (and skips it for alphabets < 64 symbols).
 - Batch at least ~2048 rows (`symbols.shape[0]`) to saturate the GPU; streams encoded on CPU decode on CUDA and vice versa.
 
+## Performance Tuning
+
+In order of impact (measured on an RTX 2080 Ti and a 6-core CPU):
+
+### GPU
+
+1. **Use `impl="rans32_16"` with `num_interleaves=32`** — this selects the warp-level interleaved CUDA kernels (one warp per stream). It requires `freq_precision <= 15`.
+2. **Batch enough rows.** Each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`: use `rows >= 4 * SM count` (e.g. >= 2048 on a 68-SM GPU) to saturate the GPU. Below that, decode throughput scales almost linearly with `rows`, and no launch-configuration trick can recover it.
+3. **Enable the inverse-CDF lookup for faster decoding** with `inverse_cdf_precision="auto"`: for alphabets with >= 64 symbols it builds a `2**q` table (`q ~= log2(alphabet) - 1`) sized so the whole row fits the shared-memory staging budget. Worth +5% to +80% over the default binary search depending on the alphabet.
+4. **Keep `freq_precision <= 15`** — smaller states renormalize less often, and `rans32_16` is the only variant with the warp-level path.
+5. **Avoid bypass coding when symbols are guaranteed in range** — the bypass phase is inherently sequential across the warp lanes (its per-symbol skeleton was worth 2.5-3.3x in our ablations).
+6. `init_params` rebuilds the quantized CDFs and the lookup table and costs ~0.2 ms on CUDA. It runs on every call of the `dist_freqs` API, so for many small tensors prefer passing `dist_indexes` (precomputed CDF indexes), or reuse the coder.
+
+On CUDA (RTX 2080 Ti, `rans32_16`, 1024 rows x 4096 symbols, alphabet 255, p=15, Gsymbol/s):
+
+| lookup | 1-way enc/dec | 4-way enc/dec | 32-way enc/dec |
+|---|---|---|---|
+| divided search | 1.16 / 0.84 | 3.69 / 1.64 | 10.10 / 6.19 |
+| inverse-CDF | 1.57 / **1.42** | 3.66 / 2.30 | 10.49 / **8.85** |
+| alias sampling | 1.01 / 1.24 | 1.98 / 2.56 | n/a |
+
+1. **Interleaving matters far more on CUDA than on CPU**: 4-way is ~3x and the 32-way warp path is ~7-9x over 1-way (each stream is coded by one warp with a shared cursor, which also coalesces the stream traffic).
+2. **Decoding**: the inverse-CDF table wins at every interleave factor (1.7x over the divided search at 1-way with 256 distributions, 1.4x at 32-way). Alias sampling is also faster than the divided search (1.5x) but slower than the table, and it scales worst (~2x from 1-way to 4-way, against ~3x) because its bucket lookup is a division by a runtime value and it needs an extra dependent table load.
+3. **Encoding**: alias sampling is the slowest by up to 1.9x - the push reads a remap table indexed by the whole `2**freq_precision` range, which is 33 MB for 256 distributions. There is also no 32-way alias variant.
+4. So the recommendation is the same on both devices: `inverse_cdf_precision="auto"` (or a dense table) for decode, and no alias sampling except where its 1-way convenience is worth the throughput. Alias needs `cdfs_sizes - 1` to be a power of two, e.g. alphabet 255 with bypass coding (a cdf row of 257).
+
+### CPU
+
+1. `torch.set_num_threads(n)` controls the OpenMP parallelism used by push/pop.
+2. `inverse_cdf_precision="auto"` also helps on CPU decoding — up to ~2.5x at `num_interleaves=1` and ~1.2-1.6x on top of the interleaved gain (see the next point); the table is built with a single sorted merge, so it is cheap.
+3. **Interleaved variants boost CPU performance via OoO (Out-of-Order) execution** — with `num_interleaves=4`, the independent rANS states per stream let the out-of-order engine overlap their renormalize/push/pop chains. Measured on an i7-6800K (1M symbols, alphabet 256, 256 distributions, single thread, best-of-5, `scripts/bench_interleaves_cpu.py`):
+   - **Encoding: ~1.25-1.4x** with `num_interleaves=4` (1.5x without bypass coding).
+   - **Decoding: ~1.8-2.0x** with the default (divided-search) symbol lookup, ~1.4-1.8x with the inverse-CDF table — the table's *absolute* decode throughput is the highest of the two (about 1.2-1.6x better than the divided search at the same `num_interleaves`), it just has less left to gain from interleaving because a single state is already fast.
+   - `num_interleaves=8` performs about the same as 4; `num_interleaves=32` is **not** useful on CPU (encode ~0.8x, register pressure) — it exists for the warp-level CUDA path. **Use 4 (or 8) on CPU.**
+   - The inverse-CDF table (`inverse_cdf_precision="auto"` or an integer) is the fastest CPU decode configuration measured, at every alphabet size and every `num_interleaves`, *provided* the auto precision is used (a dense table is far worse: for 256 distributions it is tens of MB and thrashes the cache). This required removing the data-dependent linear walk that used to close the table's gap — see below.
+   - The gains come from the fact that the coder is written to be overlap-friendly — see *Why interleaving helps* below.
+
+   **Why interleaving helps (and what it needs).** Interleaved coding only pays off if the independent states can actually execute in parallel, and three things used to prevent that:
+   - *Data-dependent branches.* Whether a renormalization is needed is close to a coin flip, so the renormalize `if` mispredicts on about every second symbol and flushes the out-of-order window — exactly the window the other lanes need. The coders therefore use branch-free renormalization (a speculative store on the encode side, an unconditional load on the decode side), a branch-free monotone search for the symbol lookup, and a branch-free way to close the inverse-CDF table's gap: the table gives a lower bound and the remaining couple of symbols are resolved by loading a small fixed window of cdf entries *in parallel* and counting how many are `<= cum_freq`, instead of walking one cdf entry at a time.
+   - *Non-pipelined 64-bit division.* The integer divider is not pipelined, so N interleaved states merely queue on it. Encoding now uses a pipelined floating-point divide plus a rarely-taken exact integer fix-up.
+   - *Aliasing and table lookups.* The states live in registers (locals accessed with a compile-time lane index) instead of in the stream tensor they are written to, and all per-lane table lookups (`index -> cdf row`, `symbol -> (start, freq)`) are gathered for the whole interleave group before any state is updated, so the cache misses and the symbol searches of different lanes overlap.
+
+   Note the branch-free renormalization stores one word *past* the cursor speculatively and the launch configuration keeps the interleaved states inline in the stream buffer, so every buffer keeps one word of slack (see `rans_init_stream` / `rans_push`).
+
+4. `rans64` remains the most robust default; `rans32_16` reduces the initial-state overhead for small payloads. For CPU decode throughput the best combination measured is **`inverse_cdf_precision="auto"` + `num_interleaves=4`** (or 8); for encode, `num_interleaves=4` (the table does not affect encode). See `scripts/bench_interleaves_cpu.py` to reproduce.
+5. **Symbol lookup choice.** There are three decode lookups; on CPU the inverse-CDF table wins, and alias sampling is the slowest (it is opt-in via `alias_sampling=True`). Measured on an i7-6800K (1M symbols, 256 distributions, alphabet 255, p=15, single thread, `num_interleaves=4`, cyc/symbol):
+
+   | lookup | encode | decode | tables |
+   |---|---|---|---|
+   | divided search (default) | 25.8 | 63.9 | cdf 257 KB |
+   | inverse-CDF (`"auto"`) | 26.7 | **54.4** | 385 KB |
+   | alias sampling | 101.6 | 75.8 | 1.3 MB + 32 MB remap |
+
+   Alias sampling *does* benefit from interleaving, just less than the other two (decode 118.2 -> 75.8 cyc/symbol from 1 to 4 interleaved states, i.e. 1.56x, against 1.76x for the inverse-CDF table; encode 212.9 -> 101.6, 2.1x), for two structural reasons: its bucket lookup divides by a runtime value (a non-pipelined integer division - it is a shift here because the builder only accepts a cdf size of `2**k + 1`, but the shift has to be recovered per symbol), and its encode side reads a *remap* table indexed by the whole `2**freq_precision` range, which is 32 MB for 256 distributions and misses cache on every symbol. It also requires `cdfs_sizes - 1` to be a power of two (e.g. alphabet 255 with bypass coding), unlike the other lookups.
+
+
 ## Troubleshooting
 
 - Ensure PyTorch and pybind11 are installed and compatible with your Python version.
@@ -425,27 +481,6 @@ On an RTX 2080 Ti this reaches **~25.8 Gsymbol/s decode (~29 GB/s of payload at 
 - torch_ans targets the learned-compression use case: multiple distributions per tensor, `int32` symbols with per-symbol CDF indexes, and bypass coding for out-of-range values.
 
 ### Technical
-
-**Q: How do I optimize encoding/decoding speed on CPU and GPU?**
-
-A: In order of impact (measured on an RTX 2080 Ti and a 6-core CPU):
-
-On GPU:
-
-1. **Use `impl="rans32_16"` with `num_interleaves=32`** — this selects the warp-level interleaved CUDA kernels (one warp per stream). It requires `freq_precision <= 15`.
-2. **Batch enough rows.** Each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`: use `rows >= 4 * SM count` (e.g. >= 2048 on a 68-SM GPU) to saturate the GPU. Below that, decode throughput scales almost linearly with `rows`, and no launch-configuration trick can recover it.
-3. **Enable the inverse-CDF lookup for faster decoding** with `inverse_cdf_precision="auto"`: for alphabets with >= 64 symbols it builds a `2**q` table (`q ~= log2(alphabet) - 1`) sized so the whole row fits the shared-memory staging budget. Worth +5% to +80% over the default binary search depending on the alphabet.
-4. **Keep `freq_precision <= 15`** — smaller states renormalize less often, and `rans32_16` is the only variant with the warp-level path.
-5. **Avoid bypass coding when symbols are guaranteed in range** — the bypass phase is inherently sequential across the warp lanes (its per-symbol skeleton was worth 2.5-3.3x in our ablations).
-6. `init_params` rebuilds the quantized CDFs and the lookup table and costs ~0.2 ms on CUDA. It runs on every call of the `dist_freqs` API, so for many small tensors prefer passing `dist_indexes` (precomputed CDF indexes), or reuse the coder.
-
-On CPU:
-
-1. `torch.set_num_threads(n)` controls the OpenMP parallelism used by push/pop.
-2. `inverse_cdf_precision="auto"` also helps on CPU decoding — up to ~2.8x for large alphabets (the table is built with a single sorted merge, so it is cheap).
-3. Using interleaved variants may also boost performance on modern CPUs with OoO (Out-of-Order) execution support.
-4. `rans64` remains the most robust default; `rans32_16` reduces the initial-state overhead for small payloads.
-
 
 **Q: What Python and PyTorch versions are supported?**
 

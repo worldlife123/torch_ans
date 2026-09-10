@@ -17,10 +17,31 @@ from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
 from torch_ans._C import rans64_i4_push, rans64_i4_pop
 from torch_ans._C import rans32_i4_push, rans32_i4_pop
 from torch_ans._C import rans32_16_i4_push, rans32_16_i4_pop, rans32_16_i32_push, rans32_16_i32_pop
+from torch_ans._C import rans64_i2_push, rans64_i2_pop
+from torch_ans._C import rans32_i2_push, rans32_i2_pop
+from torch_ans._C import rans32_16_i2_push, rans32_16_i2_pop
+from torch_ans._C import rans64_i8_push, rans64_i8_pop
+from torch_ans._C import rans32_i8_push, rans32_i8_pop
+from torch_ans._C import rans32_16_i8_push, rans32_16_i8_pop
 # inverse-CDF (dense or sparse) decode variants, selected by inverse_cdf_precision
 from torch_ans._C import rans64_invcdf_pop, rans64_i4_invcdf_pop
 from torch_ans._C import rans32_invcdf_pop, rans32_i4_invcdf_pop
 from torch_ans._C import rans32_16_invcdf_pop, rans32_16_i4_invcdf_pop, rans32_16_i32_invcdf_pop
+from torch_ans._C import rans64_i2_invcdf_pop, rans64_i8_invcdf_pop
+from torch_ans._C import rans32_i2_invcdf_pop, rans32_i8_invcdf_pop
+from torch_ans._C import rans32_16_i2_invcdf_pop, rans32_16_i8_invcdf_pop
+from torch_ans._C import rans64_alias_push, rans64_alias_pop
+from torch_ans._C import rans32_alias_push, rans32_alias_pop
+from torch_ans._C import rans32_16_alias_push, rans32_16_alias_pop
+from torch_ans._C import rans64_alias_i2_push, rans64_alias_i2_pop
+from torch_ans._C import rans64_alias_i4_push, rans64_alias_i4_pop
+from torch_ans._C import rans64_alias_i8_push, rans64_alias_i8_pop
+from torch_ans._C import rans32_alias_i2_push, rans32_alias_i2_pop
+from torch_ans._C import rans32_alias_i4_push, rans32_alias_i4_pop
+from torch_ans._C import rans32_alias_i8_push, rans32_alias_i8_pop
+from torch_ans._C import rans32_16_alias_i2_push, rans32_16_alias_i2_pop
+from torch_ans._C import rans32_16_alias_i4_push, rans32_16_alias_i4_pop
+from torch_ans._C import rans32_16_alias_i8_push, rans32_16_alias_i8_pop
 from torch_ans._C import rans_build_inverse_cdf
 
 
@@ -299,6 +320,13 @@ def auto_inverse_cdf_precision(alphabet_size, freq_precision,
       unstaged (M=1025: staged q=8 is 12% slower than unstaged q=9).
 
     Returns ``None`` (build no table) or an integer in ``[1, freq_precision]``.
+
+    CPU note: the same rule happens to be the optimum there as well. The CPU
+    decoder closes the gap with a fixed window of ``RANS_INVCDF_WINDOW`` (2) cdf
+    entries loaded in parallel (see ``rans_invcdf_advance``), which absorbs a
+    walk of up to two steps for free, and the values picked here (e.g. q=7 for
+    `alphabet_size=258`, q=9 for 1026, q=11 for 4098) measured fastest in every
+    shape tried. Denser tables lose on cache misses rather than on walk length.
     """
     alphabet_size = int(alphabet_size)
     freq_precision = int(freq_precision)
@@ -792,15 +820,29 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                                                with a table of 2**inverse_cdf_precision
                                                entries. Must be in [1, freq_precision];
                                                equal to freq_precision gives the dense
-                                               O(1) table, a smaller value trades space for
-                                               a short bounded linear walk. "auto" picks
-                                               the precision from the alphabet size at
+                                               O(1) table (large - tens of MB for many
+                                               distributions, so usually not worth it), a
+                                               smaller value trades space for a bounded gap
+                                               closed branch-free. "auto" picks the
+                                               precision from the alphabet size at
                                                init_params time (about ceil(log2(alphabet)),
                                                coarser when that keeps the row inside the
                                                shared-memory staging budget, and no table
                                                at all for alphabets < 64 where it buys < 3%).
                                                None (default) keeps the divided-search +
-                                               binary refine lookup.
+                                               binary refine lookup. "auto" + num_interleaves=4
+                                               is the fastest CPU decode configuration
+                                               measured, at every alphabet size.
+        alias_sampling (bool): Use the alias-sampling table instead of the search/inverse-CDF
+                                               lookup (CPU only). The bucket of the rANS state's
+                                               low bits names the symbol directly, so there is no
+                                               search at all, but the table costs one extra load
+                                               and a division per symbol, and it needs
+                                               2**symbol_precision == cdfs_sizes - 1 (e.g. an
+                                               alphabet of 255 with bypass coding, i.e. a cdf row
+                                               of 257). Measured *slower* than the inverse-CDF
+                                               table at every num_interleaves, so it is opt-in
+                                               only.
         **kwargs: Passed to TorchEntropyCoderBaseInterface.
     """
     def __init__(self, 
@@ -811,6 +853,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                  num_interleaves: int = 1,
                  num_bytes_code_length=4, 
                  inverse_cdf_precision: Optional[Union[int, str]] = None,
+                 alias_sampling: bool = False,
                  **kwargs) -> None:
         # _ensure_C()
         self.impl = impl
@@ -820,11 +863,12 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self.num_interleaves = int(num_interleaves)
         self.num_bytes_code_length = num_bytes_code_length
         self.inverse_cdf_precision = inverse_cdf_precision
+        self.alias_sampling = bool(alias_sampling)
         super().__init__(**kwargs)
         
         # TODO: expose them to options
         self.impl_use_inverse_cdf = inverse_cdf_precision is not None
-        self.impl_use_alias_table = False
+        self.impl_use_alias_table = self.alias_sampling
         
         # NOTE: "rans32_16".startswith("rans32") is True, so rans32_16 must be matched first
         if self.impl.startswith("rans64"):
@@ -839,11 +883,17 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
         impl_funcs = {
             ("rans64", 1): (rans64_init_stream, rans64_push, rans64_pop),
+            ("rans64", 2): (rans64_init_stream, rans64_i2_push, rans64_i2_pop),
             ("rans64", 4): (rans64_init_stream, rans64_i4_push, rans64_i4_pop),
+            ("rans64", 8): (rans64_init_stream, rans64_i8_push, rans64_i8_pop),
             ("rans32", 1): (rans32_init_stream, rans32_push, rans32_pop),
+            ("rans32", 2): (rans32_init_stream, rans32_i2_push, rans32_i2_pop),
             ("rans32", 4): (rans32_init_stream, rans32_i4_push, rans32_i4_pop),
+            ("rans32", 8): (rans32_init_stream, rans32_i8_push, rans32_i8_pop),
             ("rans32_16", 1): (rans32_16_init_stream, rans32_16_push, rans32_16_pop),
+            ("rans32_16", 2): (rans32_16_init_stream, rans32_16_i2_push, rans32_16_i2_pop),
             ("rans32_16", 4): (rans32_16_init_stream, rans32_16_i4_push, rans32_16_i4_pop),
+            ("rans32_16", 8): (rans32_16_init_stream, rans32_16_i8_push, rans32_16_i8_pop),
             # 32-way interleaving maps to the warp-level CUDA kernels on GPU
             ("rans32_16", 32): (rans32_16_init_stream, rans32_16_i32_push, rans32_16_i32_pop),
         }
@@ -856,6 +906,34 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self.ans_init_func, self.ans_encode_func, self.ans_decode_func = impl_funcs[impl_key]
         self._binary_decode_func = self.ans_decode_func
 
+        # Alias sampling overrides both lookups: push uses the remap table, pop
+        # the alias table (see rans_alias_build_table).
+        if self.alias_sampling:
+            alias_funcs = {
+                ("rans64", 1): (rans64_alias_push, rans64_alias_pop),
+                ("rans64", 2): (rans64_alias_i2_push, rans64_alias_i2_pop),
+                ("rans64", 4): (rans64_alias_i4_push, rans64_alias_i4_pop),
+                ("rans64", 8): (rans64_alias_i8_push, rans64_alias_i8_pop),
+                ("rans32", 1): (rans32_alias_push, rans32_alias_pop),
+                ("rans32", 2): (rans32_alias_i2_push, rans32_alias_i2_pop),
+                ("rans32", 4): (rans32_alias_i4_push, rans32_alias_i4_pop),
+                ("rans32", 8): (rans32_alias_i8_push, rans32_alias_i8_pop),
+                ("rans32_16", 1): (rans32_16_alias_push, rans32_16_alias_pop),
+                ("rans32_16", 2): (rans32_16_alias_i2_push, rans32_16_alias_i2_pop),
+                ("rans32_16", 4): (rans32_16_alias_i4_push, rans32_16_alias_i4_pop),
+                ("rans32_16", 8): (rans32_16_alias_i8_push, rans32_16_alias_i8_pop),
+            }
+            if impl_key not in alias_funcs:
+                raise NotImplementedError(
+                    f"alias sampling is not available for impl={self.impl} with "
+                    f"num_interleaves={self.num_interleaves} "
+                    f"(available: {sorted(alias_funcs.keys())})"
+                )
+            self.ans_encode_func, self.ans_decode_func = alias_funcs[impl_key]
+            self._binary_decode_func = self.ans_decode_func
+            self._invcdf_decode_func = None
+            self.impl_use_inverse_cdf = False
+
         # Swap in the inverse-CDF decode op. NOTE: every (impl, interleaves)
         # combination that supports push/pop also has an inverse-CDF variant.
         self._decode_extra_kwargs = {}
@@ -864,14 +942,20 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._inverse_cdf_auto = (isinstance(self.inverse_cdf_precision, str) and
                                   self.inverse_cdf_precision.strip().lower() == "auto")
         self._invcdf_decode_func = None
-        if self.impl_use_inverse_cdf:
+        if self.impl_use_inverse_cdf and not self.alias_sampling:
             invcdf_pop_funcs = {
                 ("rans64", 1): rans64_invcdf_pop,
+                ("rans64", 2): rans64_i2_invcdf_pop,
                 ("rans64", 4): rans64_i4_invcdf_pop,
+                ("rans64", 8): rans64_i8_invcdf_pop,
                 ("rans32", 1): rans32_invcdf_pop,
+                ("rans32", 2): rans32_i2_invcdf_pop,
                 ("rans32", 4): rans32_i4_invcdf_pop,
+                ("rans32", 8): rans32_i8_invcdf_pop,
                 ("rans32_16", 1): rans32_16_invcdf_pop,
+                ("rans32_16", 2): rans32_16_i2_invcdf_pop,
                 ("rans32_16", 4): rans32_16_i4_invcdf_pop,
+                ("rans32_16", 8): rans32_16_i8_invcdf_pop,
                 ("rans32_16", 32): rans32_16_i32_invcdf_pop,
             }
             if impl_key not in invcdf_pop_funcs:
@@ -963,8 +1047,20 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                 cdfs, freq_precision=self.freq_precision,
                 table_precision=self.inverse_cdf_precision)
         elif self.impl_use_alias_table:
+            # NOTE: alias sampling needs 2**symbol_precision == cdfs_sizes - 1
+            # (the builder raises otherwise) - e.g. an alphabet of 255 with
+            # bypass coding, whose cdf row is 257 entries.
+            required_symbol_precision = int(cdfs.size(-1) - 1)
+            symbol_precision = self.symbol_precision
+            if (1 << symbol_precision) != required_symbol_precision:
+                if required_symbol_precision > 0 and (required_symbol_precision & (required_symbol_precision - 1)) == 0:
+                    symbol_precision = required_symbol_precision.bit_length() - 1
+                else:
+                    raise ValueError(
+                        f"alias sampling requires cdfs_sizes - 1 to be a power of two, "
+                        f"got {required_symbol_precision} (cdf row {cdfs.size(-1)})")
             cdfs, cdfs_with_alias_table = rans_alias_build_table(
-                cdfs, cdfs_sizes, symbol_precision=self.symbol_precision, freq_precision=self.freq_precision
+                cdfs, cdfs_sizes, symbol_precision=symbol_precision, freq_precision=self.freq_precision
             )
             self.cdfs_with_alias_table = self._init_tensor(cdfs_with_alias_table).contiguous()
 

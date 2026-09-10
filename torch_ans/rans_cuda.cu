@@ -10,6 +10,7 @@
 #define RANS_CUDA_API
 
 #include "rans_utils.hpp"
+#include "rans_build_config.hpp"
 #include "rans_warp_cuda.cuh"
 
 // NOTE: using 256 threads per block causes significant slowdown,
@@ -507,34 +508,142 @@ torch::Tensor rans_build_inverse_cdf_cuda(const torch::Tensor& cdfs, int64_t fre
 }
 
 
-TORCH_LIBRARY_IMPL(torch_ans, CUDA, m) {
-    m.impl("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf_cuda);
-    m.impl("rans64_push_indexed", &rans_push_indexed_cuda<uint64_t, uint32_t>);
-    m.impl("rans64_pop_indexed", &rans_pop_indexed_cuda<uint64_t, uint32_t>);
-    m.impl("rans64_i4_push_indexed", &rans_push_indexed_cuda<uint64_t, uint32_t, false, 4>);
-    m.impl("rans64_i4_pop_indexed", &rans_pop_indexed_cuda<uint64_t, uint32_t, false, false, 4>);
-    m.impl("rans64_alias_push_indexed", &rans_push_indexed_cuda<uint64_t, uint32_t, true>);
-    m.impl("rans64_alias_pop_indexed", &rans_pop_indexed_cuda<uint64_t, uint32_t, true, false>);
-    m.impl("rans64_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint64_t, uint32_t, false, true>);
-    m.impl("rans64_i4_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint64_t, uint32_t, false, true, 4>);
-    m.impl("rans32_push_indexed", &rans_push_indexed_cuda<uint32_t, uint8_t>);
-    m.impl("rans32_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint8_t>);
-    m.impl("rans32_i4_push_indexed", &rans_push_indexed_cuda<uint32_t, uint8_t, false, 4>);
-    m.impl("rans32_i4_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint8_t, false, false, 4>);
-    m.impl("rans32_i4_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint8_t, false, true, 4>);
-    m.impl("rans32_alias_push_indexed", &rans_push_indexed_cuda<uint32_t, uint8_t, true>);
-    m.impl("rans32_alias_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint8_t, true, false>);
-    m.impl("rans32_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint8_t, false, true>);
-    m.impl("rans32_16_push_indexed", &rans_push_indexed_cuda<uint32_t, uint16_t>);
-    m.impl("rans32_16_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t>);
-    m.impl("rans32_16_alias_push_indexed", &rans_push_indexed_cuda<uint32_t, uint16_t, true>);
-    m.impl("rans32_16_alias_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, true, false>);
-    m.impl("rans32_16_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, true>);
-    m.impl("rans32_16_i4_push_indexed", &rans_push_indexed_cuda<uint32_t, uint16_t, false, 4>);
-    m.impl("rans32_16_i4_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, false, 4>);
-    m.impl("rans32_16_i4_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, true, 4>);
-    m.impl("rans32_16_i32_push_indexed", &rans_push_indexed_cuda<uint32_t, uint16_t, false, 32>);
-    m.impl("rans32_16_i32_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, false, 32>);
-    m.impl("rans32_16_i32_invcdf_pop_indexed", &rans_pop_indexed_cuda<uint32_t, uint16_t, false, true, 32>);
-    
-}
+// ---------------------------------------------------------------------------
+// Instantiations required by the pybind bindings in rans_bindings.hpp.
+//
+// Whenever WITH_CUDA/WITH_HIP is defined, the rans.hpp wrappers reference the
+// CUDA template for every bound combination, so the .cu translation unit must
+// define each of them - a missing one is not a compile error but an undefined
+// symbol, which makes the whole module fail to import. The blocks mirror both
+// the bindings and the gates in rans_build_config.hpp.
+// ---------------------------------------------------------------------------
+
+#define TORCH_ANS_CUDA_INST_ILV(STATE, STREAM, ILV) \
+  TORCH_ANS_INST_PUSH(rans_push_indexed_cuda, STATE, STREAM, false, ILV); \
+  TORCH_ANS_INST_POP(rans_pop_indexed_cuda, STATE, STREAM, false, false, ILV)
+#define TORCH_ANS_CUDA_INST_ILV_INVCDCDF(STATE, STREAM, ILV) \
+  TORCH_ANS_INST_POP(rans_pop_indexed_cuda, STATE, STREAM, false, true, ILV)
+#define TORCH_ANS_CUDA_INST_ILV_ALIAS(STATE, STREAM, ILV) \
+  TORCH_ANS_INST_PUSH(rans_push_indexed_cuda, STATE, STREAM, true, ILV); \
+  TORCH_ANS_INST_POP(rans_pop_indexed_cuda, STATE, STREAM, true, false, ILV)
+
+#if TORCH_ANS_WITH_RANS64
+TORCH_ANS_CUDA_INST_ILV(uint64_t, uint32_t, 1);
+#  if TORCH_ANS_WITH_INVCDCDF
+TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint64_t, uint32_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_ALIAS
+TORCH_ANS_CUDA_INST_ILV_ALIAS(uint64_t, uint32_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_CUDA_INST_ILV(uint64_t, uint32_t, 2);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint64_t, uint32_t, 2);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint64_t, uint32_t, 2);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_CUDA_INST_ILV(uint64_t, uint32_t, 4);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint64_t, uint32_t, 4);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint64_t, uint32_t, 4);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_CUDA_INST_ILV(uint64_t, uint32_t, 8);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint64_t, uint32_t, 8);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint64_t, uint32_t, 8);
+#    endif
+#  endif
+#endif
+
+#if TORCH_ANS_WITH_RANS32
+TORCH_ANS_CUDA_INST_ILV(uint32_t, uint8_t, 1);
+#  if TORCH_ANS_WITH_INVCDCDF
+TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint8_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_ALIAS
+TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint8_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint8_t, 2);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint8_t, 2);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint8_t, 2);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint8_t, 4);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint8_t, 4);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint8_t, 4);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint8_t, 8);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint8_t, 8);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint8_t, 8);
+#    endif
+#  endif
+#endif
+
+#if TORCH_ANS_WITH_RANS32_16
+TORCH_ANS_CUDA_INST_ILV(uint32_t, uint16_t, 1);
+#  if TORCH_ANS_WITH_INVCDCDF
+TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint16_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_ALIAS
+TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint16_t, 1);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint16_t, 2);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint16_t, 2);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint16_t, 2);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint16_t, 4);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint16_t, 4);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint16_t, 4);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint16_t, 8);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint16_t, 8);
+#    endif
+#    if TORCH_ANS_WITH_ALIAS
+  TORCH_ANS_CUDA_INST_ILV_ALIAS(uint32_t, uint16_t, 8);
+#    endif
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_CUDA_INST_ILV(uint32_t, uint16_t, 32);
+#    if TORCH_ANS_WITH_INVCDCDF
+  TORCH_ANS_CUDA_INST_ILV_INVCDCDF(uint32_t, uint16_t, 32);
+#    endif
+#  endif
+#endif
+
+#undef TORCH_ANS_CUDA_INST_ILV
+#undef TORCH_ANS_CUDA_INST_ILV_INVCDCDF
+#undef TORCH_ANS_CUDA_INST_ILV_ALIAS

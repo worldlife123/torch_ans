@@ -82,12 +82,22 @@ std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
         cdf_alias_table_ptr += cdf_size;
         std::copy(cdf_ptr, cdf_ptr + cdf_size, cdf_alias_remap_ptr);
         cdf_alias_remap_ptr += cdf_size;
-        build_alias_mapping<DEFAULT_TORCH_TENSOR_TYPE, DEFAULT_TORCH_TENSOR_TYPE>(
+        // NOTE: build_alias_mapping reports failure (the alias scheme only works
+        // when the cdf size is 2**symbol_precision + 1 and the frequencies sum
+        // to exactly 2**freq_precision). Ignoring it used to leave a partially
+        // built table behind, which silently produced a wrong stream on every
+        // symbol instead of an error - so fail loudly.
+        const bool built = build_alias_mapping<DEFAULT_TORCH_TENSOR_TYPE, DEFAULT_TORCH_TENSOR_TYPE>(
           cdf_ptr, cdf_size,
           reinterpret_cast<RANSAliasSamplingCDFTableElement<DEFAULT_TORCH_TENSOR_TYPE>*>(cdf_alias_table_ptr), 
           reinterpret_cast<DEFAULT_TORCH_TENSOR_TYPE*>(cdf_alias_remap_ptr), 
           symbol_precision, freq_precision
         );
+        TORCH_CHECK(built,
+          "alias sampling table could not be built: it requires "
+          "2**symbol_precision == cdfs_sizes[i] - 1 and a cdf whose frequencies sum to "
+          "2**freq_precision. Got cdf_size=", cdf_size, " (symbol_precision=",
+          symbol_precision, "), freq_precision=", freq_precision);
       }
   });
 

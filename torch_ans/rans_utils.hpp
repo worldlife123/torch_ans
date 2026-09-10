@@ -42,33 +42,168 @@
 #define POP_STATE_FROM_STREAM(state, pptr) \
     state = (state << RANS_STREAM_BITS) | **pptr; *pptr -= 1; // std::cout<<"popstate"<<std::endl;
 
+// Branch-free single-word renormalization (host builds).
+//
+// Whether a renormalization is needed is close to a coin flip for the usual
+// parameter choices - freq_precision=15 bits consumed per symbol against a
+// 32-bit stream word renormalizes about every second symbol - so an `if` here
+// mispredicts on roughly half of the symbols. That is what kept interleaved
+// coding from paying off: a mispredict discards the whole out-of-order window,
+// which is exactly the window the (otherwise independent) interleaved lanes
+// need in order to overlap. The variants below are branch-free instead:
+//   * append: store the word into the *next* slot unconditionally and commit
+//     the cursor only when the renormalization was really needed. When it was
+//     not, a garbage word is left one past the cursor; the next append
+//     overwrites it, and the stream length is derived from the cursor, so it
+//     never becomes part of the bitstream. The buffers keep one word of slack
+//     for the very last append (see rans_init_stream / rans_push).
+//   * pop: load the word unconditionally (the cursor always points at a word
+//     inside the row) and select.
+// Both emit/consume exactly the words the branchy version does, so streams stay
+// bit-compatible between implementations (CPU <-> CUDA included).
+#ifdef RANS_CUDA_API
+#define APPEND_STATE_TO_STREAM_IF(state, pptr, cond) \
+    { if (cond) { APPEND_STATE_TO_STREAM(state, pptr) } }
+#define POP_STATE_FROM_STREAM_IF(state, pptr, cond) \
+    { if (cond) { POP_STATE_FROM_STREAM(state, pptr) } }
+#else
+#define APPEND_STATE_TO_STREAM_IF(state, pptr, cond) \
+    { const bool _rans_need = (cond); \
+      (*pptr)[1] = (RANS_STREAM_TYPE) state; \
+      *pptr += _rans_need; \
+      state = _rans_need ? (RANS_STATE_TYPE) (state >> RANS_STREAM_BITS) : state; }
+#define POP_STATE_FROM_STREAM_IF(state, pptr, cond) \
+    { const bool _rans_need = (cond); \
+      const RANS_STATE_TYPE _rans_word = (RANS_STATE_TYPE) **pptr; \
+      state = _rans_need ? (RANS_STATE_TYPE) ((state << RANS_STREAM_BITS) | _rans_word) : state; \
+      *pptr -= _rans_need; }
+#endif
+
 #define RANS_APPEND_STATE_RENORM(state, freq, freq_precision, pptr) \
     if (RANS_STATE_USED_BITS - RANS_STREAM_BITS < RANS_STREAM_BITS) \
-      {if (state >= ((RANS_STATE_LOWER_BOUND >> freq_precision) << RANS_STREAM_BITS) * freq) {APPEND_STATE_TO_STREAM(state, pptr);}} \
+      {APPEND_STATE_TO_STREAM_IF(state, pptr, state >= ((RANS_STATE_LOWER_BOUND >> freq_precision) << RANS_STREAM_BITS) * freq)} \
     else \
       {while (state >= ((RANS_STATE_LOWER_BOUND >> freq_precision) << RANS_STREAM_BITS) * freq) {APPEND_STATE_TO_STREAM(state, pptr);}}
 
 #define RANS_APPEND_STATE_RENORM_OVERFLOW(state, pptr) \
     if (RANS_STATE_BITS - RANS_STREAM_BITS < RANS_STREAM_BITS) \
-      {if (state >= (RANS_STATE_LOWER_BOUND << RANS_STREAM_BITS)) {APPEND_STATE_TO_STREAM(state, pptr);}} \
+      {APPEND_STATE_TO_STREAM_IF(state, pptr, state >= (RANS_STATE_LOWER_BOUND << RANS_STREAM_BITS))} \
     else \
       {while (state >= (RANS_STATE_LOWER_BOUND << RANS_STREAM_BITS)) {APPEND_STATE_TO_STREAM(state, pptr);}}
 
 #define RANS_POP_STATE_RENORM(state, pptr) \
     if (RANS_STATE_USED_BITS - RANS_STREAM_BITS < RANS_STREAM_BITS) \
-      {if (state < RANS_STATE_LOWER_BOUND) {POP_STATE_FROM_STREAM(state, pptr);}} \
+      {POP_STATE_FROM_STREAM_IF(state, pptr, state < RANS_STATE_LOWER_BOUND)} \
     else \
       {while (state < RANS_STATE_LOWER_BOUND) {POP_STATE_FROM_STREAM(state, pptr);}}
 
 #define RANS_APPEND_BITS(state, pptr, value, nbits) \
     if (RANS_STATE_USED_BITS - RANS_STREAM_BITS < RANS_STREAM_BITS) \
-      {if (state >= ((RANS_STATE_LOWER_BOUND >> nbits) << RANS_STREAM_BITS)) {APPEND_STATE_TO_STREAM(state, pptr);}} \
+      {APPEND_STATE_TO_STREAM_IF(state, pptr, state >= ((RANS_STATE_LOWER_BOUND >> nbits) << RANS_STREAM_BITS))} \
     else \
       {while (state >= ((RANS_STATE_LOWER_BOUND >> nbits) << RANS_STREAM_BITS)) {APPEND_STATE_TO_STREAM(state, pptr);}} \
-    state = (x << nbits) | value;
+    state = (state << (nbits)) | (value);
 
 #define RANS_POP_BITS(state, pptr, value, nbits) \
-    value = (RANS_SYMBOL_TYPE) (state & ((1u << nbits) - 1)); state = state >> bypass_precision; RANS_POP_STATE_RENORM(state, pptr)
+    value = (RANS_SYMBOL_TYPE) (state & ((1u << (nbits)) - 1)); state = state >> (nbits); RANS_POP_STATE_RENORM(state, pptr)
+
+
+// Compile-time unrolled loop (used to give the interleaved lanes a compile-time
+// lane index, which is what allows the state arrays to live in registers).
+// from https://artificial-mind.net/blog/2020/10/31/constexpr-for
+template <auto Start, auto End, auto Inc, class F>
+constexpr void constexpr_for(F&& f)
+{
+    if constexpr (Start < End)
+    {
+        f(std::integral_constant<decltype(Start), Start>());
+        constexpr_for<Start + Inc, End, Inc>(f);
+    }
+}
+
+
+// How many cdf entries the inverse-CDF gap closing loads speculatively (see
+// rans_invcdf_advance). See the discussion there for how the value is chosen.
+#ifndef RANS_INVCDF_WINDOW
+#define RANS_INVCDF_WINDOW 2
+#endif
+
+
+// Turn the inverse-CDF table's lower bound into the exact symbol index.
+//
+// `inversed_cdf[cum_freq >> shift]` gives the largest i with
+// cdf[i] <= (the bucket start), which is a lower bound of the answer; the exact
+// index is the largest i with cdf[i] <= cum_freq. The gap is at most 2**shift
+// symbols, but in practice it is a couple of them (measured with the auto
+// precision: mean 0.5-2 steps, max 4-10 depending on the alphabet size), and the
+// obvious `while (cdf[idx + 1] <= cum_freq) ++idx;` is a data-dependent branch -
+// the same kind of coin flip that keeps the interleaved lanes from overlapping.
+//
+// So instead of walking, load a fixed window of RANS_INVCDF_WINDOW cdf entries
+// *in parallel* (they all come from the lower bound, so they do not depend on
+// each other, unlike the walk's serial loads) and count how many of them are
+// <= cum_freq: since the cdf is monotone that count is exactly the number of
+// steps the walk would have taken. A loop for the rare remainder keeps this
+// exact for any distribution (limit case: a bucket holding many symbols).
+template <typename RANS_FREQ_TYPE>
+RANS_API inline uint32_t rans_invcdf_advance(const RANS_FREQ_TYPE* cdf, uint32_t last,
+                                             uint32_t lb, RANS_FREQ_TYPE cum_freq)
+{
+#ifdef RANS_CUDA_API
+    uint32_t idx = lb;
+    while (cdf[idx + 1] <= cum_freq) ++idx;
+    return idx;
+#else
+    uint32_t advance = 0;
+    constexpr_for<size_t(1), size_t(RANS_INVCDF_WINDOW) + 1, size_t(1)>([&](auto kc) {
+        constexpr size_t k = kc;
+        // cdf[last] == 1 << freq_precision > cum_freq, so clamping the read
+        // index (instead of testing the bound) keeps every load in range and
+        // contributes nothing for entries past the end.
+        const uint32_t j = lb + k;
+        const uint32_t j_clamped = (j < last) ? j : last;
+        advance += (uint32_t)(cdf[j_clamped] <= cum_freq);
+    });
+    uint32_t idx = lb + advance;
+    // Rare: only when a bucket spans more than RANS_INVCDF_WINDOW symbols.
+    while (cdf[idx + 1] <= cum_freq) ++idx;
+    return idx;
+#endif
+}
+
+
+// x / freq and x % freq in one go.
+//
+// The hardware integer divider is the most expensive instruction of the push
+// step by a wide margin and - unlike everything else in the loop - it is *not*
+// pipelined (a 64-bit div has a reciprocal throughput of ~21-74 cycles on
+// Broadwell, ~30 on Zen), so interleaving N states merely queues N divisions on
+// the same unit and cannot overlap anything. The floating-point divider is
+// pipelined (~4-8 cycles throughput), and after the pre-renormalization the
+// quotient is bounded by 2**(RANS_STATE_USED_BITS - freq_precision), which
+// leaves the double result off by at most one for the usual precisions. The
+// fix-up loops below (normally zero iterations, and perfectly predicted because
+// they almost never trigger) make the result exact for *any* input, so this is
+// a drop-in replacement rather than an approximation.
+template <typename RANS_STATE_TYPE, typename RANS_FREQ_TYPE>
+RANS_API inline RANS_STATE_TYPE rans_divmod(RANS_STATE_TYPE x, RANS_FREQ_TYPE freq,
+    RANS_STATE_TYPE* remainder)
+{
+#ifdef RANS_CUDA_API
+    *remainder = x % (RANS_STATE_TYPE) freq;
+    return x / (RANS_STATE_TYPE) freq;
+#else
+    // (int64_t) casts keep both conversions single-instruction: the state never
+    // uses its top bit (RANS_STATE_USED_BITS == RANS_STATE_BITS - 1), while
+    // unsigned <-> double conversions would compile to a branchy sequence.
+    RANS_STATE_TYPE q = (RANS_STATE_TYPE) (int64_t) ((double) (int64_t) x / (double) (int64_t) freq);
+    int64_t r = (int64_t) (x - q * (RANS_STATE_TYPE) freq);
+    while (r < 0) { --q; r += (int64_t) freq; }
+    while (r >= (int64_t) freq) { ++q; r -= (int64_t) freq; }
+    *remainder = (RANS_STATE_TYPE) r;
+    return q;
+#endif
+}
 
 
 
@@ -173,6 +308,44 @@ RANS_API inline void rans_push_raw_value_step(RANS_STATE_TYPE* state_ptr, RANS_S
 #endif
     *state_ptr = x;
     
+}
+
+
+// The arithmetic core of a push, with the (start, freq) pair already looked up.
+//
+// Split out of rans_push_step so that the interleaved coders can gather the cdf
+// entries of *all* lanes first: those loads only depend on the input tensors,
+// not on the rANS states or on the stream cursor, so hoisting them makes the
+// (cache-missing) cdf accesses of the lanes overlap instead of being serialized
+// behind each other's state updates.
+template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename RANS_FREQ_TYPE, size_t RANS_STATE_VALID_BITS=0>
+RANS_API inline void rans_push_step_freq(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE** stream_pptr,
+    const RANS_FREQ_TYPE start,
+    const RANS_FREQ_TYPE freq,
+    int64_t freq_precision,
+    const RANS_FREQ_TYPE* cdf_alias_remap
+    )
+{
+    RANS_STATE_TYPE x = *state_ptr;
+    RANS_APPEND_STATE_RENORM(x, freq, freq_precision, stream_pptr);
+
+    RANS_STATE_TYPE rem;
+    const RANS_STATE_TYPE quo = rans_divmod<RANS_STATE_TYPE, RANS_FREQ_TYPE>(x, freq, &rem);
+    if (cdf_alias_remap != nullptr) {
+      x = (quo << freq_precision) + cdf_alias_remap[rem + start];
+    }
+    else {
+      // x = C(s,x), written as x + quo * (2**freq_precision - freq) + start:
+      // algebraically the same as (quo << freq_precision) + rem + start, but it
+      // keeps the remainder off the dependency chain (it is only needed for the
+      // exactness check inside rans_divmod, which is a not-taken branch), which
+      // is worth a few cycles per symbol on the encode critical path.
+      x += quo * (((RANS_STATE_TYPE)1 << freq_precision) - (RANS_STATE_TYPE)freq) + start;
+    }
+#ifdef DEBUG_STEPS
+    std::cout << "state_ptr:" << state_ptr << ", stream_ptr:" << (void*) (*stream_pptr) << ", state:" << *state_ptr << ", newstate:" << x << ", start: " << start << ", freq: " << freq << std::endl;
+#endif
+    *state_ptr = x;
 }
 
 
@@ -303,46 +476,21 @@ RANS_API inline void rans_push_step(RANS_STATE_TYPE* state_ptr, RANS_STREAM_TYPE
       }
     }
 
-    // TODO: enable use_post_renorm may reduce efficiency! Maybe consider fixing freq_precision as template?
-    const bool use_post_renorm = false; // (RANS_STATE_USED_BITS + freq_precision) <= (sizeof(RANS_STATE_TYPE) * 8);
-
-    RANS_STATE_TYPE x = *state_ptr;
     // directly put bits
     if (cdf == nullptr) {
       const RANS_FREQ_TYPE freq = (1 << freq_precision) / max_value;
       const RANS_FREQ_TYPE start = freq * value;
-      if (!use_post_renorm) {RANS_APPEND_STATE_RENORM(x, freq, freq_precision, stream_pptr);}
-      /* x = C(s, x) */
-      x = ((x / freq) << freq_precision) + (x % freq) + start;
-      if (use_post_renorm) {RANS_APPEND_STATE_RENORM_OVERFLOW(x, stream_pptr);}
+      rans_push_step_freq<RANS_STATE_TYPE, RANS_STREAM_TYPE, RANS_FREQ_TYPE, RANS_STATE_VALID_BITS>(
+        state_ptr, stream_pptr, start, freq, freq_precision, nullptr);
     }
     // cdf-based coding
     else {
-
       // Rans64EncPut(state_ptr, stream_pptr, cdf[value], cdf[value + 1] - cdf[value], freq_precision);
       const RANS_FREQ_TYPE start = cdf[value];
       const RANS_FREQ_TYPE freq = cdf[value + 1] - start;
-      if (!use_post_renorm) {RANS_APPEND_STATE_RENORM(x, freq, freq_precision, stream_pptr);}
-
-      if (cdf_alias_remap != nullptr) {
-        const RANS_STATE_TYPE new_state = ((x / freq) << freq_precision) + cdf_alias_remap[(x % freq) + start];
-#ifdef DEBUG_STEPS
-        std::cout << "state_ptr:" << state_ptr << ", stream_ptr:" << (void*)(*stream_pptr) << ", state:" << *state_ptr << ", newstate:" << new_state << ", symbol:" << symbol << ", start: " << start << ", freq: " << freq << ", cdf_alias: " << cdf_alias_remap[(x % freq) + start] << ", cum_freq_offset: " << (x % freq) << ", value: " << value << std::endl;
-#endif
-        x = new_state;
-      }
-      else {
-        // x = C(s,x)
-        const RANS_STATE_TYPE new_state = ((x / freq) << freq_precision) + (x % freq) + start;
-#ifdef DEBUG_STEPS
-        std::cout << "state_ptr:" << state_ptr << ", stream_ptr:" << (void*) (*stream_pptr) << ", state:" << *state_ptr << ", newstate:" << new_state << ", symbol:" << symbol << ", start: " << start << ", freq: " << freq << ", value: " << value << std::endl;
-#endif
-        x = new_state;
-      }
-
-      if (use_post_renorm) {RANS_APPEND_STATE_RENORM_OVERFLOW(x, stream_pptr);}
+      rans_push_step_freq<RANS_STATE_TYPE, RANS_STREAM_TYPE, RANS_FREQ_TYPE, RANS_STATE_VALID_BITS>(
+        state_ptr, stream_pptr, start, freq, freq_precision, cdf_alias_remap);
     }
-    *state_ptr = x;
 
 }
 
@@ -445,20 +593,44 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
     else if (inversed_cdf != nullptr) {
       // Sparse inverse CDF: entry i answers the query for the bucket start
       // i << (freq_precision - inverse_cdf_precision). A bucket start never
-      // exceeds cum_freq, so the entry is a lower bound of the true symbol and
-      // a short linear walk closes the remaining gap. The walk is bounded by
-      // 1 << (freq_precision - inverse_cdf_precision) (every symbol owns at
-      // least one frequency unit) and is empty for a dense table.
-      // Mirrors rans_warp_pop_lookup (rans_warp_cuda.cuh) so that the CPU and
-      // the warp kernels stay bit-compatible.
+      // exceeds cum_freq, so the entry is a lower bound of the true symbol; the
+      // remaining gap is closed branch-free in rans_invcdf_advance. The result
+      // is the same as the linear walk (and as rans_warp_pop_lookup in
+      // rans_warp_cuda.cuh), so the CPU and the warp kernels stay
+      // bit-compatible.
       const int64_t inv_cdf_precision = (inverse_cdf_precision > 0) ? inverse_cdf_precision : freq_precision;
       const int shift = (int)(freq_precision - inv_cdf_precision);
-      cdf_idx = inversed_cdf[cum_freq >> shift];
-      while (cdf[cdf_idx + 1] <= cum_freq) ++cdf_idx;
+      cdf_idx = rans_invcdf_advance<RANS_FREQ_TYPE>(
+          cdf, (uint32_t)cdf_size - 1, (uint32_t)inversed_cdf[cum_freq >> shift], cum_freq);
       cum_freq_offset -= cdf[cdf_idx];
     }
     else {
-// #ifdef RANS_CUDA_API
+#ifndef RANS_CUDA_API
+      // Branch-free search for the last index with cdf[idx] <= cum_freq.
+      //
+      // The divided/binary search below spends ~log2(cdf_size) *data dependent*
+      // branches per symbol, about half of them mispredicted (~10 cycles each,
+      // i.e. the bulk of the decode time for a 256 symbol alphabet), and every
+      // mispredict also throws away the work the other interleaved lanes had
+      // already started - which is why interleaving could not pay off. Here the
+      // trip count only depends on cdf_size (so the loop branch is predictable)
+      // and the update is a cmov, leaving a pure chain of dependent loads that
+      // different lanes overlap freely.
+      //
+      // Invariant: the answer lies in [base, base+len-1] and cdf[base] <=
+      // cum_freq holds (cdf[0] == 0). cdf[cdf_size-1] == 1<<freq_precision is
+      // always > cum_freq, hence len starts at cdf_size-1 and the result is
+      // identical to the binary search it replaces.
+      uint32_t base = 0;
+      uint32_t len = (uint32_t)cdf_size - 1;
+      while (len > 1) {
+        const uint32_t half = len >> 1;
+        base = (cdf[base + half] <= cum_freq) ? (base + half) : base;
+        len -= half;
+      }
+      cdf_idx = base;
+      cum_freq_offset -= cdf[cdf_idx];
+#else
       // divided search (seems to be fastest)
       cdf_idx = (cdf_size * cum_freq) >> freq_precision;
       // if (cdf_idx < 0 || cdf_idx >= cdf_size) cdf_idx = cdf_size / 2;
@@ -495,6 +667,7 @@ RANS_API inline RANS_SYMBOL_TYPE rans_pop_step(RANS_STATE_TYPE* state_ptr, RANS_
 //                                  [cum_freq](int v) { return v > cum_freq; });
 //     const RANS_SYMBOL_TYPE cdf_idx = std::distance(cdf, it) - 1;
 // #endif
+#endif
 
     }
     

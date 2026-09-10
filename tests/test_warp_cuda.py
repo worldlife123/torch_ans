@@ -22,6 +22,11 @@ from torch_ans._C import (
     rans32_16_i32_push,
     rans32_16_i32_pop,
     rans64_i4_push,
+    rans32_16_alias_push,
+    rans32_16_alias_pop,
+    rans32_16_alias_i4_push,
+    rans32_16_alias_i4_pop,
+    rans_alias_build_table,
 )
 from torch_ans.utils import TorchANSInterface
 
@@ -268,6 +273,50 @@ class TestRansWarpCuda(unittest.TestCase):
         torch.cuda.synchronize()
         decoded = do_pop(stream, indexes.cuda(), 12, True)
         self.assertTrue(torch.equal(expected, decoded.cpu()))
+
+    def test_cuda_alias_interleaved_roundtrip(self):
+        """Alias sampling must apply its remap on the interleaved warp push.
+
+        Regression test: the warp push kernel accepted USE_ALIAS_SAMPLING_CDF
+        but ignored it, so an interleaved alias stream was actually plain rANS
+        and decoded to garbage (the 1-way path was the only one covered before).
+        The fixture's cdf size (NUM_SYMBOLS + 2 = 9) makes cdfs_sizes - 1 = 8 a
+        power of two, which is what the alias builder requires.
+        """
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+        cdfs, cdfs_sizes, offsets = _generate_rans_params(freq_precision=12)
+        data, indexes, expected = _generate_data((8, 512), seed=7)
+        alias_remap, alias_table = rans_alias_build_table(
+            cdfs, cdfs_sizes, symbol_precision=3, freq_precision=12)
+        alias_remap, alias_table = alias_remap.contiguous(), alias_table.contiguous()
+
+        for num_interleaves, push, pop in (
+            (1, rans32_16_alias_push, rans32_16_alias_pop),
+            (4, rans32_16_alias_i4_push, rans32_16_alias_i4_pop),
+        ):
+            # CUDA on CUDA
+            stream = rans32_16_init_stream(data.size(0), num_interleaves).cuda()
+            push(stream, data.cuda(), indexes.cuda(), alias_remap.cuda(),
+                 cdfs_sizes.cuda(), offsets.cuda(), freq_precision=12,
+                 bypass_coding=True, bypass_precision=4)
+            decoded = pop(stream.clone(), indexes.cuda(), alias_table.cuda(),
+                          cdfs_sizes.cuda(), offsets.cuda(), freq_precision=12,
+                          bypass_coding=True, bypass_precision=4)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(decoded.cpu(), expected),
+                            f"CUDA alias x{num_interleaves} roundtrip mismatch")
+
+            # the CPU encoder's stream must decode on the GPU as well
+            stream_cpu = rans32_16_init_stream(data.size(0), num_interleaves)
+            push(stream_cpu, data, indexes, alias_remap, cdfs_sizes, offsets,
+                 freq_precision=12, bypass_coding=True, bypass_precision=4)
+            decoded_cross = pop(stream_cpu.cuda(), indexes.cuda(), alias_table.cuda(),
+                                cdfs_sizes.cuda(), offsets.cuda(), freq_precision=12,
+                                bypass_coding=True, bypass_precision=4)
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(decoded_cross.cpu(), expected),
+                            f"CPU alias x{num_interleaves} stream did not decode on CUDA")
 
     def test_cuda_i4_unsupported_variant_raises(self):
         # interleaved CUDA coding is rans32_16-only; other variants must fail loudly

@@ -263,6 +263,10 @@ __global__ void rans_warp_push_indexed_kernel(
     unsigned run_words = 0;
     unsigned sym_words = 0;
     TORCH_TENSOR_TYPE start = 0, freq = 0;
+    // alias sampling replaces the low bits the symbol contributes with the
+    // remap table entry (see rans_push_step_freq in rans_utils.hpp); the table
+    // lives right behind the cdf row
+    const TORCH_TENSOR_TYPE* alias_remap_ptr = nullptr;
     bool valid = false;
     bool renorm_pred = false;
     if (is_active) {
@@ -289,6 +293,9 @@ __global__ void rans_warp_push_indexed_kernel(
         }
         start = cdf_ptr[value];
         freq = cdf_ptr[value + 1] - start;
+        if constexpr (USE_ALIAS_SAMPLING_CDF) {
+          alias_remap_ptr = cdf_ptr + cdf_size;
+        }
         renorm_pred =
             state >= ((RANS_STATE_LOWER_BOUND >> p) << RANS_STREAM_BITS) * (unsigned long long)freq;
       }
@@ -301,7 +308,11 @@ __global__ void rans_warp_push_indexed_kernel(
     }
     cursor += __shfl_sync(group_mask, sym_words, group_start_in_warp + active_lane);
     if (valid) {
-      state = ((state / freq) << p) + (state % freq) + start;
+      if constexpr (USE_ALIAS_SAMPLING_CDF) {
+        state = ((state / freq) << p) + (RANS_STATE_TYPE)alias_remap_ptr[(state % freq) + start];
+      } else {
+        state = ((state / freq) << p) + (state % freq) + start;
+      }
     }
   }
 
@@ -364,10 +375,14 @@ __global__ void rans_warp_push_indexed_kernel(
     // symbol pushes: at most one word per lane, lane-descending order
     bool pred = false;
     TORCH_TENSOR_TYPE start = 0, freq = 0;
+    const TORCH_TENSOR_TYPE* alias_remap_ptr = nullptr;
     if (valid) {
       const auto cdf_ptr = cdfs_accessor[index].data();
       start = cdf_ptr[cdf_value];
       freq = cdf_ptr[cdf_value + 1] - start;
+      if constexpr (USE_ALIAS_SAMPLING_CDF) {
+        alias_remap_ptr = cdf_ptr + cdfs_sizes_accessor[index];
+      }
       pred = state >= ((RANS_STATE_LOWER_BOUND >> p) << RANS_STREAM_BITS) * (unsigned long long)freq;
     }
     const unsigned vote = __ballot_sync(group_mask, pred);
@@ -380,7 +395,11 @@ __global__ void rans_warp_push_indexed_kernel(
     }
     cursor += count;
     if (valid) {
-      state = ((state / freq) << p) + (state % freq) + start;
+      if constexpr (USE_ALIAS_SAMPLING_CDF) {
+        state = ((state / freq) << p) + (RANS_STATE_TYPE)alias_remap_ptr[(state % freq) + start];
+      } else {
+        state = ((state / freq) << p) + (state % freq) + start;
+      }
     }
   }
 
