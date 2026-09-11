@@ -97,7 +97,7 @@ def test_profile_defines_enable_only_the_requested_gates():
     assert defines["TORCH_ANS_INCREMENTAL_BUILD"] == 1
     assert defines["TORCH_ANS_WITH_RANS32_16"] == 1
     assert defines["TORCH_ANS_WITH_INTERLEAVE_4"] == 1
-    assert defines["TORCH_ANS_WITH_INVCDCDF"] == 1
+    assert defines["TORCH_ANS_WITH_INVCDF"] == 1
     assert "TORCH_ANS_WITH_ALIAS" not in defines
     assert "TORCH_ANS_WITH_RANS64" not in defines
     # interleave 1 is the always-compiled core, so it needs no gate

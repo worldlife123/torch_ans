@@ -21,7 +21,7 @@
 //   TORCH_ANS_WITH_ALIAS
 //       alias-sampling push/pop (CPU only; the CUDA side only implements the
 //       rans32_16 interleaved combination, as before)
-//   TORCH_ANS_WITH_INVCDCDF
+//   TORCH_ANS_WITH_INVCDF
 //       inverse-CDF table pop (`inverse_cdf_precision`)
 //
 // The gate names and the (family, interleave, lookup) combinations they cover
@@ -55,8 +55,8 @@
 #  ifndef TORCH_ANS_WITH_ALIAS
 #    define TORCH_ANS_WITH_ALIAS 0
 #  endif
-#  ifndef TORCH_ANS_WITH_INVCDCDF
-#    define TORCH_ANS_WITH_INVCDCDF 0
+#  ifndef TORCH_ANS_WITH_INVCDF
+#    define TORCH_ANS_WITH_INVCDF 0
 #  endif
 #else
 #  ifndef TORCH_ANS_WITH_RANS64
@@ -83,8 +83,8 @@
 #  ifndef TORCH_ANS_WITH_ALIAS
 #    define TORCH_ANS_WITH_ALIAS 1
 #  endif
-#  ifndef TORCH_ANS_WITH_INVCDCDF
-#    define TORCH_ANS_WITH_INVCDCDF 1
+#  ifndef TORCH_ANS_WITH_INVCDF
+#    define TORCH_ANS_WITH_INVCDF 1
 #  endif
 #endif
 

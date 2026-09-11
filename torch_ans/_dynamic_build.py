@@ -125,7 +125,7 @@ def profile_defines(profile: Optional[BuildProfile]) -> Dict[str, int]:
     if profile.alias:
         defines["TORCH_ANS_WITH_ALIAS"] = 1
     if profile.invcdf:
-        defines["TORCH_ANS_WITH_INVCDCDF"] = 1
+        defines["TORCH_ANS_WITH_INVCDF"] = 1
     return defines
 
 

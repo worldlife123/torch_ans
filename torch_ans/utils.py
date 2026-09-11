@@ -83,7 +83,7 @@ RANS_ALIAS_OP_NAMES = {
     for family, interleaves in _build_config.ALIAS_INTERLEAVES.items()
     for interleave in interleaves
 }
-RANS_INVCDCDF_POP_OP_NAMES = {
+RANS_INVCDF_POP_OP_NAMES = {
     (family, interleave): _invcdf_op_names(family, interleave)
     for family, interleaves in _build_config.SUPPORTED_INTERLEAVES.items()
     for interleave in interleaves
@@ -990,11 +990,11 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._inverse_cdf_auto = (isinstance(self.inverse_cdf_precision, str) and
                                   self.inverse_cdf_precision.strip().lower() == "auto")
         if use_invcdf_decode:
-            if impl_key not in RANS_INVCDCDF_POP_OP_NAMES:
+            if impl_key not in RANS_INVCDF_POP_OP_NAMES:
                 raise NotImplementedError(
                     f"inverse CDF decoding is not available for impl={self.impl} with "
                     f"num_interleaves={self.num_interleaves} "
-                    f"(available: {sorted(RANS_INVCDCDF_POP_OP_NAMES.keys())})"
+                    f"(available: {sorted(RANS_INVCDF_POP_OP_NAMES.keys())})"
                 )
             if not self._inverse_cdf_auto:
                 inverse_cdf_precision = int(self.inverse_cdf_precision)
@@ -1034,7 +1034,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._decode_extra_kwargs = {}
         self._invcdf_decode_func = None
         if use_invcdf_decode:
-            self._invcdf_decode_func = getattr(self._native, RANS_INVCDCDF_POP_OP_NAMES[impl_key])
+            self._invcdf_decode_func = getattr(self._native, RANS_INVCDF_POP_OP_NAMES[impl_key])
             if self._inverse_cdf_auto:
                 # the numeric precision is decided in init_params, once the
                 # alphabet size (cdfs width) is known

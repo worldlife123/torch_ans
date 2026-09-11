@@ -10,7 +10,7 @@
 //
 // The pybind argument lists are factored into macros so that the gated list
 // stays readable, and the push/pop/invcdf bindings are factored into
-// TORCH_ANS_BIND_PUSH_POP / TORCH_ANS_BIND_INVCDCDF so each gated block below
+// TORCH_ANS_BIND_PUSH_POP / TORCH_ANS_BIND_INVCDF so each gated block below
 // is a couple of lines.
 
 #include "rans.hpp"
@@ -40,7 +40,7 @@
   m.def(PREFIX "_push", &rans_push<STATE, STREAM, ALIAS, ILV>, TORCH_ANS_PUSH_ARGS); \
   m.def(PREFIX "_pop", &rans_pop<STATE, STREAM, ALIAS, false, ILV>, TORCH_ANS_POP_ARGS)
 
-#define TORCH_ANS_BIND_INVCDCDF(m, PREFIX, STATE, STREAM, ILV) \
+#define TORCH_ANS_BIND_INVCDF(m, PREFIX, STATE, STREAM, ILV) \
   m.def(PREFIX "_invcdf_pop", &rans_pop<STATE, STREAM, false, true, ILV>, \
         TORCH_ANS_POP_ARGS)
 
@@ -65,16 +65,16 @@ inline void torch_ans_bind_all(py::module& m) {
 #if TORCH_ANS_WITH_RANS64
   TORCH_ANS_BIND_INIT(m, "rans64", uint64_t, uint32_t);
   TORCH_ANS_BIND_PUSH_POP(m, "rans64", uint64_t, uint32_t, false, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans64", uint64_t, uint32_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans64", uint64_t, uint32_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_alias", uint64_t, uint32_t, true, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_i2", uint64_t, uint32_t, false, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans64_i2", uint64_t, uint32_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans64_i2", uint64_t, uint32_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_alias_i2", uint64_t, uint32_t, true, 2);
@@ -82,8 +82,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_i4", uint64_t, uint32_t, false, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans64_i4", uint64_t, uint32_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans64_i4", uint64_t, uint32_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_alias_i4", uint64_t, uint32_t, true, 4);
@@ -91,8 +91,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_i8", uint64_t, uint32_t, false, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans64_i8", uint64_t, uint32_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans64_i8", uint64_t, uint32_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans64_alias_i8", uint64_t, uint32_t, true, 8);
@@ -105,16 +105,16 @@ inline void torch_ans_bind_all(py::module& m) {
 #if TORCH_ANS_WITH_RANS32
   TORCH_ANS_BIND_INIT(m, "rans32", uint32_t, uint8_t);
   TORCH_ANS_BIND_PUSH_POP(m, "rans32", uint32_t, uint8_t, false, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32", uint32_t, uint8_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32", uint32_t, uint8_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_alias", uint32_t, uint8_t, true, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_i2", uint32_t, uint8_t, false, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_i2", uint32_t, uint8_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_i2", uint32_t, uint8_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_alias_i2", uint32_t, uint8_t, true, 2);
@@ -122,8 +122,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_i4", uint32_t, uint8_t, false, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_i4", uint32_t, uint8_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_i4", uint32_t, uint8_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_alias_i4", uint32_t, uint8_t, true, 4);
@@ -131,8 +131,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_i8", uint32_t, uint8_t, false, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_i8", uint32_t, uint8_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_i8", uint32_t, uint8_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_alias_i8", uint32_t, uint8_t, true, 8);
@@ -147,16 +147,16 @@ inline void torch_ans_bind_all(py::module& m) {
 #if TORCH_ANS_WITH_RANS32_16
   TORCH_ANS_BIND_INIT(m, "rans32_16", uint32_t, uint16_t);
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16", uint32_t, uint16_t, false, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_16", uint32_t, uint16_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_16", uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_alias", uint32_t, uint16_t, true, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_i2", uint32_t, uint16_t, false, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_16_i2", uint32_t, uint16_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_16_i2", uint32_t, uint16_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_alias_i2", uint32_t, uint16_t, true, 2);
@@ -164,8 +164,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_i4", uint32_t, uint16_t, false, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_16_i4", uint32_t, uint16_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_16_i4", uint32_t, uint16_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_alias_i4", uint32_t, uint16_t, true, 4);
@@ -173,8 +173,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_i8", uint32_t, uint16_t, false, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_16_i8", uint32_t, uint16_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_16_i8", uint32_t, uint16_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_alias_i8", uint32_t, uint16_t, true, 8);
@@ -182,8 +182,8 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_32
   TORCH_ANS_BIND_PUSH_POP(m, "rans32_16_i32", uint32_t, uint16_t, false, 32);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_BIND_INVCDCDF(m, "rans32_16_i32", uint32_t, uint16_t, 32);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_BIND_INVCDF(m, "rans32_16_i32", uint32_t, uint16_t, 32);
 #    endif
 #  endif
 #endif

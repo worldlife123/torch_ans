@@ -726,7 +726,7 @@ torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq
 #define TORCH_ANS_CPU_INST_ILV(STATE, STREAM, ILV) \
   TORCH_ANS_INST_PUSH(rans_push_indexed_cpu, STATE, STREAM, false, ILV); \
   TORCH_ANS_INST_POP(rans_pop_indexed_cpu, STATE, STREAM, false, false, ILV)
-#define TORCH_ANS_CPU_INST_ILV_INVCDCDF(STATE, STREAM, ILV) \
+#define TORCH_ANS_CPU_INST_ILV_INVCDF(STATE, STREAM, ILV) \
   TORCH_ANS_INST_POP(rans_pop_indexed_cpu, STATE, STREAM, false, true, ILV)
 #define TORCH_ANS_CPU_INST_ILV_ALIAS(STATE, STREAM, ILV) \
   TORCH_ANS_INST_PUSH(rans_push_indexed_cpu, STATE, STREAM, true, ILV); \
@@ -735,16 +735,16 @@ torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq
 #if TORCH_ANS_WITH_RANS64
 TORCH_ANS_INST_INIT(uint64_t, uint32_t);
 TORCH_ANS_CPU_INST_ILV(uint64_t, uint32_t, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint64_t, uint32_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+TORCH_ANS_CPU_INST_ILV_INVCDF(uint64_t, uint32_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
 TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_CPU_INST_ILV(uint64_t, uint32_t, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint64_t, uint32_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint64_t, uint32_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 2);
@@ -752,8 +752,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_CPU_INST_ILV(uint64_t, uint32_t, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint64_t, uint32_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint64_t, uint32_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 4);
@@ -761,8 +761,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_CPU_INST_ILV(uint64_t, uint32_t, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint64_t, uint32_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint64_t, uint32_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 8);
@@ -773,16 +773,16 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint64_t, uint32_t, 1);
 #if TORCH_ANS_WITH_RANS32
 TORCH_ANS_INST_INIT(uint32_t, uint8_t);
 TORCH_ANS_CPU_INST_ILV(uint32_t, uint8_t, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint8_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint8_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
 TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint8_t, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint8_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint8_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 2);
@@ -790,8 +790,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint8_t, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint8_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint8_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 4);
@@ -799,8 +799,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint8_t, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint8_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint8_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 8);
@@ -811,16 +811,16 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint8_t, 1);
 #if TORCH_ANS_WITH_RANS32_16
 TORCH_ANS_INST_INIT(uint32_t, uint16_t);
 TORCH_ANS_CPU_INST_ILV(uint32_t, uint16_t, 1);
-#  if TORCH_ANS_WITH_INVCDCDF
-TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint16_t, 1);
+#  if TORCH_ANS_WITH_INVCDF
+TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_ALIAS
 TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_2
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint16_t, 2);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint16_t, 2);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint16_t, 2);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 2);
@@ -828,8 +828,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_4
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint16_t, 4);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint16_t, 4);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint16_t, 4);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 4);
@@ -837,8 +837,8 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint16_t, 8);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint16_t, 8);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint16_t, 8);
 #    endif
 #    if TORCH_ANS_WITH_ALIAS
   TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 8);
@@ -846,12 +846,12 @@ TORCH_ANS_CPU_INST_ILV_ALIAS(uint32_t, uint16_t, 1);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_32
   TORCH_ANS_CPU_INST_ILV(uint32_t, uint16_t, 32);
-#    if TORCH_ANS_WITH_INVCDCDF
-  TORCH_ANS_CPU_INST_ILV_INVCDCDF(uint32_t, uint16_t, 32);
+#    if TORCH_ANS_WITH_INVCDF
+  TORCH_ANS_CPU_INST_ILV_INVCDF(uint32_t, uint16_t, 32);
 #    endif
 #  endif
 #endif
 
 #undef TORCH_ANS_CPU_INST_ILV
-#undef TORCH_ANS_CPU_INST_ILV_INVCDCDF
+#undef TORCH_ANS_CPU_INST_ILV_INVCDF
 #undef TORCH_ANS_CPU_INST_ILV_ALIAS

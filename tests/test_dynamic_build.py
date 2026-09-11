@@ -124,7 +124,7 @@ def test_incremental_defines_reach_cxx_and_nvcc(monkeypatch):
                        verbose=False, defines=db.profile_defines(profile))
 
     for flag in ("-DTORCH_ANS_INCREMENTAL_BUILD=1", "-DTORCH_ANS_WITH_RANS32_16=1",
-                 "-DTORCH_ANS_WITH_INTERLEAVE_32=1", "-DTORCH_ANS_WITH_INVCDCDF=1"):
+                 "-DTORCH_ANS_WITH_INTERLEAVE_32=1", "-DTORCH_ANS_WITH_INVCDF=1"):
         assert flag in captured["extra_cflags"], flag
         assert flag in captured["extra_cuda_cflags"], flag
     assert "-DTORCH_ANS_WITH_RANS64=1" not in captured["extra_cflags"]
