@@ -1,0 +1,59 @@
+{
+  "version": "0.3.0",
+  "torch": "2.11.0+cu130",
+  "python": "3.11.5",
+  "threads": 6,
+  "gpu": "NVIDIA GeForce RTX 2080 Ti",
+  "cpu": "Intel(R) Core(TM) i7-6800K CPU @ 3.40GHz (6C/12T)",
+  "sparse_q": 7,
+  "records": [
+    {
+      "section": "high_level",
+      "device": "cpu",
+      "variant": "rans64 default",
+      "status": "ok",
+      "encode": 100.1839217776934,
+      "decode": 41.21906270364701
+    },
+    {
+      "section": "high_level",
+      "device": "cpu",
+      "variant": "rans32_16 default",
+      "status": "ok",
+      "encode": 104.01020291392018,
+      "decode": 40.58890289338652
+    },
+    {
+      "section": "high_level",
+      "device": "cpu",
+      "variant": "rans32_16 i4 + auto invcdf",
+      "status": "ok",
+      "encode": 160.1160997317069,
+      "decode": 86.69687176982764
+    },
+    {
+      "section": "high_level",
+      "device": "cuda",
+      "variant": "rans64 default",
+      "status": "ok",
+      "encode": 1.8715008967585969,
+      "decode": 1.652730825049895
+    },
+    {
+      "section": "high_level",
+      "device": "cuda",
+      "variant": "rans32_16 default",
+      "status": "ok",
+      "encode": 2.4871667348905464,
+      "decode": 1.6535058135897651
+    },
+    {
+      "section": "high_level",
+      "device": "cuda",
+      "variant": "rans32_16 i4 + auto invcdf",
+      "status": "ok",
+      "encode": 6.891890737828053,
+      "decode": 8.707672666816654
+    }
+  ]
+}

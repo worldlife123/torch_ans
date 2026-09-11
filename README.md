@@ -565,11 +565,12 @@ Run Python coverage for the package:
 pytest --cov=torch_ans --cov-report=term-missing --cov-report=html
 ```
 
-To track throughput with `pytest-benchmark`, install the benchmark dependency and run:
+For release-to-release throughput comparisons see `benchmark_status.md`: it is measured locally (CI runners are virtualised CPUs and too noisy for this) with
 
 ```bash
-pip install pytest-benchmark
-pytest --benchmark-only
+python scripts/bench_version_matrix.py --version-label <ver> --json <ver>.json
+python scripts/generate_benchmark_report.py --baseline <old>.json \
+    --candidate <new>.json --output benchmark_status.md
 ```
 
 To collect native C/C++ coverage for the compiled extension, build with coverage instrumentation and run tests from the repository root:

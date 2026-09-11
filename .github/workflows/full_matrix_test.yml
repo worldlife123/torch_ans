@@ -56,15 +56,13 @@ jobs:
             pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
           fi
       - name: Install build dependencies
-        run: pip install setuptools wheel pybind11 pytest pytest-benchmark
+        run: pip install setuptools wheel pybind11 pytest
       - name: Build and install extension
         run: pip install --no-build-isolation .
       - name: Show versions
         run: python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__, 'CUDA:', torch.cuda.is_available())"
       - name: Run tests
         run: pytest -q tests
-      - name: Run benchmarks
-        run: pytest --benchmark-only --benchmark-json=benchmark.json tests/test_benchmarks.py
       - name: Create result file
         if: ${{ always() }}
         shell: bash
@@ -80,12 +78,6 @@ jobs:
         with:
           name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: result.txt
-      - name: Upload benchmark artifact
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
-          path: benchmark.json
 
   update-build-status:
     needs: test-matrix
@@ -130,9 +122,6 @@ jobs:
           done
           echo "" >> table.md
           echo "Last updated: $(date)" >> table.md
-      - name: Generate benchmark table
-        shell: bash
-        run: python scripts/generate_benchmark_status.py results benchmark_status.md
       - name: Create build_status.md
         shell: bash
         run: mv table.md build_status.md
@@ -141,5 +130,5 @@ jobs:
         with:
           author_name: GitHub Actions
           author_email: actions@github.com
-          message: 'Update build and benchmark status tables'
-          add: 'build_status.md benchmark_status.md'
+          message: 'Update build status table'
+          add: 'build_status.md'

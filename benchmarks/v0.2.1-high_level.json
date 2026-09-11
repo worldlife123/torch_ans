@@ -1,0 +1,43 @@
+{
+  "version": "0.2.1",
+  "torch": "2.11.0+cu130",
+  "python": "3.11.5",
+  "threads": 6,
+  "gpu": "NVIDIA GeForce RTX 2080 Ti",
+  "cpu": "Intel(R) Core(TM) i7-6800K CPU @ 3.40GHz (6C/12T)",
+  "sparse_q": 7,
+  "records": [
+    {
+      "section": "high_level",
+      "device": "cpu",
+      "variant": "rans64 default",
+      "status": "ok",
+      "encode": 71.15217108676238,
+      "decode": 32.22038282484393
+    },
+    {
+      "section": "high_level",
+      "device": "cpu",
+      "variant": "rans32_16 default",
+      "status": "ok",
+      "encode": 91.32346002001702,
+      "decode": 32.634180826901456
+    },
+    {
+      "section": "high_level",
+      "device": "cuda",
+      "variant": "rans64 default",
+      "status": "ok",
+      "encode": 1.8458901216405725,
+      "decode": 1.651914628248109
+    },
+    {
+      "section": "high_level",
+      "device": "cuda",
+      "variant": "rans32_16 default",
+      "status": "ok",
+      "encode": 2.1377636375706484,
+      "decode": 1.5586020869459822
+    }
+  ]
+}
