@@ -144,7 +144,18 @@ def ensure_module(profile=None, verbose: bool = True, require_cuda: bool = False
 
 
 def __getattr__(name: str) -> Any:
-    """Forward attribute access to the full build (compiling it if needed)."""
+    """Forward attribute access to the full build (compiling it if needed).
+
+    Dunder attributes are answered without building: the import machinery probes
+    them on the module it is about to import names from, so
+    ``from ._lazy_C import ensure_full, ensure_module`` in `torch_ans/_C.py`
+    issues ``hasattr(_lazy_C, "__path__")`` first. Building the extension to
+    answer that would make plain ``import torch_ans.utils`` compile everything
+    (see tests/test_native_fallback.py).
+    """
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
     module = ensure_full()
     try:
         return getattr(module, name)

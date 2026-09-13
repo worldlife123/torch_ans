@@ -23,7 +23,15 @@ __all__ = ["ensure_full", "ensure_module"]
 
 
 def __getattr__(name: str) -> Any:
-    """Forward every operator lookup to the lazy implementation."""
+    """Forward every operator lookup to the lazy implementation.
+
+    Dunder attributes never reach the lazy module: they are what the import
+    machinery probes (``hasattr(module, "__path__")``) while resolving a
+    ``from ... import ...``, and answering them must not trigger a build (see
+    torch_ans/_lazy_C.py).
+    """
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import _lazy_C
     return getattr(_lazy_C, name)
 

@@ -10,6 +10,8 @@ Three situations are covered, none of which compiles anything:
    install when that is not possible.
 """
 import contextlib
+import importlib.util
+import os
 import sys
 import types
 import warnings
@@ -73,9 +75,6 @@ def test_force_runtime_build_skips_the_prebuilt_extension(monkeypatch):
 
 def test_C_forwarding_layer_keeps_the_old_shim_api(monkeypatch):
     """`torch_ans/_C.py` must forward to `_lazy_C` (a compiled .so shadows it)."""
-    import importlib.util
-    import os
-
     lazy = utils._lazy_C()
     monkeypatch.setattr(lazy, "ensure_full",
                         lambda verbose=True: types.SimpleNamespace(rans64_push="OP"))
@@ -90,6 +89,58 @@ def test_C_forwarding_layer_keeps_the_old_shim_api(monkeypatch):
     # module-level __getattr__ is what `from torch_ans._C import <op>` and
     # scripts/bench_version_matrix.py rely on
     assert module.rans64_push == "OP"
+
+
+def _record_builds(monkeypatch):
+    """Make both build entry points record instead of compiling."""
+    lazy = utils._lazy_C()
+    builds = []
+    monkeypatch.setattr(lazy, "ensure_full",
+                        lambda *args, **kwargs: builds.append("full"))
+    monkeypatch.setattr(lazy, "ensure_module",
+                        lambda *args, **kwargs: builds.append("profile"))
+    return lazy, builds
+
+
+def test_dunder_attribute_probes_never_build(monkeypatch):
+    """Import-machinery probes must not compile the extension.
+
+    `from ._lazy_C import ensure_full, ensure_module` (in torch_ans/_C.py) makes
+    the import system ask `hasattr(_lazy_C, "__path__")`; answering that with
+    `ensure_full()` would turn `import torch_ans.utils` into a full JIT build.
+    """
+    lazy, builds = _record_builds(monkeypatch)
+
+    assert hasattr(lazy, "__path__") is False
+    assert hasattr(lazy, "__all__") is False
+    with pytest.raises(AttributeError):
+        lazy.__getattr__("__path__")
+
+    assert builds == []
+
+
+def test_importing_the_C_forwarder_does_not_build(monkeypatch):
+    """Importing `torch_ans/_C.py` itself must stay lazy (regression test)."""
+    lazy, builds = _record_builds(monkeypatch)
+
+    path = os.path.join(os.path.dirname(utils.__file__), "_C.py")
+    spec = importlib.util.spec_from_file_location("torch_ans._C_no_build_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert builds == [], "importing torch_ans._C compiled the extension"
+    assert module.ensure_module is lazy.ensure_module
+    assert module.ensure_full is lazy.ensure_full
+
+
+def test_operator_attribute_access_still_builds(monkeypatch):
+    """`torch_ans._C.<op>` keeps compiling the full extension: documented behaviour."""
+    lazy, builds = _record_builds(monkeypatch)
+    monkeypatch.setattr(lazy, "ensure_full", lambda *args, **kwargs: (
+        builds.append("full") or types.SimpleNamespace(rans64_push="OP")))
+
+    assert lazy.rans64_push == "OP"
+    assert builds == ["full"]
 
 
 @pytest.mark.parametrize("value", ["0", "false", "", "no", "off"])
