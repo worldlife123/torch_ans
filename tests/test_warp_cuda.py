@@ -4,12 +4,17 @@ The CUDA warp kernels (rans_warp_cuda.cuh) are designed to be bit-compatible
 with the CPU interleaved implementation (rans_cpu.cpp with
 NUM_INTERLEAVES=32): for the same input they produce byte-identical streams
 and can decode each other's streams. These tests verify that invariant.
+
+The CUDA cases are skipped when there is no usable CUDA device *or* when the
+loaded extension was built without CUDA support (`WITH_CUDA=1` is opt-in, so a
+GPU machine can still run a CPU-only build); the CPU cases always run.
 """
 
 import unittest
 
 import torch
 
+from torch_ans import _C as _native_module
 from torch_ans._C import (
     rans_pmf_to_quantized_cdf,
     rans_stream_to_byte_strings,
@@ -28,10 +33,41 @@ from torch_ans._C import (
     rans32_16_alias_i4_pop,
     rans_alias_build_table,
 )
-from torch_ans.utils import TorchANSInterface
+from torch_ans.utils import TorchANSInterface, module_has_cuda
 
 NUM_DISTS = 8
 NUM_SYMBOLS = 7  # symbols per distribution (in-range values 0..6)
+
+#: error markers that mean "this environment cannot code CUDA tensors"
+_CUDA_UNAVAILABLE_MARKERS = (
+    "not compiled with GPU support",      # C++ AT_ERROR raised from rans.hpp
+    "CUDA coding was requested",          # RuntimeWarning/Error from utils.py
+    "could not be built for the local torch",
+)
+
+
+def _cuda_coding_skip_reason():
+    """Why CUDA coding cannot be exercised, or None when it can.
+
+    ``torch.cuda.is_available()`` alone is not enough: the CUDA kernels are
+    compiled in only when the extension was built with ``WITH_CUDA=1``, so a
+    machine with a GPU can still have a CPU-only build (see
+    ``torch_ans.utils.module_has_cuda``). A module that cannot report it - the
+    lazy shim, which compiles the extension on demand - is given the benefit of
+    the doubt and the test is allowed to run.
+    """
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    if module_has_cuda(_native_module) is False:
+        return ("the torch_ans extension was compiled without CUDA support "
+                "(build it with WITH_CUDA=1 to run this test)")
+    return None
+
+
+def _is_cuda_unavailable_error(error):
+    """Whether `error` reports an environment without CUDA coding support."""
+    message = str(error)
+    return any(marker in message for marker in _CUDA_UNAVAILABLE_MARKERS)
 
 
 def _generate_rans_params(freq_precision=12, bypass=True):
@@ -99,36 +135,44 @@ def _push(pop_params, init_interleaves=32):
 
 class TestRansWarpCuda(unittest.TestCase):
 
+    def _require_cuda_coding(self):
+        """Skip when the extension cannot code CUDA tensors.
+
+        Covers both "no GPU" and "GPU present, but the extension was compiled
+        without CUDA support"; the skip reason says which one it was.
+        """
+        reason = _cuda_coding_skip_reason()
+        if reason is not None:
+            self.skipTest(reason)
+
     def _roundtrip(self, shape, seed, freq_precision=12, bypass=True, invalid_ratio=0.0,
                    interleaves=32):
-        """GPU (or CPU) push -> serialize -> deserialize -> pop roundtrip."""
+        """CUDA push -> serialize -> deserialize -> pop roundtrip."""
+        self._require_cuda_coding()
         data, indexes, expected = _generate_data(shape, seed, invalid_ratio,
                                                  clamp_to_range=not bypass)
         params = _generate_rans_params(freq_precision, bypass=bypass)
         do_init, do_push, do_pop = _push(params, interleaves)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        stream = do_init(shape[0]).to(device)
+        stream = do_init(shape[0]).cuda()
         try:
-            do_push(stream, data.to(device), indexes.to(device), freq_precision, bypass)
+            do_push(stream, data.cuda(), indexes.cuda(), freq_precision, bypass)
         except RuntimeError as e:
-            if device == "cuda" and "not compiled with GPU support" in str(e):
-                self.skipTest("torch_ans is not compiled with GPU support")
+            if _is_cuda_unavailable_error(e):
+                self.skipTest(f"CUDA coding is unavailable: {e}")
             raise
-        if device == "cuda":
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         byte_strings = rans_stream_to_byte_strings(stream.cpu())
-        stream = rans_byte_strings_to_stream(byte_strings).to(device)
+        stream = rans_byte_strings_to_stream(byte_strings).cuda()
 
         try:
-            decoded = do_pop(stream, indexes.to(device), freq_precision, bypass)
+            decoded = do_pop(stream, indexes.cuda(), freq_precision, bypass)
         except RuntimeError as e:
-            if device == "cuda" and "not compiled with GPU support" in str(e):
-                self.skipTest("torch_ans is not compiled with GPU support")
+            if _is_cuda_unavailable_error(e):
+                self.skipTest(f"CUDA coding is unavailable: {e}")
             raise
-        if device == "cuda":
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         self.assertTrue(torch.equal(expected, decoded.cpu()),
                         f"roundtrip mismatch for shape={shape}, seed={seed}, "
@@ -161,8 +205,7 @@ class TestRansWarpCuda(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_cuda_warp32_roundtrip_sweep(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         shapes = [(1, 1), (3, 2), (2, 31), (2, 32), (1, 33), (2, 64), (5, 257), (7, 1000)]
         seed = 10
         for shape in shapes:
@@ -172,8 +215,7 @@ class TestRansWarpCuda(unittest.TestCase):
                     seed += 1
 
     def test_cuda_warp32_roundtrip_invalid_indexes(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         self._roundtrip((3, 130), seed=50, invalid_ratio=0.3)
 
     # ------------------------------------------------------------------
@@ -182,8 +224,7 @@ class TestRansWarpCuda(unittest.TestCase):
 
     def _bit_compat_case(self, shape, seed, freq_precision, bypass, invalid_ratio,
                          interleaves=32, data=None):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         if data is None:
             data, indexes, expected = _generate_data(shape, seed, invalid_ratio,
                                                      clamp_to_range=not bypass)
@@ -263,8 +304,7 @@ class TestRansWarpCuda(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_cuda_i4_roundtrip(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         data, indexes, expected = _generate_data((6, 140), seed=70, invalid_ratio=0.1)
         params = _generate_rans_params(12)
         do_init, do_push, do_pop = _push(params, 4)
@@ -283,8 +323,7 @@ class TestRansWarpCuda(unittest.TestCase):
         The fixture's cdf size (NUM_SYMBOLS + 2 = 9) makes cdfs_sizes - 1 = 8 a
         power of two, which is what the alias builder requires.
         """
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         cdfs, cdfs_sizes, offsets = _generate_rans_params(freq_precision=12)
         data, indexes, expected = _generate_data((8, 512), seed=7)
         alias_remap, alias_table = rans_alias_build_table(
@@ -320,8 +359,7 @@ class TestRansWarpCuda(unittest.TestCase):
 
     def test_cuda_i4_unsupported_variant_raises(self):
         # interleaved CUDA coding is rans32_16-only; other variants must fail loudly
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         data = torch.randint(0, 4, (2, 64), dtype=torch.int32)
         indexes = torch.randint(0, 2, (2, 64), dtype=torch.int32)
         cdfs = torch.tensor([[0, 128, 256], [0, 64, 256]], dtype=torch.int32)
@@ -360,8 +398,8 @@ class TestRansWarpCuda(unittest.TestCase):
                         self.assertTrue(
                             torch.equal(expected, do_pop(cpu_stream, indexes, freq_precision, True)))
 
-                        if not torch.cuda.is_available():
-                            continue
+                        if _cuda_coding_skip_reason() is not None:
+                            continue  # the CPU half above is still verified
                         gpu_stream = do_init(shape[0]).cuda()
                         do_push(gpu_stream, data.cuda(), indexes.cuda(), freq_precision, True)
                         torch.cuda.synchronize()
@@ -416,8 +454,7 @@ class TestRansWarpCuda(unittest.TestCase):
         return freqs, num_freqs, offsets
 
     def test_high_level_warp32_cuda(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         freqs, num_freqs, offsets = self._make_coder_params()
         coder = TorchANSInterface(
             impl="rans32_16", freq_precision=12, bypass_coding=True,
@@ -434,8 +471,7 @@ class TestRansWarpCuda(unittest.TestCase):
         self.assertTrue(torch.equal(symbols, decoded.cpu()))
 
     def test_high_level_warp32_streaming_cuda(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        self._require_cuda_coding()
         freqs, num_freqs, offsets = self._make_coder_params(seed=82)
         coder = TorchANSInterface(
             impl="rans32_16", freq_precision=12, bypass_coding=True,
