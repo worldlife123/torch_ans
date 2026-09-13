@@ -83,6 +83,19 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.doc() = "PyTorch based ANS entropy coding library.";
 
+    // Capability flag. Both build paths define WITH_CUDA for a CUDA build
+    // (setup.py's CUDAExtension and the runtime build's extra_cuda_cflags) and
+    // leave it undefined for a CPU-only one, so this attribute is the single
+    // reliable source of truth for "can this module code CUDA tensors?" - the
+    // Python layer uses it to explain the situation instead of letting the call
+    // fail with a bare "not compiled with GPU support!" (see torch_ans/utils.py
+    // and torch_ans/_lazy_C.py).
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    m.attr("_torch_ans_with_cuda") = py::bool_(true);
+#else
+    m.attr("_torch_ans_with_cuda") = py::bool_(false);
+#endif
+
     // m.def("rans_pmf_to_quantized_cdf", &rans_pmf_to_quantized_cdf);
 
     // Gated by the TORCH_ANS_WITH_* feature macros: with incremental

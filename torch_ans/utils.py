@@ -3,12 +3,13 @@ import torch
 import math
 import struct
 import io
+import os
+import warnings
 
 # from cbench.ans import Rans64Encoder, Rans64Decoder, TansEncoder, TansDecoder
 # TODO: provide a better impl of pmf_to_quantized_cdf in torch_ans
 # from cbench.rans import pmf_to_quantized_cdf, pmf_to_quantized_cdf_np
 
-from torch_ans import _C as _native_C
 from torch_ans import _dynamic_build as _build_config
 
 # ---------------------------------------------------------------------------
@@ -22,21 +23,132 @@ from torch_ans import _dynamic_build as _build_config
 # combination is ever resolved - that is what makes an incremental build
 # possible, since a module built for `impl="rans64"` does not export the
 # rans32 ops.
+#
+# `torch_ans._lazy_C` is the same shim, but always importable: a compiled
+# `_C*.so` shadows `torch_ans/_C.py` completely, so the lazy module is what the
+# fallbacks below switch to (unloadable pre-built extension, or CUDA support
+# required from one that was compiled without it).
 # ---------------------------------------------------------------------------
 
+#: Set to 1/true/yes to ignore a pre-built `torch_ans._C` and always compile for
+#: the local torch (see README "Runtime dynamic build").
+FORCE_RUNTIME_BUILD_ENV_VAR = "TORCH_ANS_FORCE_RUNTIME_BUILD"
 
-def _native_module(profile=None, incremental_compile=None):
+
+def _lazy_C():
+    """The lazy shim module, importable even next to a compiled `_C*.so`."""
+    from torch_ans import _lazy_C as shim
+    return shim
+
+
+def _import_native_c():
+    """`torch_ans._C` when it is usable, otherwise the lazy shim.
+
+    A pre-built extension is preferred (no compilation), but one compiled
+    against a different torch cannot be imported at all; falling back to the
+    shim compiles an extension for the *local* torch instead of failing.
+    """
+    if os.getenv(FORCE_RUNTIME_BUILD_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on"):
+        return _lazy_C()
+    try:
+        from torch_ans import _C as native
+        return native
+    except (ImportError, OSError) as exc:
+        warnings.warn(
+            f"the pre-built torch_ans native extension could not be loaded "
+            f"({type(exc).__name__}: {exc}); compiling one for the local torch "
+            f"instead (requires a C++ toolchain; the first call will be slow)",
+            RuntimeWarning, stacklevel=2)
+        return _lazy_C()
+
+
+_native_C = _import_native_c()
+
+
+def module_has_cuda(module):
+    """Whether `module` can code CUDA tensors, or None when it does not say.
+
+    The flag is compiled into the extension (torch_ans/lib.cpp), so it is
+    correct for both install-time and runtime builds. None means the module
+    cannot report it (the shim, or an extension predating the attribute).
+    """
+    # NOTE: the shim is checked first and must never be probed for the flag:
+    # its module-level __getattr__ would compile the whole extension to answer.
+    if getattr(module, "ensure_module", None) is not None:
+        return None  # the shim: the runtime build probes the CUDA toolchain itself
+    flag = getattr(module, "_torch_ans_with_cuda", None)
+    if flag is not None:
+        return bool(flag)
+    try:
+        # Extensions built before the attribute existed recorded the same
+        # information in the build metadata written by setup.py.
+        from torch_ans._torch_build_version import BUILD_WITH_CUDA
+        return bool(BUILD_WITH_CUDA)
+    except Exception:
+        return None
+
+
+def _runtime_native_module(profile=None, incremental_compile=None, require_cuda=False):
+    """Ask the lazy shim for a native module, optionally insisting on CUDA."""
+    shim = _lazy_C()
+    if profile is None or not _build_config.incremental_enabled(incremental_compile):
+        return shim.ensure_full(require_cuda=require_cuda)
+    return shim.ensure_module(profile, require_cuda=require_cuda)
+
+
+def _native_module(profile=None, incremental_compile=None, require_cuda=False):
     """Return the native module that provides `profile`'s operators.
 
     Falls back to `torch_ans._C` itself when that is a pre-built extension,
-    which always contains every operator.
+    which always contains every operator. With `require_cuda`, a pre-built
+    extension that cannot code CUDA tensors is rejected in favour of the runtime
+    build - only a build against the local torch can be trusted to match its
+    CUDA toolchain.
     """
     ensure = getattr(_native_C, "ensure_module", None)
     if not callable(ensure):
-        return _native_C
+        if not require_cuda or module_has_cuda(_native_C):
+            return _native_C
+        return _runtime_native_module(profile, incremental_compile, require_cuda=True)
     if profile is None or not _build_config.incremental_enabled(incremental_compile):
-        return ensure(None)  # the full build
-    return ensure(profile)
+        return ensure(None, require_cuda=require_cuda)  # the full build
+    return ensure(profile, require_cuda=require_cuda)
+
+
+def _requests_cuda(device, *tensors) -> bool:
+    """Whether `device` (or one of the tensors) puts the coding on a GPU."""
+    if device is not None:
+        try:
+            if torch.device(device).type == "cuda":
+                return True
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    # Duck-typed on purpose: only the device attributes matter here, and this is
+    # called on the hot path of every encode/decode.
+    return any(bool(getattr(tensor, "is_cuda", False)) for tensor in tensors)
+
+
+#: Raised when CUDA coding is requested but no CUDA-capable extension could be
+#: produced. Kept as a single string so the installation steps stay in one place.
+_CUDA_UNAVAILABLE_HINT = (
+    "torch_ans was asked to code CUDA tensors but the native extension in use "
+    "cannot, and a CUDA extension could not be built for the local torch.\n"
+    "Fixes (any one of them):\n"
+    "  * install a CUDA toolkit whose version matches the one your torch build "
+    "uses, make sure `nvcc` is on PATH and retry: the extension is then "
+    "compiled automatically on first use;\n"
+    "  * rebuild this package from source with CUDA enabled:\n"
+    "      WITH_CUDA=1 pip install . --no-build-isolation\n"
+    "    (installing the published source distribution is enough: "
+    "`pip install --no-binary torch_ans torch_ans --no-build-isolation`);\n"
+    "  * force the runtime build so an existing pre-built extension is "
+    "ignored:\n"
+    "      TORCH_ANS_FORCE_RUNTIME_BUILD=1\n"
+    "If an earlier CUDA build attempt already failed on this machine, delete the "
+    "`cuda_build_state` file from the torch extensions cache directory "
+    "(`~/.cache/torch_extensions/*/`) after fixing the toolchain, so the retry "
+    "is not short-circuited."
+)
 
 
 def _common_native_module():
@@ -1005,23 +1117,51 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                     )
                 self.inverse_cdf_precision = inverse_cdf_precision
 
-        # Resolve the native operators. With incremental compilation (the
-        # default, see incremental_compile) this builds a module with just the
-        # selected subset; a previously built superset - or a pre-built
-        # torch_ans._C - is reused as is.
-        self._native = _native_module(
-            _build_config.BuildProfile(
-                family=base_impl,
-                interleave=self.num_interleaves,
-                alias=self.alias_sampling,
-                invcdf=use_invcdf_decode),
-            incremental_compile)
+        # Everything needed to resolve (and later re-resolve) the operators: the
+        # native module is switched to a locally compiled, CUDA-capable one when
+        # a CUDA device is requested and the current build cannot code it (see
+        # _ensure_native_for).
+        self._impl_key = impl_key
+        self._base_impl = base_impl
+        self._incremental_compile = incremental_compile
+        self._configured_invcdf_decode = use_invcdf_decode
+        self._resolve_native()
+
+    def _build_profile(self):
+        """The build profile this interface needs (see _dynamic_build)."""
+        return _build_config.BuildProfile(
+            family=self._base_impl,
+            interleave=self.num_interleaves,
+            alias=self.alias_sampling,
+            invcdf=self._configured_invcdf_decode)
+
+    def _resolve_native(self, require_cuda: bool = False) -> None:
+        """(Re)resolve the native operators, optionally insisting on CUDA.
+
+        Cheap and idempotent: the shim reuses an already built module that
+        exports the requested operators, and a pre-built extension is used as is
+        (see `_native_module`).
+        """
+        # With incremental compilation (the default, see incremental_compile)
+        # this builds a module with just the selected subset; a previously built
+        # superset - or a pre-built torch_ans._C - is reused as is.
+        self._native = _native_module(self._build_profile(),
+                                      self._incremental_compile,
+                                      require_cuda=require_cuda)
+        # Cached so the per-call check in _ensure_native_for stays a single
+        # attribute lookup (encode/decode are hot paths). "Unknown" counts as
+        # capable: the runtime build probes CUDA itself.
+        self._native_cuda_capable = module_has_cuda(self._native) is not False
+        impl_key = self._impl_key
 
         def _bind(names):
             return tuple(getattr(self._native, name) for name in names)
 
         self.ans_init_func, self.ans_encode_func, self.ans_decode_func = _bind(RANS_IMPL_OP_NAMES[impl_key])
         self._binary_decode_func = self.ans_decode_func
+
+        self._decode_extra_kwargs = {}
+        self._invcdf_decode_func = None
 
         if self.alias_sampling:
             self.ans_encode_func, self.ans_decode_func = _bind(RANS_ALIAS_OP_NAMES[impl_key])
@@ -1031,9 +1171,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
         # Swap in the inverse-CDF decode op. NOTE: every (impl, interleaves)
         # combination that supports push/pop also has an inverse-CDF variant.
-        self._decode_extra_kwargs = {}
-        self._invcdf_decode_func = None
-        if use_invcdf_decode:
+        if self._configured_invcdf_decode:
             self._invcdf_decode_func = getattr(self._native, RANS_INVCDF_POP_OP_NAMES[impl_key])
             if self._inverse_cdf_auto:
                 # the numeric precision is decided in init_params, once the
@@ -1044,6 +1182,40 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             else:
                 self.ans_decode_func = self._invcdf_decode_func
                 self._decode_extra_kwargs = {"inverse_cdf_precision": self.inverse_cdf_precision}
+
+    def _ensure_native_for(self, *tensors) -> None:
+        """Make sure the native module can code the device the coding runs on.
+
+        `setup.py` only compiles CUDA support when `WITH_CUDA=1` is set
+        explicitly, so a build can lack it even on a machine with a GPU; a
+        runtime build can also have fallen back to CPU-only after a failed CUDA
+        attempt. Without this check the user only sees a bare "not compiled with
+        GPU support" from C++. Instead: warn, then compile a CUDA extension for
+        the local torch, and if that is impossible explain what to install.
+        """
+        # `_resolve_native` caches the verdict; fall back to asking the module
+        # (an interface that has not resolved yet, or a test double).
+        capable = getattr(self, "_native_cuda_capable", None)
+        if capable is None:
+            capable = module_has_cuda(self._native) is not False
+        if capable:
+            return
+        if not _requests_cuda(self.device, *tensors):
+            return
+        if not torch.cuda.is_available():
+            # No usable GPU here: let the C++ error describe the real problem.
+            return
+        warnings.warn(
+            "torch_ans: CUDA coding was requested but the loaded native "
+            "extension was compiled without CUDA support. Compiling a CUDA "
+            "extension for the local torch now (requires an nvcc matching the "
+            "CUDA version your torch build uses; this can take a few minutes "
+            "and happens only once).",
+            RuntimeWarning, stacklevel=3)
+        try:
+            self._resolve_native(require_cuda=True)
+        except Exception as exc:
+            raise RuntimeError(_CUDA_UNAVAILABLE_HINT) from exc
 
     def _init_stream(self, num_parallel_states=None, **kwargs) -> torch.Tensor:
         """
@@ -1073,6 +1245,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             num_freqs (torch.Tensor): Number of frequencies per distribution.
             offsets (torch.Tensor): Offset tensor for each distribution.
         """
+        # A pre-built (or CUDA-failed) extension may not be able to code the
+        # device the pmf/cdfs live on; switch to a locally built one if needed.
+        self._ensure_native_for(freqs)
+
         # cdfs = pmf_to_quantized_cdf_batched(freqs, add_tail=self.bypass_coding, freq_precision=self.freq_precision)
         # cdfs = torch.zeros(freqs.shape[0], num_freqs.max() + (2 if self.bypass_coding else 1), dtype=torch.int32)
         # for i, p in enumerate(freqs):
@@ -1147,7 +1323,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                      cdfs_sizes: Optional[torch.Tensor]=None,
                      offsets: Optional[torch.Tensor]=None,
                      **kwargs) -> torch.Tensor:
-        
+        # A pre-built (or CUDA-failed) extension may not be able to code the
+        # device these tensors live on; switch to a locally built one if needed.
+        self._ensure_native_for(symbols, stream)
+
         if stream is None:
             num_parallel_states = symbols.size(0) if self.num_parallel_states is None else self.num_parallel_states
             # assert num_parallel_states == symbols.size(0)
@@ -1189,7 +1368,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
         return stream
 
-    def _decode_func(self, stream, 
+    def _decode_func(self, stream,
                      dist_indexes: Optional[torch.Tensor]=None,
                      dist_freqs: Optional[torch.Tensor]=None, # aka freqs
                      dist_num_freqs: Optional[torch.Tensor]=None, # aka num_freqs
@@ -1199,6 +1378,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                      cdfs_sizes: Optional[torch.Tensor]=None,
                      offsets: Optional[torch.Tensor]=None,
                      **kwargs) -> torch.Tensor:
+        # See _encode_func: the stream tensor decides whether CUDA is needed.
+        self._ensure_native_for(stream)
+
         num_parallel_states = stream.size(0) if self.num_parallel_states is None else self.num_parallel_states
         
         

@@ -20,9 +20,13 @@ from torch_ans import utils
 
 
 def _load_shim():
-    """Import `torch_ans/_C.py` as a module even when a pre-built .so exists."""
-    path = os.path.join(os.path.dirname(utils.__file__), "_C.py")
-    spec = importlib.util.spec_from_file_location("torch_ans._C_shim_test", path)
+    """Import `torch_ans/_lazy_C.py` even when a pre-built .so exists.
+
+    The shim lives in `_lazy_C.py` because a compiled `torch_ans/_C*.so` shadows
+    `_C.py` completely (see torch_ans/_lazy_C.py).
+    """
+    path = os.path.join(os.path.dirname(utils.__file__), "_lazy_C.py")
+    spec = importlib.util.spec_from_file_location("torch_ans._lazy_C_shim_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -33,10 +37,17 @@ class FakeShim:
 
     def __init__(self):
         self.requests = []
+        self.cuda_requests = []
 
-    def ensure_module(self, profile=None, verbose=True):
+    def ensure_module(self, profile=None, verbose=True, require_cuda=False):
         self.requests.append(profile)
-        return types.SimpleNamespace(**{n: n for n in db.profile_op_names(profile)})
+        self.cuda_requests.append(require_cuda)
+        # `_torch_ans_with_cuda` mirrors the flag the compiled extension exposes
+        # (see torch_ans/lib.cpp); without it the shim reports "unknown" and
+        # utils.module_has_cuda() would treat the module as CUDA-incapable.
+        return types.SimpleNamespace(
+            _torch_ans_with_cuda=bool(require_cuda),
+            **{n: n for n in db.profile_op_names(profile)})
 
 
 @pytest.fixture
@@ -172,7 +183,7 @@ def test_shim_reuses_an_equivalent_or_larger_module(monkeypatch):
     shim = _load_shim()
     built = []
 
-    def fake_compile(module_name, defines, verbose=True):
+    def fake_compile(module_name, defines, verbose=True, require_cuda=False):
         built.append(module_name)
         for profile in _all_profiles():
             if db.profile_module_name(profile) == module_name:

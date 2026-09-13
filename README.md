@@ -19,7 +19,10 @@ This extension is designed as an efficient, extensible replacement to [torchac](
 - **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
 
 ## Installation
-It is highly recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
+
+`torch_ans` is distributed as a **source package**. The native extension is compiled **on your machine**, either at install time (`--no-build-isolation`, which needs a C++ toolchain) or lazily on first use (see [Runtime dynamic build](#runtime-dynamic-build)). Nothing is pinned to a particular PyTorch build: the extension is always compiled against the PyTorch you have installed, so there is no wheel-to-torch version to match. Pre-compiled wheels are deliberately not published - a wheel built against one torch version is not loadable by another.
+
+It is therefore recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
 
 
 ### From PyPI
@@ -27,6 +30,8 @@ It is highly recommended to install a specific version of [PyTorch](https://pyto
 ```bash
 pip install torch_ans --no-build-isolation
 ```
+
+This compiles the extension during installation, using the PyTorch that is already installed. Without `--no-build-isolation` the package still installs, but the extension is compiled later, on first use.
 
 To build with CUDA support:
 
@@ -39,7 +44,6 @@ To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation
 ```bash
 WITH_HIP=1 pip install torch_ans --no-build-isolation
 ```
-
 
 ### From source
 ```bash
@@ -57,6 +61,33 @@ To build with ROCm/AMDGPU support when using a ROCm-enabled PyTorch installation
 ```bash
 WITH_HIP=1 pip install . --no-build-isolation
 ```
+
+### CUDA support
+
+CUDA coding is **opt-in at build time**: `WITH_CUDA=1` is required, a visible GPU
+is not enough (the same holds for both install paths above). The CUDA toolkit must
+match the CUDA version your PyTorch build uses (`nvcc --version` vs
+`torch.version.cuda`), and `nvcc` must be on `PATH`.
+
+A CPU-only extension (the default) can still be used on a GPU machine, but only
+with CPU tensors. If it is asked to code CUDA tensors it does not fail silently:
+
+1. `torch_ans` emits a `RuntimeWarning` and compiles a CUDA extension for the
+   local torch on the spot (this needs the matching `nvcc`, and takes a few
+   minutes; the result is cached in `~/.cache/torch_extensions/`).
+2. If no CUDA extension can be produced, it raises a `RuntimeError` listing the
+   exact commands to fix it - install the toolkit, or rebuild from source with
+   `WITH_CUDA=1 pip install . --no-build-isolation`, or set
+   `TORCH_ANS_FORCE_RUNTIME_BUILD=1` to ignore a pre-built extension and always
+   compile locally.
+
+`TORCH_ANS_FORCE_RUNTIME_BUILD=1` is also useful on its own: it makes `torch_ans`
+ignore an existing compiled extension (for example one built by an earlier
+`pip install`) and compile for the local torch instead.
+
+### Tested PyTorch versions
+
+The CI matrix builds and runs the full test suite against **PyTorch 1.10.1 (Python 3.7), 2.1.1 (Python 3.9) and 2.7.1 (Python 3.11)** on Linux, macOS and Windows, plus an ARM64 Linux job and a lazy-compile job that installs without a compiler. Newer releases (e.g. 2.11) work for the same reason as any other: the extension is compiled locally against the torch that is installed.
 
 ## Usage
 
@@ -544,6 +575,8 @@ This library is developed for research-purpose only, and not as a robust everyda
 
 ### Known Issues
 - Rans64 cuda coding test fails on some newer GPU architectures.
+- **No pre-compiled wheels are published**: installing requires a C++ toolchain (and `nvcc` for CUDA coding), and the extension is compiled against your local PyTorch. This is intentional - a wheel compiled against one torch build cannot be loaded by another, and shipping one would break the `import` on every other version.
+- **CUDA coding is off unless the extension was built with `WITH_CUDA=1`**: a CPU-only extension on a GPU machine only codes CPU tensors. Asking it for CUDA tensors triggers the automatic local CUDA build described in [CUDA support](#cuda-support); if that is not possible you get the commands to install/fix it.
 - **CUDA build fails with `std_function.h: parameter packs not expanded with '...'`**: `nvcc <= 12.1` cannot parse the `std::function` headers shipped with `libstdc++` from GCC >= 11.4 (e.g. Ubuntu 22.04.3+), so compiling CUDA extensions with the default `g++` fails. Fixes (any one of them):
   - Use an older host compiler for nvcc, e.g. `g++-10` (install with `apt install g++-10`). The runtime dynamic build detects this automatically: when a CUDA build fails, it retries with `g++-10`/`g++-9`/`g++-8` (`-ccbin`) before falling back to CPU-only, and remembers the working configuration in the torch extensions cache directory (`cuda_build_state`).
   - Use `nvcc >= 12.2`, which supports the newer libstdc++ headers.
@@ -590,9 +623,13 @@ This produces Python coverage output in `htmlcov/` and native C/C++ coverage out
 
 ## Runtime dynamic build
 
-If you installed a prebuilt wheel the native extension `torch_ans._C` is used automatically.
-If the compiled extension is not present (for example when installing from source without building),
-`torch_ans` can compile the native C++/CUDA sources at runtime using PyTorch's `cpp_extension`.
+If a compiled extension is already present (for example one built by `pip install . --no-build-isolation`),
+it is used as is. Otherwise - e.g. when the package was installed without a compiler - `torch_ans` compiles
+the native C++/CUDA sources at runtime using PyTorch's `cpp_extension`, on the first *use* of an operator.
+
+An extension that cannot be loaded (built against another PyTorch, or with a different ABI) does not break
+the import: `torch_ans` warns and falls back to compiling one for the local torch. Set
+`TORCH_ANS_FORCE_RUNTIME_BUILD=1` to always take that path and ignore any pre-built extension.
 
 - Trigger runtime build programmatically:
 
@@ -607,6 +644,7 @@ import torch_ans
   - The runtime build tries CUDA first and falls back to CPU-only automatically when no usable CUDA runtime or toolchain is available. For CUDA builds you must have a compatible CUDA toolkit and driver installed (see Known Issues for nvcc/GCC compatibility).
   - CPU parallel coding relies on OpenMP: `at::parallel_for` in the native code is multi-threaded only when the extension is compiled with OpenMP enabled. The runtime build enables it automatically on Linux (GCC `-fopenmp`) and Windows (MSVC `/openmp`); on macOS it uses Homebrew libomp (`-Xpreprocessor -fopenmp -lomp`) when installed, and falls back to single-threaded coding otherwise.
   - If your runtime PyTorch ABI differs from the build-time one, `torch_ans` will warn by default. Set `TORCH_ANS_STRICT_CHECK=1` to re-enable a strict ImportError on mismatch.
+  - A compiled `torch_ans/_C*.so` shadows `torch_ans/_C.py` completely, so the lazy implementation lives in `torch_ans/_lazy_C.py` (always importable). That is what the fallbacks switch to: an extension that fails to load, and a CPU-only extension that is asked to code CUDA tensors (see [CUDA support](#cuda-support)).
   - To keep CI/tests stable, the bundled test for dynamic build is guarded; enable it with `RUN_DYNAMIC_BUILD_TEST=1` when you want to run the rebuild test locally.
 
 

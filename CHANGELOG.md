@@ -7,12 +7,15 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 ## [Unreleased]
 
 
-## [0.3.0] - 2026-09-xx
+## [0.3.0] - 2026-09-13
+
+v0.3.0 includes a major performance overhaul for both CPU and GPU.
 
 ### Added
 
 - Warp-level 32-way interleaved rANS coding on CUDA for `rans32_16` (`rans32_16_i32_*`), one warp sharing a single bitstream cursor, bit-compatible with the CPU interleaved layout. Also fixed the broken 4-way CUDA interleaved path (routed to 4-lane sub-warp kernels; other variants raise a clear error), exposed `num_interleaves` in `TorchANSInterface`, and fixed `impl="rans32_16"` being shadowed by the `"rans32"` prefix match.
-- A sparse inverse-CDF symbol lookup for decode (`inverse_cdf_precision` int or `"auto"`): `2**q`-entry table plus a bounded walk, staged into shared memory on the CUDA 32-way warp path (decode ~6 -> ~26 Gsymbol/s on RTX 2080 Ti). Also fuses `pmf -> quantized cdf` and `cdf ++ inverse table` into single-pass implementations (2-4x faster `init_params`), adds the missing `rans64_i4_invcdf_pop` binding, and documents design and measurements in `SPARSE_INVCDF_SUMMARY.md`.
+- Runtime-build fallbacks so a compiled extension is never a dead end: an extension that cannot be imported (compiled against another torch) falls back to compiling one for the local torch instead of failing the import, and a CPU-only extension that is asked to code CUDA tensors warns and compiles a CUDA extension locally - or raises with the exact commands to fix the toolchain instead of a bare "not compiled with GPU support" from C++. The new `TORCH_ANS_FORCE_RUNTIME_BUILD=1` ignores any pre-built extension and always compiles for the local torch.
+- A sparse inverse-CDF symbol lookup for decode (`inverse_cdf_precision` int or `"auto"`): `2**q`-entry table plus a bounded walk, staged into shared memory on the CUDA 32-way warp path (decode ~6 -> ~26 Gsymbol/s on RTX 2080 Ti). Also fuses `pmf -> quantized cdf` and `cdf ++ inverse table` into single-pass implementations (2-4x faster `init_params`), adds the missing `rans64_i4_invcdf_pop` binding.
 - Interleaved variants of the alias-sampling coder (`*_alias_i2/i4/i8_*`, new `alias_sampling=True` option), with batched symbol lookup; `rans_alias_build_table` now fails loudly on invalid input.
 - `scripts/bench_version_matrix.py` (raw-operator matrix: device x family x `num_interleaves` x symbol lookup, plus the `init_params` build steps and the high-level API; driven through the low-level ops so operators that exist in only one release are reported as `n/a` instead of failing, and every configuration is round-trip checked before it is timed) and `scripts/generate_benchmark_report.py`, which renders `benchmark_status.md` from two of its JSON outputs. `benchmark_status.md` now holds a measured v0.2.1 -> v0.3.0 comparison (i7-6800K / RTX 2080 Ti): CPU decode 1.27-1.44x at the default configuration and 2.40-2.75x at `num_interleaves=4`, CUDA 1-way unchanged, new CUDA 32-way warp path at ~26 Gsymbol/s, `pmf -> cdf` 6-11x faster and inverse-CDF table build 60-600x faster.
 
@@ -21,10 +24,13 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 - CPU interleaved coding is now much faster: ~1.25-1.4x encode / ~1.8-2.1x decode at `num_interleaves=4` (previously a slight slowdown). Achieved via branch-free renormalization, pipelined division (`rans_divmod`), and register-resident interleaved states (see `rans_cpu.cpp` / `rans_utils.hpp`).
 - New default symbol lookup is branch-free (monotone predicate search), removing binary-search mispredicts in non-interleaved decoding.
 - Inverse-CDF table gap closing is branch-free (`rans_invcdf_advance`, fixed `RANS_INVCDF_WINDOW`=2 parallel loads), making the table the fastest CPU decode lookup at every alphabet size. `num_interleaves=32` remains CUDA-only.
+- Package metadata now comes from `pyproject.toml` (PEP 621, `setuptools>=61`), including the project URLs. `setup.py` only mirrors it when the installed setuptools is older than 61, which ignores `[project]` entirely - that is the `pip install . --no-build-isolation` case, where dropping the mirror would silently produce an `UNKNOWN` distribution with no dependencies. `tests/test_packaging_metadata.py` keeps the two in sync.
+- The extension compiled at install time is described by a compiled-in `_torch_ans_with_cuda` flag (see `lib.cpp`) rather than by generated metadata, so the Python layer can tell whether the loaded build can code CUDA tensors.
 
 ### Fixed
 
 - CUDA build failed to import (`undefined symbol`) for `*_i2_*`/`*_i8_*` and interleaved alias/inverse-CDF combinations due to missing CUDA instantiations; all bound combinations now have one, unsupported ones raise a clear error (interleaved CUDA coding is rans32_16-only).
+- The sdist could miss the native headers it needs to build (`rans_bindings.hpp`, `rans_build_config.hpp`): setuptools does not recompute the manifest when new source files appear, and the file list was never declared. `MANIFEST.in` now lists the sources explicitly and excludes generated or stale artifacts (`torch_ans/_torch_build_version.py`, `*.so`) so a leftover local `_C*.so` can never shadow `torch_ans/_C.py` in a distribution.
 
 ### Removed
 

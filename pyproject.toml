@@ -1,11 +1,15 @@
 [build-system]
-requires = ["setuptools<60", "wheel", "pybind11"]
+# `[project]` (PEP 621) static metadata requires setuptools >= 61. Keeping the
+# lower bound explicit also guarantees an isolated build never silently falls
+# back to the legacy setup.py-only metadata path, which would produce an
+# "UNKNOWN" distribution.
+requires = ["setuptools>=61", "wheel", "pybind11"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch_ans"
-version = "0.2.1.post1"
-description = "PyTorch extension for ANS-based compression (C++/CUDA)"
+version = "0.3.0"
+description = "PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)"
 authors = [
     { name="worldlife", email="worldlife@sjtu.edu.cn" }
 ]
@@ -16,13 +20,20 @@ dependencies = [
     "ninja"
 ]
 readme = { file = "README.md", content-type = "text/markdown" }
+# NOTE: the TOML-table form is deprecated in favour of an SPDX string
+# (`license = "MIT"` + `license-files = ["LICENSE"]`) by setuptools >= 77, but
+# that form requires >= 77 while this project still builds on Python 3.7 (where
+# the newest available setuptools is 68.x). setuptools removes the table form on
+# 2027-02-18, so this has to be migrated once Python 3.7 support is dropped.
 license = { file="LICENSE" }
+
+[project.urls]
+Homepage = "https://github.com/worldlife123/torch_ans"
+Repository = "https://github.com/worldlife123/torch_ans"
+Issues = "https://github.com/worldlife123/torch_ans/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "gcovr"]
-
-[tool.setuptools.packages.find]
-exclude = ["tests"]
 
 [tool.pytest.ini_options]
 # addopts = "--cov=torch_ans --cov-report=html --cov-report=term-missing"

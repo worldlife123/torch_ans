@@ -1,1 +1,31 @@
 include CHANGELOG.md
+include README.md
+include LICENSE
+
+# Documentation and reproducible-measurement files referenced from the README
+include benchmark_status.md
+include build_status.md
+
+# Native sources. `*.hpp` is the hard requirement: rans_bindings.hpp and
+# rans_build_config.hpp are needed to build the extension from the sdist, and
+# setuptools does not recompute the manifest when new source files appear
+# (torch_ans.egg-info/SOURCES.txt can be stale), so they are listed explicitly.
+recursive-include torch_ans *.hpp *.cuh *.cpp *.cu
+
+# Written by setup.py at build time. It must not be shipped from the working
+# tree: when the extension build is skipped (isolated build without torch) a
+# stale copy would make a pure-Python install claim it was compiled with an
+# unrelated torch version.
+exclude torch_ans/_torch_build_version.py
+
+recursive-include scripts *.py *.sh
+recursive-include tests *.py
+recursive-include examples *.py
+
+# Never ship build artifacts: a stale torch_ans/_C*.so in the source tree would
+# shadow torch_ans/_C.py and be loaded instead of being compiled locally.
+global-exclude *.so *.pyc
+prune build
+prune dist
+prune .github
+prune .codebuddy

@@ -141,16 +141,44 @@ elif want_build:
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"), encoding="utf-8") as _f:
     _long_description = _f.read()
 
+
+def _setuptools_reads_pyproject_metadata() -> bool:
+    """True when the running setuptools reads `[project]` from pyproject.toml.
+
+    Isolated builds always have it (`build-system.requires` pins
+    `setuptools>=61`), but `pip install . --no-build-isolation` runs with
+    whatever setuptools the user already has, and versions below 61 ignore the
+    `[project]` table completely.
+    """
+    try:
+        import setuptools
+        major, minor = (int(part) for part in setuptools.__version__.split(".")[:2])
+        return (major, minor) >= (61, 0)
+    except Exception:
+        return False
+
+
+#: Mirrors `[project]` in pyproject.toml and is passed *only* on the legacy
+#: setuptools path, where `[project]` is ignored: without it that build would
+#: silently produce an "UNKNOWN" distribution with no dependencies. Keeping the
+#: mirror out of the modern path leaves `[project]` as the single source of truth
+#: and avoids setuptools' "overwritten in pyproject.toml" warnings. Bump the
+#: version in both places: tests/test_packaging_metadata.py checks they agree.
+_LEGACY_METADATA = {
+    "name": "torch_ans",
+    "version": "0.3.0",
+    "description": "PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
+    "long_description": _long_description,
+    "long_description_content_type": "text/markdown",
+    "license": "MIT",
+    "author": "worldlife",
+    "author_email": "worldlife@sjtu.edu.cn",
+    "url": "https://github.com/worldlife123/torch_ans",
+    "install_requires": ["torch>=1.10", "pybind11", "ninja"],
+    "python_requires": ">=3.7",
+}
+
 setup(
-    name="torch_ans",
-    version="0.2.1.post1",
-    description="PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
-    long_description=_long_description,
-    long_description_content_type="text/markdown",
-    license="MIT",
-    author="worldlife",
-    author_email="worldlife@sjtu.edu.cn",
-    url="https://github.com/worldlife123/torch_ans",
     packages=["torch_ans"],
     include_package_data=True,
     package_data={
@@ -167,6 +195,5 @@ setup(
     },
     ext_modules=ext_modules,
     cmdclass=cmdclass,
-    install_requires=["torch>=1.10", "pybind11", "ninja"],
-    python_requires=">=3.7",
+    **({} if _setuptools_reads_pyproject_metadata() else _LEGACY_METADATA),
 )

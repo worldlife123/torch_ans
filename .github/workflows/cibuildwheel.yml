@@ -1,4 +1,15 @@
-name: Build wheels (cibuildwheel template)
+name: Build wheels (pure Python, artifacts only)
+
+# v0.3.0 does NOT publish wheels: the released artifact is the sdist, and the
+# native extension is compiled on the user's machine (on the first import, or at
+# install time with `pip install --no-build-isolation`). Distribution wheels
+# would pin the extension to the torch build they were compiled against, which
+# is exactly what this release avoids; see the README.
+#
+# This workflow therefore builds the pure-Python wheel (`py3-none-any`, no
+# `_C*.so`) with SKIP_BUILD_EXT=1, as a smoke test that the package also installs
+# without a compiler. Artifacts are uploaded for inspection only - there is no
+# publish job.
 
 on:
   push:
@@ -8,13 +19,11 @@ on:
 
 jobs:
   build:
-    name: Build wheels for target PyTorch versions
+    name: Build pure-Python wheel for target Python versions
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python: ["3.10"]
-        torch_version: ["2.4.1"]
-        cuda: ["cpu"]
 
     steps:
       - name: Checkout
@@ -30,27 +39,39 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install cibuildwheel
 
-      - name: Build wheels with cibuildwheel (preinstall target torch)
+      - name: Build wheels with cibuildwheel
         env:
           # Limit builds to cp${{ matrix.python }} ABI patterns if desired
           CIBW_BUILD: "cp310-*"
-          # Pre-install the target torch in the build environment before building wheels
-          CIBW_BEFORE_BUILD: |
-            if [ "${{ matrix.cuda }}" = "cpu" ]; then
-              pip install torch==${{ matrix.torch_version }}
-            else
-              pip install torch==${{ matrix.torch_version }} --extra-index-url https://download.pytorch.org/whl/${{ matrix.cuda }}
-            fi
+          # Skip the native extension: this wheel must stay pure Python (the
+          # extension is compiled per user, matching their torch). Also removes
+          # the need to install torch in the build environment.
+          CIBW_ENVIRONMENT: "SKIP_BUILD_EXT=1"
         run: |
           python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Assert the wheel is pure Python
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, zipfile
+          wheels = glob.glob("wheelhouse/*.whl")
+          assert wheels, "no wheel was produced"
+          for wheel in wheels:
+              names = zipfile.ZipFile(wheel).namelist()
+              natives = [n for n in names if n.endswith((".so", ".pyd", ".dylib"))]
+              assert not natives, f"{wheel} unexpectedly ships native code: {natives}"
+          print("pure-Python wheel(s):", wheels)
+          PY
 
       - name: Upload built wheels
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.python }}-torch-${{ matrix.torch_version }}-${{ matrix.cuda }}
+          name: wheels-${{ matrix.python }}
           path: wheelhouse/*.whl
 
 # NOTES:
-# - This is a template. Adapt Python versions, torch versions, and CUDA tags to your needs.
-# - For production, extend matrix to other Python versions and configure manylinux/Windows/macOS builds.
-# - Ensure sufficient runner resources and timeouts for cibuildwheel; building many wheels can take significant time.
+# - This is a template. Adapt Python versions to your needs.
+# - To publish wheels in a future release, they must be built with the target
+#   torch installed and `--no-build-isolation` (so that `_C` is really
+#   compiled), and that wheel then only matches that torch version.
