@@ -14,6 +14,8 @@ import unittest
 
 import torch
 
+from cuda_helpers import is_cuda_unavailable_error, require_cuda_coding
+
 
 class TestIndexRangeCheckLowLevel(unittest.TestCase):
 
@@ -82,13 +84,12 @@ class TestIndexRangeCheckLowLevel(unittest.TestCase):
         self.assertTrue((decoded == 0).all())
 
     def test_cuda_push_pop_mixed_invalid_indexes(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
         try:
             self._roundtrip_with_corrupted_indexes("cuda", "mixed")
         except RuntimeError as e:
-            if "not compiled with GPU support" in str(e):
-                self.skipTest("torch_ans is not compiled with GPU support")
+            if is_cuda_unavailable_error(e):
+                self.skipTest(f"CUDA coding is unavailable: {e}")
             raise
 
 

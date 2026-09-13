@@ -9,6 +9,9 @@ import time
 import unittest
 import functools
 
+from cuda_helpers import is_cuda_unavailable_error, require_cuda_coding
+
+
 class TestTorchANS(unittest.TestCase):
 
     def _generate_rans_params(self, num_dists, num_symbols, freq_precision=16, device="cpu"):
@@ -120,9 +123,8 @@ class TestTorchANS(unittest.TestCase):
         except RuntimeError as e:
             print(e)
             # If the native extension wasn't compiled with GPU support, skip this CUDA variant gracefully
-            if device == "cuda" and "not compiled with GPU support" in str(e):
-                # print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
-                self.skipTest("torch_ans is not compiled with GPU support")
+            if device == "cuda" and is_cuda_unavailable_error(e):
+                self.skipTest(f"CUDA coding is unavailable: {e}")
                 return
             raise e
         byte_strings = rans_stream_to_byte_strings(stream.cpu() if device == "cuda" else stream)
@@ -138,9 +140,8 @@ class TestTorchANS(unittest.TestCase):
         try:
             decoded = pop_func(stream)
         except RuntimeError as e:
-            if device == "cuda" and "not compiled with GPU support" in str(e):
-                # print("Skipping CUDA variant: torch_ans is not compiled with GPU support")
-                self.skipTest("torch_ans is not compiled with GPU support")
+            if device == "cuda" and is_cuda_unavailable_error(e):
+                self.skipTest(f"CUDA coding is unavailable: {e}")
                 return
             raise
         if device == "cuda":
@@ -303,8 +304,7 @@ class TestTorchANS(unittest.TestCase):
         )
 
     def test_rans32_cuda_batch_coding(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
 
         from torch_ans._C import rans32_init_stream, rans32_push, rans32_pop
 
@@ -319,8 +319,7 @@ class TestTorchANS(unittest.TestCase):
         )
 
     def test_rans64_cuda_batch_coding(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
 
         from torch_ans._C import rans64_init_stream, rans64_push, rans64_pop
 
@@ -361,8 +360,7 @@ class TestTorchANS(unittest.TestCase):
         )
 
     def test_rans32_16_cuda_batch_coding(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
 
         from torch_ans._C import rans32_16_init_stream, rans32_16_push, rans32_16_pop
 
@@ -403,8 +401,7 @@ class TestTorchANS(unittest.TestCase):
         )
 
     def test_rans32_alias_cuda_batch_coding(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
 
         from torch_ans._C import rans32_init_stream, rans32_alias_push, rans32_alias_pop
 
@@ -419,8 +416,7 @@ class TestTorchANS(unittest.TestCase):
         )
 
     def test_rans64_alias_cuda_batch_coding(self):
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is not available")
+        require_cuda_coding(self)
 
         from torch_ans._C import rans64_init_stream, rans64_alias_push, rans64_alias_pop
 

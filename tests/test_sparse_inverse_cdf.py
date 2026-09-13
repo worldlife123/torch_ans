@@ -30,6 +30,8 @@ from torch_ans._C import (
 )
 from torch_ans.utils import TorchANSInterface, auto_inverse_cdf_precision, inverse_quantized_cdf
 
+from cuda_helpers import cuda_coding_skip_reason, require_cuda_coding
+
 NUM_DISTS = 6
 NUM_SYMBOLS = 9  # in-range values are 0..NUM_SYMBOLS-1
 
@@ -73,14 +75,18 @@ def _generate_data(shape, seed, invalid_ratio=0.0, clamp_to_range=False,
     return data, indexes, expected
 
 
-def _cuda_usable():
-    if not torch.cuda.is_available():
-        return False
+def _require_cuda(case):
+    """Skip `case` unless the CUDA variants can be exercised here.
+
+    A GPU is not enough: the extension must have been built with CUDA support
+    (`cuda_helpers.require_cuda_coding`), and the driver/toolkit must actually
+    be able to create a device tensor.
+    """
+    require_cuda_coding(case)
     try:
-        _ = torch.zeros(1, dtype=torch.int32).cuda()
-        return True
-    except Exception:
-        return False
+        torch.zeros(1, dtype=torch.int32).cuda()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        case.skipTest(f"CUDA tensors cannot be created: {exc}")
 
 
 class TestSparseInverseCDFTable(unittest.TestCase):
@@ -160,6 +166,8 @@ class TestSparseInverseCDFRoundtrip(unittest.TestCase):
 
     def _run(self, device, freq_precision, table_precisions, bypass, num_symbols,
              shape, seed, interleaves=32, invalid_ratio=0.0):
+        if device == "cuda":
+            _require_cuda(self)
         data, indexes, expected = _generate_data(
             shape, seed, invalid_ratio=invalid_ratio, clamp_to_range=not bypass,
             num_symbols=num_symbols)
@@ -216,27 +224,23 @@ class TestSparseInverseCDFRoundtrip(unittest.TestCase):
                   invalid_ratio=0.3)
 
     def test_cuda_warp32_sparse_sweep(self):
-        if not _cuda_usable():
-            self.skipTest("CUDA is not available")
+        _require_cuda(self)
         self._run("cuda", 12, [12, 10, 8, 6, 4, 1], True, NUM_SYMBOLS, (3, 200), seed=7)
         self._run("cuda", 15, [15, 11, 8, 4], True, NUM_SYMBOLS, (2, 96), seed=8)
         self._run("cuda", 8, [8, 5, 2], True, NUM_SYMBOLS, (5, 257), seed=9)
 
     def test_cuda_warp32_no_bypass(self):
-        if not _cuda_usable():
-            self.skipTest("CUDA is not available")
+        _require_cuda(self)
         self._run("cuda", 12, [12, 9, 6], False, NUM_SYMBOLS, (2, 128), seed=10)
 
     def test_cuda_non_warp_sparse_sweep(self):
-        if not _cuda_usable():
-            self.skipTest("CUDA is not available")
+        _require_cuda(self)
         self._run("cuda", 12, [12, 8, 4], True, NUM_SYMBOLS, (3, 100), seed=11,
                   interleaves=1)
 
     def test_cpu_cuda_agree_bit_for_bit(self):
         """The same stream decodes identically on CPU and on the warp kernel."""
-        if not _cuda_usable():
-            self.skipTest("CUDA is not available")
+        _require_cuda(self)
         data, indexes, expected = _generate_data((4, 300), seed=12)
         cdfs, cdfs_sizes, offsets = _generate_rans_params(12)
         stream = rans32_16_init_stream(4, 32)
@@ -270,6 +274,8 @@ class TestTorchANSInterfaceSparseInverseCDF(unittest.TestCase):
         return freqs, num_freqs, offsets
 
     def _roundtrip(self, device, inverse_cdf_precision, freq_precision=12, seed=21):
+        if device == "cuda":
+            _require_cuda(self)
         freqs, num_freqs, offsets = self._params(seed=seed)
         coder = TorchANSInterface(
             impl="rans32_16", freq_precision=freq_precision, bypass_coding=True,
@@ -295,8 +301,7 @@ class TestTorchANSInterfaceSparseInverseCDF(unittest.TestCase):
                 self._roundtrip("cpu", q)
 
     def test_cuda_high_level_sparse(self):
-        if not _cuda_usable():
-            self.skipTest("CUDA is not available")
+        _require_cuda(self)
         for q in (12, 8, 5):
             with self.subTest(table_precision=q):
                 self._roundtrip("cuda", q)
@@ -312,7 +317,7 @@ class TestTorchANSInterfaceSparseInverseCDF(unittest.TestCase):
         # C2: the rans64 + 4-interleaves inverse-CDF combination used to be
         # missing; it must roundtrip like every other supported combination
         for device in ("cpu", "cuda"):
-            if device == "cuda" and not torch.cuda.is_available():
+            if device == "cuda" and cuda_coding_skip_reason() is not None:
                 continue
             with self.subTest(device=device):
                 self._roundtrip(device, inverse_cdf_precision=8)
@@ -330,6 +335,8 @@ class TestAutoInverseCDF(unittest.TestCase):
     """C1: inverse_cdf_precision="auto" picks the precision from the alphabet."""
 
     def _run(self, device, num_symbols, freq_precision=15, seed=31):
+        if device == "cuda":
+            _require_cuda(self)
         g = torch.Generator().manual_seed(seed)
         freqs = torch.randint(1, 100, (NUM_DISTS, num_symbols), generator=g).float()
         num_freqs = torch.zeros(NUM_DISTS, dtype=torch.int32) + num_symbols
@@ -348,7 +355,7 @@ class TestAutoInverseCDF(unittest.TestCase):
         return coder, symbols, decoded
 
     def test_auto_roundtrip_and_precision(self):
-        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        devices = ["cpu"] + (["cuda"] if cuda_coding_skip_reason() is None else [])
         for device in devices:
             for num_symbols in (256, 1024):
                 with self.subTest(device=device, num_symbols=num_symbols):
@@ -430,7 +437,7 @@ class TestFusedBuilders(unittest.TestCase):
 
     def test_build_cdf_with_inverse_table_matches_reference(self):
         from torch_ans.utils import build_cdf_with_inverse_table
-        devices = ("cpu",) + (("cuda",) if torch.cuda.is_available() else ())
+        devices = ("cpu",) + (("cuda",) if cuda_coding_skip_reason() is None else ())
         for device in devices:
             for num_symbols, q in ((256, 7), (256, 15), (64, 6)):
                 with self.subTest(device=device, num_symbols=num_symbols, q=q):
@@ -442,7 +449,7 @@ class TestFusedBuilders(unittest.TestCase):
                     self.assertTrue(torch.equal(combined, expected))
 
     def test_inverse_quantized_cdf_matches_broadcast(self):
-        devices = ("cpu",) + (("cuda",) if torch.cuda.is_available() else ())
+        devices = ("cpu",) + (("cuda",) if cuda_coding_skip_reason() is None else ())
         for device in devices:
             for q in (6, 9, 15):
                 with self.subTest(device=device, q=q):
@@ -452,7 +459,7 @@ class TestFusedBuilders(unittest.TestCase):
                     self.assertTrue(torch.equal(ref, new))
 
     def test_fused_pmf_to_quantized_cdf_matches_reference(self):
-        devices = ("cpu",) + (("cuda",) if torch.cuda.is_available() else ())
+        devices = ("cpu",) + (("cuda",) if cuda_coding_skip_reason() is None else ())
         for device in devices:
             for num_symbols, precision in ((66, 12), (258, 15)):
                 for kind in ("uniform", "many_zeros", "one_hot"):

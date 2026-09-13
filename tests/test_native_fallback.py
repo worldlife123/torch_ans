@@ -51,6 +51,8 @@ def test_import_native_c_falls_back_to_lazy_shim(monkeypatch):
     """A pre-built extension that fails to import must not break the package."""
     import torch_ans
 
+    # Otherwise the force flag short-circuits before the import is attempted.
+    monkeypatch.delenv(utils.FORCE_RUNTIME_BUILD_ENV_VAR, raising=False)
     monkeypatch.delattr(torch_ans, "_C", raising=False)
     # `None` in sys.modules makes the import machinery raise ImportError, which
     # is what a torch-ABI mismatch of a pre-built extension looks like.

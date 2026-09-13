@@ -14,7 +14,6 @@ import unittest
 
 import torch
 
-from torch_ans import _C as _native_module
 from torch_ans._C import (
     rans_pmf_to_quantized_cdf,
     rans_stream_to_byte_strings,
@@ -33,41 +32,13 @@ from torch_ans._C import (
     rans32_16_alias_i4_pop,
     rans_alias_build_table,
 )
-from torch_ans.utils import TorchANSInterface, module_has_cuda
+from torch_ans.utils import TorchANSInterface
+
+from cuda_helpers import (cuda_coding_skip_reason, is_cuda_unavailable_error,
+                          require_cuda_coding)
 
 NUM_DISTS = 8
 NUM_SYMBOLS = 7  # symbols per distribution (in-range values 0..6)
-
-#: error markers that mean "this environment cannot code CUDA tensors"
-_CUDA_UNAVAILABLE_MARKERS = (
-    "not compiled with GPU support",      # C++ AT_ERROR raised from rans.hpp
-    "CUDA coding was requested",          # RuntimeWarning/Error from utils.py
-    "could not be built for the local torch",
-)
-
-
-def _cuda_coding_skip_reason():
-    """Why CUDA coding cannot be exercised, or None when it can.
-
-    ``torch.cuda.is_available()`` alone is not enough: the CUDA kernels are
-    compiled in only when the extension was built with ``WITH_CUDA=1``, so a
-    machine with a GPU can still have a CPU-only build (see
-    ``torch_ans.utils.module_has_cuda``). A module that cannot report it - the
-    lazy shim, which compiles the extension on demand - is given the benefit of
-    the doubt and the test is allowed to run.
-    """
-    if not torch.cuda.is_available():
-        return "CUDA is not available"
-    if module_has_cuda(_native_module) is False:
-        return ("the torch_ans extension was compiled without CUDA support "
-                "(build it with WITH_CUDA=1 to run this test)")
-    return None
-
-
-def _is_cuda_unavailable_error(error):
-    """Whether `error` reports an environment without CUDA coding support."""
-    message = str(error)
-    return any(marker in message for marker in _CUDA_UNAVAILABLE_MARKERS)
 
 
 def _generate_rans_params(freq_precision=12, bypass=True):
@@ -136,14 +107,8 @@ def _push(pop_params, init_interleaves=32):
 class TestRansWarpCuda(unittest.TestCase):
 
     def _require_cuda_coding(self):
-        """Skip when the extension cannot code CUDA tensors.
-
-        Covers both "no GPU" and "GPU present, but the extension was compiled
-        without CUDA support"; the skip reason says which one it was.
-        """
-        reason = _cuda_coding_skip_reason()
-        if reason is not None:
-            self.skipTest(reason)
+        """Skip when the extension cannot code CUDA tensors (see cuda_helpers)."""
+        require_cuda_coding(self)
 
     def _roundtrip(self, shape, seed, freq_precision=12, bypass=True, invalid_ratio=0.0,
                    interleaves=32):
@@ -158,7 +123,7 @@ class TestRansWarpCuda(unittest.TestCase):
         try:
             do_push(stream, data.cuda(), indexes.cuda(), freq_precision, bypass)
         except RuntimeError as e:
-            if _is_cuda_unavailable_error(e):
+            if is_cuda_unavailable_error(e):
                 self.skipTest(f"CUDA coding is unavailable: {e}")
             raise
         torch.cuda.synchronize()
@@ -169,7 +134,7 @@ class TestRansWarpCuda(unittest.TestCase):
         try:
             decoded = do_pop(stream, indexes.cuda(), freq_precision, bypass)
         except RuntimeError as e:
-            if _is_cuda_unavailable_error(e):
+            if is_cuda_unavailable_error(e):
                 self.skipTest(f"CUDA coding is unavailable: {e}")
             raise
         torch.cuda.synchronize()
@@ -398,7 +363,7 @@ class TestRansWarpCuda(unittest.TestCase):
                         self.assertTrue(
                             torch.equal(expected, do_pop(cpu_stream, indexes, freq_precision, True)))
 
-                        if _cuda_coding_skip_reason() is not None:
+                        if cuda_coding_skip_reason() is not None:
                             continue  # the CPU half above is still verified
                         gpu_stream = do_init(shape[0]).cuda()
                         do_push(gpu_stream, data.cuda(), indexes.cuda(), freq_precision, True)
