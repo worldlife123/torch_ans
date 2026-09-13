@@ -31,6 +31,7 @@ v0.3.0 includes a major performance overhaul for both CPU and GPU.
 
 - CUDA build failed to import (`undefined symbol`) for `*_i2_*`/`*_i8_*` and interleaved alias/inverse-CDF combinations due to missing CUDA instantiations; all bound combinations now have one, unsupported ones raise a clear error (interleaved CUDA coding is rans32_16-only).
 - The sdist could miss the native headers it needs to build (`rans_bindings.hpp`, `rans_build_config.hpp`): setuptools does not recompute the manifest when new source files appear, and the file list was never declared. `MANIFEST.in` now lists the sources explicitly and excludes generated or stale artifacts (`torch_ans/_torch_build_version.py`, `*.so`) so a leftover local `_C*.so` can never shadow `torch_ans/_C.py` in a distribution.
+- Importing the Python API stays lazy when no compiled extension is present. The import machinery probes `__path__` on the module it is about to import names from (`from ._lazy_C import ...`), and the shim answered that probe with a full build, so a plain `import torch_ans.utils` compiled the whole extension - CUDA included - before any use. Dunder probes now raise `AttributeError` without building, while `from torch_ans._C import <op>` still compiles the full extension as documented.
 
 ### Removed
 
