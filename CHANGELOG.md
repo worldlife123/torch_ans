@@ -6,6 +6,9 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS runtime builds no longer abort the process on the first parallel operation. The OpenMP variant they get from Homebrew libomp links and imports perfectly well and then dies - SIGABRT inside `rans_pmf_to_quantized_cdf`, no exception, nothing a build- or load-time check could see - with torch 2.14 (2.13 and older work), which turned the full-matrix macOS arm64 jobs red. As the crash is invisible to the build, the runtime build now runs that operator once in a child process (a build cache hit plus one call) before accepting the variant, and falls back to the flags without a second OpenMP runtime - the ones `setup.py` has always used on macOS, with `at::parallel_for` on torch's own thread pool instead of a second runtime. The outcome is remembered in an `openmp_build_state` file in the torch extensions cache directory; delete it to try OpenMP again.
 
 ## [0.3.0] - 2026-09-14
 

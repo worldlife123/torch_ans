@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import platform
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -206,6 +207,22 @@ def _detect_cuda_torch():
         return False
 
 
+def _build_state_path(state_key: str, filename: str) -> Optional[str]:
+    """Path of a build state marker inside the extension build cache.
+
+    `state_key` picks the cache directory (a module name, or a key shared by
+    every profile on purpose) and `filename` the marker in it. Returns None if
+    torch's build directory cannot be determined (then there is no state).
+    """
+    try:
+        from torch.utils.cpp_extension import _get_build_directory
+        build_dir = _get_build_directory(state_key, verbose=False)
+        os.makedirs(build_dir, exist_ok=True)
+        return os.path.join(build_dir, filename)
+    except Exception:
+        return None
+
+
 def _cuda_state_path(module_name: str) -> Optional[str]:
     """Path of the CUDA build state marker inside the extension build cache.
 
@@ -222,13 +239,163 @@ def _cuda_state_path(module_name: str) -> Optional[str]:
                     headers of gcc >= 11.4); start attempts with it.
     Returns None if torch's build directory cannot be determined (no state).
     """
-    try:
-        from torch.utils.cpp_extension import _get_build_directory
-        build_dir = _get_build_directory(module_name, verbose=False)
-        os.makedirs(build_dir, exist_ok=True)
-        return os.path.join(build_dir, "cuda_build_state")
-    except Exception:
+    return _build_state_path(module_name, "cuda_build_state")
+
+
+#: State key of the macOS OpenMP probe (see _openmp_state_path). Deliberately
+#: not a module name, like the CUDA key: whether a second OpenMP runtime aborts
+#: here is a property of the machine, not of the operators being built.
+_OMP_STATE_KEY = "torch_ans_macos_openmp"
+
+#: Environment variable set for the child process of the OpenMP probe. The build
+#: that child performs must not probe itself again (that would recurse).
+_OMP_PROBE_ENV = "TORCH_ANS_OPENMP_PROBE"
+
+
+def _openmp_state_path() -> Optional[str]:
+    """Path of the macOS OpenMP state marker inside the extension build cache."""
+    return _build_state_path(_OMP_STATE_KEY, "openmp_build_state")
+
+
+def _openmp_state() -> Optional[str]:
+    """First line of the recorded OpenMP probe outcome, or None.
+
+    "broken" is followed by a human-readable explanation; "ok <torch version>"
+    is what the probe writes when the module survived.
+    """
+    path = _openmp_state_path()
+    if path is None or not os.path.exists(path):
         return None
+    try:
+        with open(path) as f:
+            return f.readline().strip() or None
+    except OSError:
+        return None
+
+
+def _openmp_broken() -> bool:
+    """Whether an earlier build found the OpenMP runtime unusable on this machine."""
+    return (_openmp_state() or "").startswith("broken")
+
+
+def _openmp_probe_is_redundant() -> bool:
+    """Whether the probe already passed for the torch version in use.
+
+    The probe spawns a process (torch import included), so it must not run on
+    every first use; the recorded "ok" is keyed by the torch version because
+    that is what the crash it looks for depends on. Deleting the file forces a
+    fresh probe.
+    """
+    return _openmp_state() == f"ok {_torch_version()}"
+
+
+def _write_openmp_state(status: str, explanation: str = "") -> None:
+    path = _openmp_state_path()
+    if path is None:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write(status + "\n")
+            if explanation:
+                f.write(explanation)
+    except OSError:
+        pass
+
+
+def _remember_openmp_ok() -> None:
+    """Record that the OpenMP module survived, so later builds skip the probe."""
+    _write_openmp_state(f"ok {_torch_version()}")
+
+
+def _remember_openmp_broken() -> None:
+    """Record that the OpenMP build aborted, so later builds skip that variant.
+
+    Only failures are written with a reason, and they apply to the machine they
+    happened on: the file keeps the fallback (which still parallelizes, through
+    torch's own thread pool) until it is deleted.
+    """
+    _write_openmp_state(
+        "broken",
+        "The extension built with Homebrew's libomp aborted this machine on its "
+        "first parallel op, so runtime builds use the flags that do not add a "
+        "second OpenMP runtime. Delete this file to try OpenMP again.\n")
+
+
+def _run_probe_child(code: str, env: Dict[str, str]):
+    """Run the OpenMP probe's child process (separate so tests can replace it).
+
+    The child repeats the build (a cache hit) and one operator call, so it needs
+    seconds; the timeout only bounds a hang (a wedged OpenMP runtime), and a
+    timeout keeps the OpenMP build like any other probe failure.
+    """
+    return subprocess.run(
+        [sys.executable, "-c", code], env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, timeout=300)
+
+
+def _openmp_variant_is_usable(module_name: str, defines, verbose: bool = False) -> bool:
+    """Whether the OpenMP variant can code without killing the process here.
+
+    macOS takes its OpenMP runtime from Homebrew's libomp, a *second* OpenMP
+    runtime next to the one libtorch links. With torch 2.14 that combination
+    aborts on the first `at::parallel_for` - SIGABRT inside
+    rans_pmf_to_quantized_cdf, no exception, and nothing at build time notices,
+    because the module links and imports perfectly well (torch 2.13 and older
+    with the same libomp work, and the build without a second runtime never had
+    the problem).
+
+    So build and use the module *in a child process*, where a crash is only an
+    exit status, and let the caller fall back to the flags without a second
+    runtime - exactly what setup.py has always used on macOS. The child runs the
+    same `build_extension(module_name, defines)` call, i.e. it takes the first
+    variant too and leaves it in the shared JIT cache, so when the probe passes
+    the parent's own build is a cache hit.
+
+    Probing *before* the parent builds anything is what makes the fallback work
+    in the same process: `dlopen` keys on the file path, and the two variants
+    share one module name, so a module the parent had already loaded would be
+    the one that came back after the rebuild.
+
+    Returns True when the child survived, and also when the probe could not be
+    run at all: it is a guess about the local toolchain, not a reason to reject
+    a module that may work fine. The outcome is recorded so the child is spawned
+    once per (machine, torch version) rather than on every first use.
+    """
+    if os.environ.get(_OMP_PROBE_ENV):
+        return True  # we are the child: never probe recursively
+    if _openmp_probe_is_redundant():
+        return True  # already verified here for this torch version
+    code = (
+        "import torch\n"
+        "import torch_ans._dynamic_build as db\n"
+        f"m = db.build_extension(module_name={module_name!r}, with_cuda=False, "
+        f"verbose=False, defines={defines!r})\n"
+        "torch.manual_seed(0)\n"
+        "pmf = torch.rand(8, 256)\n"
+        "pmf = pmf / pmf.sum(-1, keepdim=True)\n"
+        "m.rans_pmf_to_quantized_cdf(pmf, 16)\n"
+        "print('torch_ans: the OpenMP build coded a pmf')\n"
+    )
+    env = dict(os.environ)
+    env[_OMP_PROBE_ENV] = "1"
+    if verbose:
+        print("torch_ans: checking the OpenMP build against its first parallel op")
+    try:
+        proc = _run_probe_child(code, env)
+    except Exception as exc:  # no interpreter, timeout, ...
+        print(f"torch_ans: the OpenMP probe could not be run ({exc}); keeping OpenMP")
+        return True
+    if proc.returncode == 0:
+        _remember_openmp_ok()
+        return True
+    signal_note = f", signal {-proc.returncode}" if proc.returncode < 0 else ""
+    tail = (proc.stdout or b"").decode("utf-8", "replace").strip().splitlines()[-15:]
+    print(
+        "torch_ans: the OpenMP build failed its first parallel op (exit "
+        f"{proc.returncode}{signal_note}); rebuilding without a second OpenMP "
+        "runtime - the child said:\n  " + "\n  ".join(tail))
+    _remember_openmp_broken()
+    return False
 
 
 def _older_host_compilers():
@@ -242,6 +409,16 @@ def _older_host_compilers():
     return compilers
 
 
+def _libomp_prefix() -> str:
+    """Homebrew's libomp prefix, or "" when it is not installed."""
+    try:
+        out = subprocess.run(["brew", "--prefix", "libomp"], capture_output=True, text=True, timeout=10)
+        prefix = out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+    return prefix if os.path.exists(os.path.join(prefix, "include", "omp.h")) else ""
+
+
 def _darwin_cpu_flag_variants():
     """CPU compile flag variants for macOS, fastest (OpenMP) first.
 
@@ -252,16 +429,16 @@ def _darwin_cpu_flag_variants():
     libomp is available use the standard `-Xpreprocessor -fopenmp` + `-lomp`
     recipe; otherwise (or if the OpenMP attempt fails) fall back to flags
     that still build, at the cost of a serial at::parallel_for.
+
+    The OpenMP variant is dropped once a build has found it unusable on this
+    machine (see _openmp_coding_survives): it links and imports fine but the
+    process aborts on the first parallel op, which a build failure check cannot
+    see.
     """
     base = ["-O3", "-mmacosx-version-min=10.14"]
     variants = []
-    try:
-        import subprocess
-        out = subprocess.run(["brew", "--prefix", "libomp"], capture_output=True, text=True, timeout=10)
-        prefix = out.stdout.strip() if out.returncode == 0 else ""
-    except Exception:
-        prefix = ""
-    if prefix and os.path.exists(os.path.join(prefix, "include", "omp.h")):
+    prefix = _libomp_prefix()
+    if prefix and not _openmp_broken():
         variants.append((
             base + ["-Xpreprocessor", "-fopenmp", f"-I{prefix}/include"],
             [f"-L{prefix}/lib", "-lomp", f"-Wl,-rpath,{prefix}/lib"],
@@ -290,6 +467,15 @@ def _torch_major_version() -> int:
         return int(torch.__version__.split("+")[0].split(".")[0])
     except Exception:
         return 2
+
+
+def _torch_version() -> str:
+    """Version of the installed torch ("unknown" when it cannot be determined)."""
+    try:
+        import torch
+        return str(torch.__version__)
+    except Exception:
+        return "unknown"
 
 
 def _reset_jit_versioner(module_name: str) -> None:
@@ -471,6 +657,17 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     def _build_cpu_only():
         last_err = None
         for extra_cflags, extra_ldflags in cpu_only_flag_variants:
+            # An OpenMP variant (the darwin one; only macOS links a second OpenMP
+            # runtime) can build, import and still abort on the first parallel op.
+            # Test it in a child process first - the probe builds the module
+            # there, so nothing the fallback may replace is loaded here yet - and
+            # fall back to the variant below when it does not survive.
+            if "-Xpreprocessor" in extra_cflags and not _openmp_variant_is_usable(
+                    module_name, defines, verbose):
+                last_err = RuntimeError(
+                    "the extension built with Homebrew's libomp aborts on its first "
+                    "parallel op on this machine")
+                continue
             try:
                 module = _load(cpp_sources, [], extra_cflags, extra_ldflags)
                 last_err = None
