@@ -1,33 +1,60 @@
 ## Test Results
 
-| OS | Platform | Python | CUDA | Status |
-|----|----------|--------|------|--------|
-| linux | aarch64 | 3.10 | cpu | ✅ |
-| linux | aarch64 | 3.11 | cpu | ✅ |
-| linux | aarch64 | 3.12 | cpu | ✅ |
-| linux | aarch64 | 3.13 | cpu | ✅ |
-| linux | aarch64 | 3.14 | cpu | ✅ |
-| linux | aarch64 | 3.8 | cpu | ✅ |
-| linux | aarch64 | 3.9 | cpu | ✅ |
-| linux | x86_64 | 3.10 | cpu | ✅ |
-| linux | x86_64 | 3.11 | cpu | ✅ |
-| linux | x86_64 | 3.12 | cpu | ✅ |
-| linux | x86_64 | 3.13 | cpu | ✅ |
-| linux | x86_64 | 3.7 | cpu | ✅ |
-| linux | x86_64 | 3.8 | cpu | ✅ |
-| linux | x86_64 | 3.9 | cpu | ✅ |
-| macos | arm64 | 3.10 | cpu | ✅ |
-| macos | arm64 | 3.11 | cpu | ✅ |
-| macos | arm64 | 3.12 | cpu | ✅ |
-| macos | arm64 | 3.13 | cpu | ✅ |
-| macos | arm64 | 3.14 | cpu | ✅ |
-| windows | x86_64 | 3.10 | cpu | ✅ |
-| windows | x86_64 | 3.11 | cpu | ✅ |
-| windows | x86_64 | 3.12 | cpu | ✅ |
-| windows | x86_64 | 3.13 | cpu | ✅ |
-| windows | x86_64 | 3.14 | cpu | ✅ |
-| windows | x86_64 | 3.7 | cpu | ✅ |
-| windows | x86_64 | 3.8 | cpu | ✅ |
-| windows | x86_64 | 3.9 | cpu | ✅ |
+| OS | Platform | Python | CUDA | Mode | Status |
+|----|----------|--------|------|------|--------|
+| linux | aarch64 | 3.10 | cpu | source | ✅ |
+| linux | aarch64 | 3.11 | cpu | source | ✅ |
+| linux | aarch64 | 3.12 | cpu | source | ✅ |
+| linux | aarch64 | 3.13 | cpu | source | ✅ |
+| linux | aarch64 | 3.14 | cpu | source | ✅ |
+| linux | aarch64 | 3.8 | cpu | source | ✅ |
+| linux | aarch64 | 3.9 | cpu | source | ✅ |
+| linux | x86_64 | 3.10 | cpu | source | ✅ |
+| linux | x86_64 | 3.11 | cpu | source | ✅ |
+| linux | x86_64 | 3.12 | cpu | source | ✅ |
+| linux | x86_64 | 3.13 | cpu | source | ✅ |
+| linux | x86_64 | 3.7 | cpu | source | ✅ |
+| linux | x86_64 | 3.8 | cpu | source | ✅ |
+| linux | x86_64 | 3.9 | cpu | source | ✅ |
+| macos | arm64 | 3.10 | cpu | source | ✅ |
+| macos | arm64 | 3.11 | cpu | source | ✅ |
+| macos | arm64 | 3.12 | cpu | source | ✅ |
+| macos | arm64 | 3.13 | cpu | source | ✅ |
+| macos | arm64 | 3.14 | cpu | source | ✅ |
+| windows | x86_64 | 3.10 | cpu | source | ✅ |
+| windows | x86_64 | 3.11 | cpu | source | ✅ |
+| windows | x86_64 | 3.12 | cpu | source | ✅ |
+| windows | x86_64 | 3.13 | cpu | source | ✅ |
+| windows | x86_64 | 3.14 | cpu | source | ✅ |
+| windows | x86_64 | 3.7 | cpu | source | ✅ |
+| windows | x86_64 | 3.8 | cpu | source | ✅ |
+| windows | x86_64 | 3.9 | cpu | source | ✅ |
+| linux | aarch64 | 3.10 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.11 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.12 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.13 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.14 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.8 | cpu | lazy | ✅ |
+| linux | aarch64 | 3.9 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.10 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.11 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.12 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.13 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.7 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.8 | cpu | lazy | ✅ |
+| linux | x86_64 | 3.9 | cpu | lazy | ✅ |
+| macos | arm64 | 3.10 | cpu | lazy | ❌ |
+| macos | arm64 | 3.11 | cpu | lazy | ❌ |
+| macos | arm64 | 3.12 | cpu | lazy | ❌ |
+| macos | arm64 | 3.13 | cpu | lazy | ❌ |
+| macos | arm64 | 3.14 | cpu | lazy | ❌ |
+| windows | x86_64 | 3.10 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.11 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.12 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.13 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.14 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.7 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.8 | cpu | lazy | ✅ |
+| windows | x86_64 | 3.9 | cpu | lazy | ✅ |
 
-Last updated: Mon Sep 14 14:44:06 UTC 2026
+Last updated: Mon Sep 14 17:13:51 UTC 2026
