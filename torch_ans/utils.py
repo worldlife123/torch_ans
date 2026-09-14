@@ -479,7 +479,7 @@ def auto_inverse_cdf_precision(alphabet_size, freq_precision,
                                min_alphabet=64):
     """C1: pick the inverse-CDF table precision for a given alphabet size.
 
-    Rules, derived from the measurements in SPARSE_INVCDF_SUMMARY.md (A5/A9):
+    Rules, derived from the measurement:
 
     * alphabets below ``min_alphabet`` gain less than ~3% - keep the divided
       search and build no table (returns ``None``);

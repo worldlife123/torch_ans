@@ -7,7 +7,7 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 ## [Unreleased]
 
 
-## [0.3.0] - 2026-09-13
+## [0.3.0] - 2026-09-14
 
 v0.3.0 includes a major performance overhaul for both CPU and GPU.
 
