@@ -93,34 +93,38 @@ The CI matrix builds and runs the full test suite against **PyTorch 1.10.1 (Pyth
 
 torch_ans supports a wide range of rANS variants, including different state, stream, and frequency sizes, interleaved coding, and parallel coding on CPU or GPU. 
 
-Below we list currently supported variants:
+Below we list currently supported variants. Each family comes with three symbol
+lookups (divided search, alias sampling and inverse-CDF decoding) and several
+degrees of interleaving; `{iN}` in the function names stands for the interleave
+suffix of the operator (`_i2`, `_i4`, `_i8`, `_i32`) and is omitted for a single
+(non-interleaved) state:
 
-| Variant                | State Bits | Stream Bits | Max Freq Bits | Interleaved States | Device Support | init_func                | push_func                | pop_func                |
-|------------------------|------------|-------------|---------------|--------------------|---------------|--------------------------|--------------------------|-------------------------|
-| rans64                 | 64         | 32          | 16            | 1                  | CPU, CUDA     | rans64_init_stream       | rans64_push              | rans64_pop              |
-| rans64_i4              | 64         | 32          | 16            | 4                  | CPU           | -                        | rans64_i4_push           | rans64_i4_pop           |
-| rans64_alias           | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_alias_push        | rans64_alias_pop        |
-| rans64_invcdf          | 64         | 32          | 16            | 1                  | CPU, CUDA     | -                        | rans64_push              | rans64_invcdf_pop       |
-| rans64_i4_invcdf       | 64         | 32          | 16            | 4                  | CPU, CUDA     | -                        | rans64_i4_push           | rans64_i4_invcdf_pop    |
-| rans32                 | 32         | 8           | 16             | 1                  | CPU, CUDA     | rans32_init_stream       | rans32_push              | rans32_pop              |
-| rans32_i4              | 32         | 8           | 16             | 4                  | CPU           | -                        | rans32_i4_push           | rans32_i4_pop           |
-| rans32_alias           | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_alias_push        | rans32_alias_pop        |
-| rans32_invcdf          | 32         | 8           | 16             | 1                  | CPU, CUDA     | -                        | rans32_push              | rans32_invcdf_pop       |
-| rans32_16              | 32         | 16          | 15            | 1                  | CPU, CUDA     | rans32_16_init_stream    | rans32_16_push           | rans32_16_pop           |
-| rans32_16_i4           | 32         | 16          | 15            | 4                  | CPU, CUDA     | -                        | rans32_16_i4_push        | rans32_16_i4_pop        |
-| rans32_16_i32          | 32         | 16          | 15            | 32                 | CPU, CUDA     | -                        | rans32_16_i32_push       | rans32_16_i32_pop       |
-| rans32_16_alias        | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_alias_push     | rans32_16_alias_pop     |
-| rans32_16_invcdf       | 32         | 16           | 15            | 1                  | CPU, CUDA     | -                        | rans32_16_push           | rans32_16_invcdf_pop    |
+| Variant          | State Bits | Stream Bits | Max Freq Bits | Interleaved States | Symbol Lookup  | Device Support       | init_func             | push_func                | pop_func                  |
+|------------------|------------|-------------|---------------|--------------------|----------------|----------------------|-----------------------|--------------------------|---------------------------|
+| rans64           | 64         | 32          | 16            | 1, 2, 4, 8         | divided search | CPU: all / CUDA: 1   | rans64_init_stream    | rans64{iN}_push          | rans64{iN}_pop            |
+| rans64_alias     | 64         | 32          | 16            | 1, 2, 4, 8         | alias          | CPU: all / CUDA: 1   | -                     | rans64_alias{iN}_push    | rans64_alias{iN}_pop      |
+| rans64_invcdf    | 64         | 32          | 16            | 1, 2, 4, 8         | inverse CDF    | CPU: all / CUDA: 1   | -                     | rans64{iN}_push          | rans64{iN}_invcdf_pop     |
+| rans32           | 32         | 8           | 16            | 1, 2, 4, 8         | divided search | CPU: all / CUDA: 1   | rans32_init_stream    | rans32{iN}_push          | rans32{iN}_pop            |
+| rans32_alias     | 32         | 8           | 16            | 1, 2, 4, 8         | alias          | CPU: all / CUDA: 1   | -                     | rans32_alias{iN}_push    | rans32_alias{iN}_pop      |
+| rans32_invcdf    | 32         | 8           | 16            | 1, 2, 4, 8         | inverse CDF    | CPU: all / CUDA: 1   | -                     | rans32{iN}_push          | rans32{iN}_invcdf_pop     |
+| rans32_16        | 32         | 16          | 15            | 1, 2, 4, 8, 32     | divided search | CPU: all / CUDA: all | rans32_16_init_stream | rans32_16{iN}_push       | rans32_16{iN}_pop         |
+| rans32_16_alias  | 32         | 16          | 15            | 1, 2, 4, 8         | alias          | CPU: all / CUDA: all | -                     | rans32_16_alias{iN}_push | rans32_16_alias{iN}_pop   |
+| rans32_16_invcdf | 32         | 16          | 15            | 1, 2, 4, 8, 32     | inverse CDF    | CPU: all / CUDA: all | -                     | rans32_16{iN}_push       | rans32_16{iN}_invcdf_pop  |
+
+For example `rans64{iN}_push` is `rans64_push` (a single state), `rans64_i2_push`,
+`rans64_i4_push` or `rans64_i8_push`, and the inverse-CDF decoder of the 4-way
+interleaved `rans32_16` coder is `rans32_16_i4_invcdf_pop`.
 
 **Legend:**
 - *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
 - *Stream Bits*: Number of bits per stream element. This affects the frequency of overflowed state to be written into/read from bitstream, slightly affecting speed.
 - *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In torch_ans implementation, State Bits > Stream Bits + Max Freq Bits.
-- *Interleaved States*: Number of interleaved states for sequential coding in one step. On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, `rans32_16_i4` uses 4-lane sub-warp groups and `rans32_16_i32` maps its 32 interleaved states onto the 32 lanes of a warp using warp-level primitives (`__ballot_sync`/`__shfl_xor_sync`, technique referenced from [Recoil](https://github.com/lin-toto/recoil)), with one shared bitstream cursor per warp. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
-- *Device Support*: Indicates if variant is available on CPU and/or CUDA GPU.
-- *init_func/push_func/pop_func*: Main API functions for this variant.
+- *Interleaved States*: Number of interleaved states for sequential coding in one step (the `num_interleaves` argument of the family's `rans*_init_stream`). On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, interleaved coding is implemented for `rans32_16` only: `num_interleaves` 2, 4 and 8 map to that many consecutive lanes of a warp (4-lane sub-warp groups for `rans32_16_i4`), and 32 maps the whole stream onto the 32 lanes of a warp using warp-level primitives (`__ballot_sync`/`__shfl_xor_sync`, technique referenced from [Recoil](https://github.com/lin-toto/recoil)), with one shared bitstream cursor per warp. The interleaved `rans64`/`rans32` operators are CPU-only; asking them to code CUDA tensors raises an explicit error instead of returning garbage. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
+- *Symbol Lookup*: The decode-side symbol search. *divided search* is the default (folded into the plain `pop` function); *alias* is the alias-sampling coder (`alias_sampling=True` in the high-level API), which has its own push and pop (`*_alias*_push`/`*_alias*_pop`); *inverse CDF* keeps the plain push and replaces only the decoder (`*_invcdf_pop`, used with `inverse_cdf_precision`).
+- *Device Support*: Which devices each variant is available on (`all` = every interleave factor listed for that row). Interleaved CUDA coding exists for `rans32_16` alone, so the `rans64`/`rans32` interleaved variants are CPU-only there. `num_interleaves=32` exists only for `rans32_16` and has no alias variant.
+- *init_func/push_func/pop_func*: Main API functions for this variant. The init function is always the family's `rans*_init_stream` (`-` reuses the one shown on the family's first row); alias and inverse-CDF variants differ from the family only in the push/pop shown.
 
-In addition to standard and interleaved rANS, two advanced coding types are supported: alias coding and inverse CDF coding.
+In addition to standard and interleaved rANS, two advanced coding types are supported: alias coding and inverse CDF coding. Both are available at every interleave factor their family supports (alias sampling has no 32-way variant), and both can be selected in the high-level API with `alias_sampling=True` and `inverse_cdf_precision` respectively.
 
 **Alias Coding**: Alias coding modifies both the push (encode) and pop (decode) steps. It accelerates the pop (decode) process by enabling constant-time symbol lookup, but increases memory usage during the push (encode) step due to the need for additional alias tables.
 
@@ -150,7 +154,7 @@ Increasing the number of parallel states (`B`) generally improves throughput, bu
 - For large datasets, GPUs become advantageous only with a large number of parallel states (typically >256).
 - Example: On an i7-6800k (6C12T) CPU and RTX 2080Ti GPU, rans64 encoding speed is similar for CPU and GPU with 128 parallel states, while with 256 parallel states GPU is 2 times faster than CPU.
 
-On CUDA, throughput of the warp-level interleaved path (`rans32_16` + `num_interleaves=32`) is governed by **how many warps the batch provides**: each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`. On a 68-SM GPU, `rows >= 2048` saturates the GPU; below that, decode throughput scales almost linearly with `rows` (measured: 6.6 -> 25.8 Gsymbol/s going from 256 to 2048 rows, `inverse_cdf_precision="auto"`). See the [performance FAQ](#faq) for the full checklist.
+On CUDA, throughput of the warp-level interleaved path (`rans32_16` + `num_interleaves=32`) is governed by **how many warps the batch provides**: each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`. On a 68-SM GPU, `rows >= 2048` saturates the GPU; below that, decode throughput scales almost linearly with `rows` (measured: 6.6 -> 25.8 Gsymbol/s going from 256 to 2048 rows, `inverse_cdf_precision="auto"`). See [Performance Tuning](#Performance Tuning) for the full checklist.
 
 
 ### Command-line benchmark tool
@@ -542,7 +546,7 @@ A: In most cases this is caused by version mismatch between PyTorch during runti
 
 A: Set the `device` argument in API calls to "cpu" or "cuda". For large batches, GPU is recommended; for small data, CPU may be faster.
 Also, as GPU coding process is asynchronous, if some other tasks (such as neural networks in neural compression) are running meanwhile, using GPU coding may increase the overall throughput.
-For the fastest GPU decode when you have massive data, use `impl="rans32_16"`, `num_interleaves=32`, `freq_precision <= 15`, `inverse_cdf_precision="auto"` and `rows >= 2048` (see the performance FAQ above).
+For the fastest GPU decode when you have massive data, use `impl="rans32_16"`, `num_interleaves=32`, `freq_precision <= 15`, `inverse_cdf_precision="auto"` and `rows >= 2048` (see the Performance Tuning section above).
 
 **Q: What is the difference between low-level and high-level APIs?**
 
