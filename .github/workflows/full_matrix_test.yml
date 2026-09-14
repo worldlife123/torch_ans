@@ -1,5 +1,23 @@
 name: Full Matrix Test
 
+# The release status table: every supported (Python, platform) combination is
+# tested in both ways the package can be built, and both results land in
+# build_status.md.
+#
+#   source -> `pip install --no-build-isolation .`: setup.py compiles the
+#             extension at install time (the way the README recommends).
+#   lazy   -> `pip install .`: the PEP 517 isolated build has no torch, so the
+#             package is installed as pure Python and the extension is compiled
+#             by the runtime build on first use. That is torch's JIT loader
+#             rather than setup.py, i.e. a different set of compiler flags (no
+#             /GL on MSVC, which is why it needs /bigobj), so it is tested on
+#             its own.
+#
+# CUDA is not covered: GitHub-hosted runners have no GPU, so the matrix is
+# generated with `--cuda-versions cpu` and every job builds a CPU-only
+# extension. The CUDA operators have to be verified on a machine with a GPU and
+# a matching nvcc.
+
 on:
   push:
     tags:
@@ -76,11 +94,108 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: test-result-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
+          name: test-result-source-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
+          path: result.txt
+
+  lazy-compile-test:
+    # The runtime build: the package installs as pure Python (see the header of
+    # this file) and compiles the extension on first use. It is the only job that
+    # runs the extension through torch's JIT loader instead of setup.py, which
+    # means another flag set (no /GL on MSVC, hence the /bigobj only this path
+    # needs), another build cache, and the path a user without a compiler ends up
+    # on. MSVC-only failures of it are invisible to the source jobs above.
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    env:
+      # Runs test_dynamic_build.py::test_dynamic_build_cpu, which skips itself
+      # when no compiler is on PATH (as on Windows, where the JIT build uses the
+      # MSVC environment activated below instead).
+      RUN_DYNAMIC_BUILD_TEST: '1'
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install libomp on macOS
+        # No `brew update`: it can fail on runner-broken third-party taps, and
+        # libomp is available from the pre-seeded index. Needed so the runtime
+        # build keeps OpenMP (at::parallel_for) multi-threaded.
+        if: runner.os == 'macOS'
+        run: brew install libomp
+      - name: Activate MSVC environment on Windows
+        # torch's cpp_extension requires cl.exe on PATH for JIT builds (unlike
+        # setuptools, it does not locate MSVC by itself).
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install pip
+        run: python -m ensurepip --upgrade || true
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+      - name: Install PyTorch (official wheel) and pytest
+        shell: bash
+        run: |
+          python -m pip install pytest
+          if [ "${{ matrix.cuda-version }}" = "cpu" ]; then
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda-version }}
+          fi
+      - name: Show versions
+        run: python -c "import sys, torch; print('Python', sys.version.split()[0], 'torch', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+      - name: Install package in lazy compile mode (PEP 517 isolated build)
+        # The isolated build environment has no torch, so setup.py skips the
+        # native extension and installs a pure-Python package.
+        run: python -m pip install .
+      - name: Verify pure-Python install (no prebuilt extension)
+        # Run outside the checkout so "import torch_ans" resolves to the
+        # installed site-packages copy, not the source tree.
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import glob, os, torch_ans
+          pkg_dir = os.path.dirname(torch_ans.__file__)
+          binaries = glob.glob(os.path.join(pkg_dir, "*.so")) + glob.glob(os.path.join(pkg_dir, "*.pyd"))
+          assert not binaries, f"expected a pure-Python install, found binaries: {binaries}"
+          print("pure-Python install verified:", pkg_dir)
+      - name: Verify dynamic build on first use
+        # 0.3.0 defers the compilation to the first *use* of an operator:
+        # `import torch_ans._C` (and the dunder probes the import machinery
+        # makes on it) must stay lazy, so ask for the build explicitly.
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import torch_ans._C as m
+          built = m.ensure_full()
+          assert "torch_extensions" in built.__file__, f"extension was not dynamically built: {built.__file__}"
+          print("dynamic build OK:", built.__file__)
+      - name: Run tests
+        # From outside the checkout, so the tests exercise the installed
+        # (lazily built) package rather than the source tree.
+        working-directory: ${{ runner.temp }}
+        run: pytest -q ${{ github.workspace }}/tests
+      - name: Create result file
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "PASS" > result.txt
+          else
+            echo "FAIL" > result.txt
+          fi
+      - name: Upload result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-result-lazy-${{ matrix.os }}-${{ matrix.platform }}-${{ matrix.python-version }}-${{ matrix.cuda-version }}
           path: result.txt
 
   update-build-status:
-    needs: test-matrix
+    needs: [test-matrix, lazy-compile-test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -100,25 +215,29 @@ jobs:
         run: |
           echo "## Test Results" > table.md
           echo "" >> table.md
-          echo "| OS | Platform | Python | CUDA | Status |" >> table.md
-          echo "|----|----------|--------|------|--------|" >> table.md
-          for dir in results/test-result-*; do
-            if [ -d "$dir" ]; then
-              result_file="$dir/result.txt"
-              if [ -f "$result_file" ]; then
-                # Parse dirname: test-result-os-platform-python-cuda
-                dirname=$(basename "$dir")
-                dirname=${dirname#test-result-}
-                IFS='-' read -r os platform python cuda <<< "$dirname"
-                status=$(cat "$result_file")
-                if [ "$status" = "PASS" ]; then
-                  status="✅"
-                else
-                  status="❌"
+          echo "| OS | Platform | Python | CUDA | Mode | Status |" >> table.md
+          echo "|----|----------|--------|------|------|--------|" >> table.md
+          # Mode by mode, so the two builds of one combination stay next to each
+          # other instead of being scattered by the glob's lexicographic order.
+          for mode in source lazy; do
+            for dir in results/test-result-$mode-*; do
+              if [ -d "$dir" ]; then
+                result_file="$dir/result.txt"
+                if [ -f "$result_file" ]; then
+                  # Parse dirname: test-result-<mode>-<os>-<platform>-<python>-<cuda>
+                  dirname=$(basename "$dir")
+                  dirname=${dirname#test-result-$mode-}
+                  IFS='-' read -r os platform python cuda <<< "$dirname"
+                  status=$(cat "$result_file")
+                  if [ "$status" = "PASS" ]; then
+                    status="✅"
+                  else
+                    status="❌"
+                  fi
+                  echo "| $os | $platform | $python | $cuda | $mode | $status |" >> table.md
                 fi
-                echo "| $os | $platform | $python | $cuda | $status |" >> table.md
               fi
-            fi
+            done
           done
           echo "" >> table.md
           echo "Last updated: $(date)" >> table.md
