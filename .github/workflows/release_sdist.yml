@@ -37,11 +37,16 @@ jobs:
         # rans_bindings.hpp / rans_build_config.hpp are required to compile the
         # extension and setuptools does not recompute MANIFEST.in when new
         # source files appear, so their presence is asserted explicitly.
+        # The listing is materialised once instead of being piped into grep:
+        # `grep -q` exits at its first match, which makes tar die of SIGPIPE
+        # ("tar: stdout: write error", exit 2) and `pipefail` then fails the step.
         run: |
           set -euo pipefail
-          tar -tzf dist/torch_ans-*.tar.gz | grep -q 'torch_ans/rans_bindings.hpp'
-          tar -tzf dist/torch_ans-*.tar.gz | grep -q 'torch_ans/rans_build_config.hpp'
-          ! tar -tzf dist/torch_ans-*.tar.gz | grep -q '\.so$'
+          listing=$(mktemp)
+          tar -tzf dist/torch_ans-*.tar.gz > "$listing"
+          grep -q 'torch_ans/rans_bindings.hpp' "$listing"
+          grep -q 'torch_ans/rans_build_config.hpp' "$listing"
+          ! grep -q '\.so$' "$listing"
 
       - name: Install from the sdist (compiles the extension)
         run: pip install --no-build-isolation dist/torch_ans-*.tar.gz

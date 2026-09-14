@@ -10,6 +10,11 @@ name: Build wheels (pure Python, artifacts only)
 # `_C*.so`) with SKIP_BUILD_EXT=1, as a smoke test that the package also installs
 # without a compiler. Artifacts are uploaded for inspection only - there is no
 # publish job.
+#
+# cibuildwheel is deliberately not used: since 3.0 it fails the build when a
+# wheel turns out to be pure Python ("Build failed because a pure Python wheel
+# was generated") - a platform-independent wheel is not what it is for. `build`
+# produces the same `py3-none-any` wheel here.
 
 on:
   push:
@@ -19,7 +24,7 @@ on:
 
 jobs:
   build:
-    name: Build pure-Python wheel for target Python versions
+    name: Build pure-Python wheel
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -37,18 +42,16 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install cibuildwheel
+          pip install build
 
-      - name: Build wheels with cibuildwheel
+      - name: Build the wheel
         env:
-          # Limit builds to cp${{ matrix.python }} ABI patterns if desired
-          CIBW_BUILD: "cp310-*"
           # Skip the native extension: this wheel must stay pure Python (the
           # extension is compiled per user, matching their torch). Also removes
           # the need to install torch in the build environment.
-          CIBW_ENVIRONMENT: "SKIP_BUILD_EXT=1"
+          SKIP_BUILD_EXT: "1"
         run: |
-          python -m cibuildwheel --output-dir wheelhouse
+          python -m build --wheel --outdir wheelhouse
 
       - name: Assert the wheel is pure Python
         run: |

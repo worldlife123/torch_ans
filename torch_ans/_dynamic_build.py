@@ -414,7 +414,12 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     define_flags = _define_flags(defines)
 
     if sys.platform == "win32":
-        cpu_flag_variants = [(["/O2", "/openmp"] + std_flags + define_flags, [])]
+        # /Zc:lambda (the conforming MSVC lambda processor): the legacy one, the
+        # default in C++17 mode, cannot see the declarations of an `if constexpr`
+        # branch inside rans_cpu.cpp's nested generic lambdas and fails the build
+        # with C2065. Only /std:c++20 (torch >= 2.14) turns it on implicitly, so
+        # a runtime build against an older torch needs it explicitly. See setup.py.
+        cpu_flag_variants = [(["/O2", "/openmp", "/Zc:lambda"] + std_flags + define_flags, [])]
     elif sys.platform == "darwin":
         cpu_flag_variants = [(c + darwin_extra + define_flags, ld) for c, ld in _darwin_cpu_flag_variants()]
     else:

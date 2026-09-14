@@ -47,7 +47,16 @@ def get_extension_config():
     darwin_extra = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
 
     if sys.platform == "win32":
-        extra_compile_args["cxx"] = ["/O2", "/openmp"] + std_flags
+        # /Zc:lambda selects MSVC's conforming lambda processor. The legacy one,
+        # which is the default in C++17 mode (what torch <= 2.13 asks for on
+        # Windows), fails to see the declarations made inside an `if constexpr`
+        # branch of the nested generic lambdas in rans_cpu.cpp's interleaved pop
+        # path and reports them as undeclared identifiers (C2065). The
+        # conforming processor handles them; it is implied by /std:c++20,
+        # /std:c++latest and /permissive- only, so ask for it explicitly. It is
+        # a no-op once one of those is in effect (torch 2.14+ builds extensions
+        # with /std:c++20).
+        extra_compile_args["cxx"] = ["/O2", "/openmp", "/Zc:lambda"] + std_flags
     elif sys.platform == "darwin":
         extra_compile_args["cxx"] = ["-O3", "-mmacosx-version-min=10.14"] + darwin_extra + std_flags
     else:

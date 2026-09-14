@@ -123,16 +123,19 @@ def test_incremental_defines_reach_cxx_and_nvcc(monkeypatch):
     db.build_extension(module_name=db.profile_module_name(profile), with_cuda=True,
                        verbose=False, defines=db.profile_defines(profile))
 
-    for flag in ("-DTORCH_ANS_INCREMENTAL_BUILD=1", "-DTORCH_ANS_WITH_RANS32_16=1",
-                 "-DTORCH_ANS_WITH_INTERLEAVE_32=1", "-DTORCH_ANS_WITH_INVCDF=1"):
-        assert flag in captured["extra_cflags"], flag
-        assert flag in captured["extra_cuda_cflags"], flag
-    assert "-DTORCH_ANS_WITH_RANS64=1" not in captured["extra_cflags"]
+    # `_define_flags` spells macros the way the local toolchain expects: `/D` for
+    # MSVC, `-D` elsewhere. Take the prefix from it so the two cannot drift.
+    prefix = db._define_flags({"PROBE": 1})[0].split("PROBE")[0]
+    for flag in ("TORCH_ANS_INCREMENTAL_BUILD=1", "TORCH_ANS_WITH_RANS32_16=1",
+                 "TORCH_ANS_WITH_INTERLEAVE_32=1", "TORCH_ANS_WITH_INVCDF=1"):
+        assert prefix + flag in captured["extra_cflags"], flag
+        assert prefix + flag in captured["extra_cuda_cflags"], flag
+    assert prefix + "TORCH_ANS_WITH_RANS64=1" not in captured["extra_cflags"]
     assert any(s.endswith(".cu") for s in captured["sources"])
 
     db.build_extension(module_name=db.FULL_MODULE_NAME, with_cuda=False, verbose=False,
                        defines=db.profile_defines(None))
-    assert not any(f.startswith("-DTORCH_ANS_") for f in captured["extra_cflags"])
+    assert not any(f.startswith(prefix + "TORCH_ANS_") for f in captured["extra_cflags"])
     assert not any(s.endswith(".cu") for s in captured["sources"])
 
 
