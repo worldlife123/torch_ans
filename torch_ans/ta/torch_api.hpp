@@ -2,8 +2,7 @@
 
 // The single entry point of the `ta::` compatibility layer.
 //
-// torch_ans has to compile two ways for a while (STABLE_ABI_MIGRATION.md
-// section 1.1):
+// torch_ans has to compile two ways for a while:
 //
 //   * ATen + pybind11, compiled locally per torch version  -> torch_api_aten.hpp
 //   * libtorch stable ABI, one prebuilt .so for torch>=2.10 -> torch_api_stable.hpp
@@ -58,6 +57,12 @@ namespace ta {
 //   * tests/test_capacity_contract.py - pins the two against each other by using
 //                            the wrapper's own growth as the oracle.
 //
-// STABLE_ABI_MIGRATION.md section 7 records why (decision B) and what it buys.
+// The capacity contract is the option that removes both the per-push device->host
+// read and the `aten::resize_` call the stable ABI does not promise. The
+// alternatives were: keeping the dispatcher call (removes neither), having the
+// operator return a grown stream (changes the public signature and every call
+// site) and a strict pre-reservation that raises instead of growing (loses push's
+// self-growing behaviour for direct callers). scripts/bench_stream_capacity.py
+// measures what it buys - a small CUDA push: 157 -> 39 us.
 
 }  // namespace ta

@@ -207,7 +207,7 @@ _EXPORTED_NATIVE_OPS = frozenset(_build_config.profile_op_names(None))
 
 
 # ---------------------------------------------------------------------------
-# stream capacity contract (STABLE_ABI_MIGRATION.md section 7, decision B)
+# stream capacity contract: the caller reserves, the native push compares
 # ---------------------------------------------------------------------------
 #: (state bytes, stream word bytes) per rANS family - the two sizes rans_push's
 #: worst-case formula and rans_init_stream's initial length word are built from.
@@ -1205,10 +1205,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._incremental_compile = incremental_compile
         self._configured_invcdf_decode = use_invcdf_decode
 
-        # Stream-capacity contract (STABLE_ABI_MIGRATION.md section 7, decision B):
-        # this interface owns the capacity of the streams it codes, so the native
-        # push does not have to read the stream's length word back (a blocking
-        # device->host copy on CUDA) and never goes through `aten::resize_`.
+        # Stream-capacity contract: this interface owns the capacity of the streams
+        # it codes, so the native push does not have to read the stream's length
+        # word back (a blocking device->host copy on CUDA) and never goes through
+        # `aten::resize_`, whose schema the stable ABI does not promise.
         # `_mirrored_*` is the upper bound of the bytes coded into the longest row
         # of the stream it was adopted for (see _reserve_stream).
         self._mirrored_stream = None

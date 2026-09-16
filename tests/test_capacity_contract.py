@@ -1,4 +1,4 @@
-"""The stream-capacity contract (STABLE_ABI_MIGRATION.md section 7, option B).
+"""The stream-capacity contract: Python reserves, the native push compares.
 
 `TorchANSInterface` reserves the capacity of a stream in Python and the native
 push only *compares* it (the `used_bytes` parameter), which is what keeps both the

@@ -1,8 +1,8 @@
 """Loader for the prebuilt libtorch-stable-ABI extension.
 
-`STABLE_ABI_MIGRATION.md` section 1.1: a wheel can ship one `.so` compiled
-against the libtorch stable ABI (`TORCH_TARGET_VERSION` = torch 2.10) that
-serves every `torch >= 2.10`, instead of compiling per torch version. This
+A wheel can ship one `.so` compiled against the libtorch stable ABI
+(`TORCH_TARGET_VERSION` = torch 2.10) that serves every `torch >= 2.10`,
+instead of compiling per torch version. This
 module is the Python side of that path:
 
 * :func:`load_stable` finds `_C_cpu` (always) and `_C_cuda` (only when a GPU is
@@ -36,8 +36,8 @@ from typing import List, Optional, Sequence
 import torch
 
 #: Lowest torch whose stable ABI the prebuilt `.so` targets; the same value is
-#: passed to the compiler as -DTORCH_TARGET_VERSION (see STABLE_ABI_MIGRATION.md
-#: and poc/stable_abi/setup.py).
+#: passed to the compiler as -DTORCH_TARGET_VERSION (see setup.py and
+#: poc/stable_abi/setup.py).
 STABLE_ABI_MIN_TORCH = (2, 10)
 
 #: Set to 1/true/yes to ignore the prebuilt extension entirely.

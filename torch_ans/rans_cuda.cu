@@ -1,7 +1,7 @@
 // Kernels and wrappers are written against the ta:: compatibility layer
 // (torch_ans/ta/torch_api.hpp), so this translation unit compiles both ways:
 // the ATen/pybind11 build (today) and the libtorch-stable-ABI build (the
-// prebuilt wheel, STABLE_ABI_MIGRATION.md stages 2/6). For the ATen build the
+// prebuilt wheel). For the ATen build the
 // header is a thin forwarder to <torch/extension.h>; for the stable one it is
 // the torch-free surface, which is why no `torch::` symbol below may come back.
 #include "ta/torch_api.hpp"

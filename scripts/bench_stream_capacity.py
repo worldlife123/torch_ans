@@ -1,5 +1,5 @@
-"""Per-call cost of the stream-capacity contract (STABLE_ABI_MIGRATION.md
-section 7, decision B): reserved capacity vs the wrapper growing the stream.
+"""Per-call cost of the stream-capacity contract: reserved capacity vs the
+wrapper growing the stream.
 
 Both arms run on the *same* kernel and the same pre-grown stream; the only
 difference is whether the call carries `used_bytes`:

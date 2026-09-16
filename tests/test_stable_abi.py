@@ -1,6 +1,6 @@
 """The prebuilt libtorch-stable-ABI extension: registration and bit-exactness.
 
-STABLE_ABI_MIGRATION.md stages 3-7 turn the migration into something observable:
+The stable-ABI build turns the migration into something observable:
 one `.so` per flavour registers every operator through `STABLE_TORCH_LIBRARY`
 and the Python layer prefers it over compiling anything. This module checks the
 claims that matter, and the runtime ones are skipped entirely when no stable-ABI
@@ -238,7 +238,7 @@ def test_bytes_operators_match_the_compiled_extension():
 
 
 # ---------------------------------------------------------------------------
-# 5. the CUDA flavour (STABLE_ABI_MIGRATION.md stage 6)
+# 5. the CUDA flavour
 # ---------------------------------------------------------------------------
 # The CUDA library is a second .so that registers implementations *only* for the
 # CUDA dispatch key; the operator names - and therefore every call below - are the
@@ -361,7 +361,7 @@ def test_cuda_coding_works_inside_a_non_default_stream():
 
 
 # ---------------------------------------------------------------------------
-# 6. packaging: the WITH_STABLE_ABI build (STABLE_ABI_MIGRATION.md stage 7)
+# 6. packaging: the WITH_STABLE_ABI build
 # ---------------------------------------------------------------------------
 # These are source-level checks: they pin the shape of the build switch without
 # needing a compiler, and they are the only part of this module that runs when no

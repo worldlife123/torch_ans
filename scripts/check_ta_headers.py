@@ -1,10 +1,9 @@
 """Compile-check the `ta::` compatibility layer in both build modes.
 
-`torch_ans/ta/` (STABLE_ABI_MIGRATION.md section 1.4 / stage 0) is the one place
-where the ATen build and the libtorch-stable-ABI build have to agree on an
-interface. Nothing includes it yet, so the two headers would otherwise only be
-exercised once stages 1/2/6 start replacing call sites - which is exactly when a
-missing overload or a `__host__`-only view method would be most expensive.
+`torch_ans/ta/` is the one place where the ATen build and the libtorch-stable-ABI
+build have to agree on an interface: a missing overload or a `__host__`-only view
+method breaks one of the two build modes, and the error surfaces at whichever call
+site reaches it first rather than here.
 
 This script therefore generates a throwaway translation unit that *uses* every
 primitive the layer exposes (all the templates, both dispatch macros, the POD
@@ -59,7 +58,7 @@ STABLE_DEFINES = [
 
 #: The ATen build gates its CUDA section on WITH_CUDA (what setup.py defines),
 #: the stable build on USE_CUDA (what makes the stable C shim declare the CUDA
-#: entries - STABLE_ABI_MIGRATION.md section 4, pit 1).
+#: entries).
 ATEN_CU_DEFINES = ["-DWITH_CUDA=1"]
 STABLE_CU_DEFINES = ["-DUSE_CUDA=1"]
 
@@ -198,7 +197,7 @@ def _find_nvcc(cuda_home):
 
     `shutil.which("nvcc")` comes last on purpose: on the development machine the
     one on PATH is CUDA 11.5, whose nvcc cannot compile this torch's headers,
-    while /usr/local/cuda-11.8 can (STABLE_ABI_MIGRATION.md section 4, pit 7).
+    while /usr/local/cuda-11.8 can.
     """
     candidates = []
     if cuda_home:

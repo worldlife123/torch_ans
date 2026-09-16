@@ -22,9 +22,9 @@ so the full build satisfies every profile and creating a second interface with
 a different configuration never rebuilds operators that are already there.
 
 A prebuilt libtorch-stable-ABI extension wins over both of those paths when it
-is available (torch_ans/_stable_C.py, STABLE_ABI_MIGRATION.md section 1.3): it
-contains every operator and is not tied to the local torch version, so nothing
-has to be compiled at all. That is also why the incremental profile machinery is
+is available (`torch_ans/_stable_C.py`): it contains every operator and is not
+tied to the local torch version, so nothing has to be compiled at all. That is
+also why the incremental profile machinery is
 bypassed for it - the point of profiles is to save compile time, and a prebuilt
 wheel does not compile.
 """

@@ -19,5 +19,8 @@ export.zip
 # torch_ans build metadata (written by setup.py / dynamic build)
 /torch_ans/_torch_build_version.py
 
+# local development notes (kept on disk, never part of the repository)
+/STABLE_ABI_MIGRATION.md
+
 # release artifacts
 /dist

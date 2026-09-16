@@ -3,8 +3,7 @@
 //   ATen build (`#else` below): a pybind11 module, `torch_ans._C`.
 //   stable-ABI build: no Python module at all - the .so only registers ops with
 //   the dispatcher and is loaded with `torch.ops.load_library()`. That is what
-//   makes it CPython-agnostic and torch-version-agnostic
-//   (STABLE_ABI_MIGRATION.md sections 1.1-1.3, stage 3).
+//   makes it CPython-agnostic and torch-version-agnostic.
 
 #include "rans.hpp"
 #include "rans_bindings.hpp"

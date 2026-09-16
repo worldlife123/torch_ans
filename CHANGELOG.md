@@ -11,14 +11,17 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 v0.4.0 completes the libtorch **stable ABI** migration: the native code can be compiled once against the stable
 ABI (`TORCH_TARGET_VERSION` = torch 2.10), so one `.so` serves every `torch >= 2.10`, and that path is preferred
 whenever a prebuilt extension is present. Source installs and `torch < 2.10` are unchanged - they keep compiling
-per torch exactly as before. Per-file details, the rejected alternatives and the measured numbers are in
-`STABLE_ABI_MIGRATION.md` (status and verification in its §9).
+per torch exactly as before. The four ways to handle stream capacity were all weighed: keeping the
+`aten::resize_` dispatcher call (removes neither of the two costs it has), the Python capacity contract
+(adopted), having the operator return a grown stream (changes the public signature and every call site) and a
+strict pre-reservation that raises instead of growing (loses push's self-growing behaviour for direct callers);
+`scripts/bench_stream_capacity.py` measures what the adopted one buys.
 
 ### Added
 
 - A prebuilt libtorch-stable-ABI wheel. `WITH_STABLE_ABI=1 pip install . --no-build-isolation` builds `torch_ans/_C_cpu.so` (all 71 schemas plus the CPU and catch-all implementations); adding `WITH_CUDA=1` also builds `torch_ans/_C_cuda.so`, which registers implementations only - a second schema declaration is rejected by the dispatcher. Both libraries export no CPython and no ATen/C++ symbols (only the stable C shim's `aoti_torch_*`/`torch_*`), which is what makes them independent of the torch release and the Python version; the wheel is therefore tagged `py3-none-<platform>`. `torch_ans/_stable_C.py` finds and loads them with `torch.ops.load_library`, ahead of any compilation, and every failure mode (old torch, missing/unloadable file, CUDA request without a CUDA library) is a warning plus the normal runtime build rather than an error. `TORCH_ANS_NO_STABLE_ABI=1` and `TORCH_ANS_STABLE_LIB_DIR` control the lookup; `incremental_compile=` has no effect on this path (the prebuilt extension has every operator).
 - `torch_ans/ta/`: the compatibility layer between the ATen build and the stable-ABI build (`torch_api.hpp` plus one header per backend and the POD `view.hpp`), so kernels and op wrappers exist once and both build modes are bit-comparable. Compile-checked in both modes and with nvcc by `scripts/check_ta_headers.py` / `tests/test_ta_headers.py`.
-- `scripts/check_stable_abi_wheel.py` (wheel shape, `nm -D -u` symbol whitelist, `readelf -d` NEEDED check) and `scripts/bench_stream_capacity.py` (the per-push cost of the capacity contract, before/after) - the numbers are recorded in `STABLE_ABI_MIGRATION.md` §9.2.
+- `scripts/check_stable_abi_wheel.py` (wheel shape, `nm -D -u` symbol whitelist, `readelf -d` NEEDED check) and `scripts/bench_stream_capacity.py` (the per-push cost of the capacity contract, before/after) - the measured numbers are in the capacity-contract entry below.
 - Tests for the new path: `tests/test_stable_abi.py` (registration, CPU/CUDA bit equality, the Python `bytes` operators, the CUDA flavour incl. warp-32 and the sparse inverse-CDF table), `tests/test_capacity_contract.py`, `tests/test_cross_version_load.py` (one wheel, several torch versions, one digest).
 - CI in `cibuildwheel.yml`: `build-stable-wheel` (build, retag to `py3-none-<platform>`, symbol whitelist, then "install it and check that using it compiles nothing"), `cross-version-load` (torch 2.10 / the build version / the newest release) and `cross-version-compare` (all digests must agree). The matrix floor is asserted against `_stable_C.STABLE_ABI_MIN_TORCH` by a test, so CI cannot drift below the ABI the `.so` targets.
 

@@ -17,8 +17,7 @@
 // Both backends use the *same* struct: ATen today, torch::stable under
 // TORCH_ANS_STABLE_ABI. That is what keeps the CPU and the CUDA kernels
 // bit-identical between the two build modes, and it is why `.accessor<>()` /
-// `.packed_accessor32<>()` can be replaced mechanically at every call site
-// (see STABLE_ABI_MIGRATION.md sections 2.3 / 2.4 / 2.5).
+// `.packed_accessor32<>()` can be replaced mechanically at every call site.
 //
 // The name of the file is stable history: it started as the POC's
 // `poc/stable_abi/csrc/poc_view.hpp`, whose structs are the same ones.
@@ -29,7 +28,7 @@
 // .cu the accessors are the *only* thing a kernel calls into, so they have to
 // be callable from device code (and from the host wrapper, hence __host__ too).
 // Forgetting this is 80x "calling a __host__ function from a __global__
-// function" (STABLE_ABI_MIGRATION.md section 4, pit 2).
+// function" - hence TA_VIEW_API below.
 #if defined(__CUDACC__)
 #define TA_VIEW_API __host__ __device__
 #else

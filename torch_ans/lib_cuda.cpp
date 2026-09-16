@@ -1,6 +1,6 @@
 // Entry point of the *CUDA* flavour of the prebuilt libtorch-stable-ABI wheel.
 //
-// The wheel ships a pair of libraries (STABLE_ABI_MIGRATION.md section 1.2):
+// The wheel ships a pair of libraries:
 //
 //   torch_ans/_C_cpu.so   lib.cpp         - every schema + CPU/catch-all impls
 //   torch_ans/_C_cuda.so  this file       - CUDA impls only, no schema at all

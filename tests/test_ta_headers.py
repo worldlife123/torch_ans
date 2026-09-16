@@ -1,9 +1,8 @@
-"""Stage-0 guard for the `ta::` compatibility layer (STABLE_ABI_MIGRATION.md).
+"""Guard for the `ta::` compatibility layer.
 
-`torch_ans/ta/` is not included by any source yet, so without these tests the
-four headers would only ever be compile-checked once stages 1/2/6 start
-replacing call sites - which is exactly when a missing overload or a
-`__host__`-only view method is most expensive. Two kinds of checks:
+`torch_ans/ta/` is what the kernels and op wrappers are written against, in both
+build modes, so a missing overload or a `__host__`-only view method breaks one of
+them at whichever call site reaches it first. Two kinds of checks:
 
 * static ones (no compiler involved): the four headers exist, `torch_api.hpp`
   really dispatches on `TORCH_ANS_STABLE_ABI`, and the stable backend stays free
@@ -29,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TA_DIR = ROOT / "torch_ans" / "ta"
 CHECKER = ROOT / "scripts" / "check_ta_headers.py"
 
-#: The four files STABLE_ABI_MIGRATION.md stage 0 asks for.
+#: The four files of the layer.
 HEADERS = ("torch_api.hpp", "torch_api_aten.hpp", "torch_api_stable.hpp",
            "view.hpp")
 

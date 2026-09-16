@@ -12,8 +12,8 @@
 //
 //   * `torch_ans_register_schemas` / `..._init_impls` / `..._family_impls` /
 //     `..._cpu_impls` / `..._cuda_impls` - the libtorch-stable-ABI registration
-//     (schema strings + boxed kernels) used by the prebuilt wheel
-//     (STABLE_ABI_MIGRATION.md stages 3-4/6). It is split because the schema may
+//     (schema strings + boxed kernels) used by the prebuilt wheel. It is split
+//     because the schema may
 //     be declared exactly once in the process: the CPU .so (lib.cpp) declares
 //     them and registers schemas + catch-all + CPU impls, while the CUDA .so
 //     (lib_cuda.cpp) registers implementations only (migration section 1.2).

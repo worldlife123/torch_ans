@@ -11,7 +11,7 @@
 // the same `select + amax + const_data_ptr` implementation as the stable
 // backend instead of `.item<T>()`. Keeping one implementation is what makes
 // "the same kernel, two build modes" verifiable (the POC proved bit-identical
-// results for the algorithm core; STABLE_ABI_MIGRATION.md section 1.4).
+// results for the algorithm core).
 //
 // This header must not be included by a stable-ABI translation unit: it pulls
 // in <torch/extension.h>, i.e. the whole of ATen.

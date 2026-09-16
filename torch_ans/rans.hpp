@@ -2,7 +2,7 @@
 
 // Op wrappers, written once against the `ta::` compatibility layer
 // (torch_ans/ta/torch_api.hpp): the ATen build today, the libtorch-stable-ABI
-// build for the prebuilt wheel tomorrow (STABLE_ABI_MIGRATION.md stage 1).
+// build for the prebuilt wheel tomorrow.
 // Nothing in this file may reach for ATen directly any more - the two
 // `py::bytes` operators are the one exception, because the stable ABI has no
 // schema type for them; they are behind `#ifndef TORCH_ANS_STABLE_ABI` and
@@ -120,7 +120,7 @@ ta::Tensor rans_build_inverse_cdf_cpu(const ta::Tensor& cdfs, int64_t freq_preci
 // capacity - the wrapper only checks it and throws instead of growing. Python
 // passes it for every push it issues (see torch_ans/utils.py::_encode_func), so
 // the hot path does not read the length word back (a blocking D2H on CUDA) and
-// never calls `aten::resize_` (STABLE_ABI_MIGRATION.md section 4, pit 4). The
+// never calls `aten::resize_`, whose schema the stable ABI does not promise. The
 // default -1 means "read the length word and grow the stream as needed", which is
 // what a direct op call (tests, benchmarks, scripts) keeps getting.
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>

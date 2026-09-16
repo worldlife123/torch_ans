@@ -12,8 +12,8 @@ from glob import glob
 # against the local torch: `pip install .` and the runtime JIT both use it, and
 # nothing in this file changes that path.
 #
-# WITH_STABLE_ABI=1 produces the prebuilt libtorch-stable-ABI libraries instead
-# (STABLE_ABI_MIGRATION.md sections 1.1/5): one `.so` per flavour that every
+# WITH_STABLE_ABI=1 produces the prebuilt libtorch-stable-ABI libraries instead:
+# one `.so` per flavour that every
 # torch >= 2.10 can load, because it only talks to the stable C shim. torch is
 # needed for its headers at build time and not at all at runtime.
 # ---------------------------------------------------------------------------
@@ -239,8 +239,7 @@ def get_stable_abi_extension_config():
         # The host compiler matters too: nvcc refuses a gcc it does not know
         # (CUDA 11.8 + gcc 11 is the usual case), so an explicit
         # `-ccbin <path>` is supported through TORCH_ANS_STABLE_CUDA_CCBIN
-        # (STABLE_ABI_MIGRATION.md section 4, pit 7). CUDA_HOME selects the
-        # toolkit itself, as always.
+        # CUDA_HOME selects the toolkit itself, as always.
         cuda_defines = common_defines + ["-DWITH_CUDA=1", "-DUSE_CUDA=1"]
         nvcc_flags = ["-O3"] + cuda_defines
         cuda_ccbin = os.getenv("TORCH_ANS_STABLE_CUDA_CCBIN")

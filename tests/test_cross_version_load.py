@@ -1,4 +1,4 @@
-"""One prebuilt `.so`, every `torch >= 2.10` (STABLE_ABI_MIGRATION.md stage 8).
+"""One prebuilt `.so`, every `torch >= 2.10`.
 
 This guards the claim the migration exists for: the wheel is compiled once
 (`TORCH_TARGET_VERSION` = torch 2.10, see `setup.py`) and has to load and code

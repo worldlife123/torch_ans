@@ -26,7 +26,6 @@
 // This file is deliberately the only place that knows about the stable ABI; it
 // was derived from (and is kept in sync with) `poc/stable_abi/csrc/
 // poc_torch_api.hpp`, which is the version that is actually covered by tests.
-// See STABLE_ABI_MIGRATION.md section 1.4.
 
 // Lowest ABI we claim to support (torch 2.10). setup.py passes the same value
 // as -D; this default only matters for ad-hoc compiles (`-fsyntax-only`).
@@ -282,8 +281,9 @@ inline void parallel_for(int64_t begin, int64_t end, int64_t grain, const F& f) 
 // signature is not covered by the ABI promise (only the *call mechanism* is).
 // `aten::resize_` has had this schema for years; if it ever changes the failure
 // is a loud TORCH_ERROR_CODE_CHECK at the call site, not silent corruption.
-// STABLE_ABI_MIGRATION.md section 4, pit 4 records the alternative (return a
-// grown stream instead of resizing in place).
+// The alternative - an operator that returns a grown stream instead of resizing
+// in place - was rejected: it changes the public signature and every call site,
+// and this branch only runs for callers that pass no `used_bytes`.
 inline void resize2d(Tensor& t, int64_t rows, int64_t cols) {
   std::vector<int64_t> size{rows, cols};
   std::array<StableIValue, 3> stack{

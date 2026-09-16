@@ -691,8 +691,8 @@ Runtime behaviour and knobs:
   profiles exist to save compile time - of which there is none here;
 - the API is unchanged (same operator names, same defaults). The one internal difference: the stream capacity
   is reserved by the Python layer and the native push only compares it (`used_bytes`), which keeps
-  `aten::resize_` and a device->host synchronisation out of every CUDA push - numbers in
-  `STABLE_ABI_MIGRATION.md` §9.2.
+  `aten::resize_` and a device->host synchronisation out of every CUDA push (a small push on an RTX 2080 Ti
+  went from 157 to 39 us; `scripts/bench_stream_capacity.py` reproduces that).
 
 Source distributions are unchanged: without a prebuilt `.so` the package installs as pure Python and compiles
 per torch at first use, exactly as before (`torch < 2.10` always takes that path).
