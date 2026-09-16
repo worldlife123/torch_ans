@@ -1,15 +1,17 @@
-name: Build wheels (pure Python, artifacts only)
+name: Build wheels (pure Python, prebuilt stable-ABI artifacts)
 
-# v0.3.0 does NOT publish wheels: the released artifact is the sdist, and the
-# native extension is compiled on the user's machine (on the first import, or at
-# install time with `pip install --no-build-isolation`). Distribution wheels
-# would pin the extension to the torch build they were compiled against, which
-# is exactly what this release avoids; see the README.
+# Two shapes are built here and they serve different purposes:
 #
-# This workflow therefore builds the pure-Python wheel (`py3-none-any`, no
-# `_C*.so`) with SKIP_BUILD_EXT=1, as a smoke test that the package also installs
-# without a compiler. Artifacts are uploaded for inspection only - there is no
-# publish job.
+# * the pure-Python wheel (`py3-none-any`, no `_C*.so`) with SKIP_BUILD_EXT=1 -
+#   the v0.3.0 story, a smoke test that the package also installs without a
+#   compiler. Artifacts are uploaded for inspection only, there is no publish job.
+#
+# * the prebuilt libtorch-stable-ABI wheel (`WITH_STABLE_ABI=1`) - one `.so` that
+#   every `torch >= 2.10` can load, validated here (wheel shape, symbol whitelist,
+#   "installing it compiles nothing") and then loaded under several torch versions
+#   in the cross-version jobs below, which are the ABI regression gate of
+#   STABLE_ABI_MIGRATION.md section 6. Publishing it is a separate decision; what
+#   this workflow guarantees is that it is correct when it is published.
 #
 # cibuildwheel is deliberately not used: since 3.0 it fails the build when a
 # wheel turns out to be pure Python ("Build failed because a pure Python wheel
@@ -73,8 +75,167 @@ jobs:
           name: wheels-${{ matrix.python }}
           path: wheelhouse/*.whl
 
+  build-stable-wheel:
+    name: Build the prebuilt stable-ABI wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install the build environment
+        # torch is needed for its headers and for `cpp_extension`'s include
+        # paths; it is *not* a build dependency of the .so, which only talks to
+        # the stable C shim (a CPU wheel is enough to build, even the CUDA
+        # flavour - see the note at the end of this job).
+        run: |
+          python -m pip install --upgrade pip
+          pip install "setuptools>=61" wheel build ninja pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build the wheel
+        env:
+          WITH_STABLE_ABI: "1"
+        run: |
+          python -m build --wheel --no-isolation --outdir wheelhouse
+
+      - name: Retag to py3-none-<platform>
+        # The libraries export no CPython symbols at all (asserted below), so the
+        # `cp311-cp311` that bdist_wheel derives from the mere presence of
+        # ext_modules is an artefact and would needlessly multiply the wheel
+        # matrix by the Python version. `wheel tags` is the supported way to say
+        # what the artefacts already are; STABLE_ABI_MIGRATION.md section 5.1.
+        run: |
+          python -m wheel tags --python-tag py3 --abi-tag none --remove wheelhouse/*.whl
+          ls -l wheelhouse
+
+      - name: Check the wheel (tag, shipped libraries, stable-ABI symbols)
+        run: python scripts/check_stable_abi_wheel.py wheelhouse/*.whl
+
+      - name: Install it and check that using it compiles nothing
+        run: |
+          set -euo pipefail
+          pip install --no-deps wheelhouse/*.whl
+          # From outside the checkout: pytest puts tests/ on the path, the wheel
+          # provides torch_ans, and the sources in the checkout cannot shadow it.
+          cd "$RUNNER_TEMP"
+          python -m pytest "$GITHUB_WORKSPACE/tests/test_stable_abi.py" \
+                           "$GITHUB_WORKSPACE/tests/test_capacity_contract.py" \
+                           "$GITHUB_WORKSPACE/tests/test_cross_version_load.py" -q
+          python - <<'PY'
+          import pathlib, torch_ans._C as C
+          from torch_ans import _stable_C
+          assert C.__file__.endswith("_C.py"), (
+              f"a compiled extension shadowed the shim: {C.__file__}")
+          stable = _stable_C.load_stable()
+          assert stable is not None, "the wheel's prebuilt extension was not found"
+          cache = pathlib.Path.home() / ".cache" / "torch_extensions"
+          compiled = list(cache.glob("*")) if cache.is_dir() else []
+          assert not compiled, f"using the wheel compiled something: {compiled}"
+          print("prebuilt extension :", ", ".join(stable._loaded_paths))
+          print("CUDA capability    :", stable._torch_ans_with_cuda)
+          print("no runtime build   : OK")
+          PY
+
+      - name: Upload the prebuilt wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-stable-cpu
+          path: wheelhouse/*.whl
+
+# CUDA flavour (not enabled here: it needs a GPU-less CUDA toolkit image or a
+# self-hosted runner, and the local recipe is pinned to a specific toolkit):
+#
+#   WITH_STABLE_ABI=1 WITH_CUDA=1 FORCE_CUDA=1 CUDA_HOME=/usr/local/cuda-11.8 \
+#     TORCH_ANS_STABLE_CUDA_CCBIN=/usr/bin/gcc-10 TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;9.0+PTX" \
+#     python -m build --wheel --no-isolation --outdir wheelhouse
+#   python scripts/check_stable_abi_wheel.py --require-cuda wheelhouse/*.whl
+#
+# `setup.py` bypasses `cpp_extension._check_cuda_version` for this build on
+# purpose (a stable-ABI .so does not link ATen's CUDA headers, so a CUDA 11.8
+# toolkit next to a cu130 torch is a supported combination - measured, see
+# poc/stable_abi/README.md section 3.4). Set TORCH_ANS_STABLE_KEEP_CUDA_CHECK=1
+# to keep torch's own behaviour instead.
+
+  cross-version-load:
+    name: Load one wheel under torch ${{ matrix.torch }}
+    needs: build-stable-wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is what the .so targets (TORCH_TARGET_VERSION = 2.10, see
+        # setup.py and torch_ans/_stable_C.STABLE_ABI_MIN_TORCH), 2.11 is the
+        # version the wheel is built against and 2.14 the newest release; the
+        # digest of all three has to be identical. Bump the newest entry over
+        # time - the floor is asserted against the code by
+        # tests/test_stable_abi.py::test_the_cross_version_matrix_starts_at_the_target.
+        torch: ["2.10.0", "2.11.0", "2.14.0"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download the prebuilt wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-stable-cpu
+          path: wheelhouse
+
+      - name: Install torch and the *same* wheel
+        run: |
+          pip install "torch==${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps wheelhouse/*.whl
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Code the fixed batch and record its digest
+        run: |
+          cd "$RUNNER_TEMP"
+          python "$GITHUB_WORKSPACE/tests/test_cross_version_load.py" \
+              --json "$RUNNER_TEMP/probe_${{ matrix.torch }}.json"
+
+      - name: Upload the probe
+        uses: actions/upload-artifact@v7
+        with:
+          name: probe-${{ matrix.torch }}
+          path: ${{ runner.temp }}/probe_*.json
+
+  cross-version-compare:
+    name: One digest for every torch version
+    needs: cross-version-load
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download every probe
+        uses: actions/download-artifact@v4
+        with:
+          pattern: probe-*
+          path: probes
+          merge-multiple: true
+
+      - name: Compare the digests
+        # The module is the one place that defines the probe *and* the
+        # comparison, so it is imported here as well - hence torch and pytest.
+        run: |
+          pip install pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python tests/test_cross_version_load.py --compare probes/*.json
+
 # NOTES:
 # - This is a template. Adapt Python versions to your needs.
-# - To publish wheels in a future release, they must be built with the target
-#   torch installed and `--no-build-isolation` (so that `_C` is really
-#   compiled), and that wheel then only matches that torch version.
+# - The pure-Python job above is what v0.3.0 released; the prebuilt wheel is the
+#   migration's artefact and is validated here before it is ever published.

@@ -653,6 +653,50 @@ import torch_ans
 
 
 
+## Prebuilt stable-ABI wheel
+
+Every release also builds a **prebuilt wheel**: since v0.4.0 the native code can be compiled once against the
+libtorch **stable ABI** (`TORCH_TARGET_VERSION` = torch 2.10) instead of against each user's torch, so one
+`.so` serves **every `torch >= 2.10`** - no compiler, no first-use build, no per-torch-version pinning.
+
+```bash
+# CPU flavour: builds torch_ans/_C_cpu.so (schemas + CPU and catch-all implementations)
+WITH_STABLE_ABI=1 pip install . --no-build-isolation
+
+# CUDA flavour: additionally builds torch_ans/_C_cuda.so (CUDA implementations only)
+WITH_STABLE_ABI=1 WITH_CUDA=1 pip install . --no-build-isolation
+```
+
+What CI checks (`scripts/check_stable_abi_wheel.py`, `tests/test_stable_abi.py`,
+`tests/test_cross_version_load.py`):
+
+- the libraries export **no CPython and no ATen/C++ symbols** - only `aoti_torch_*` / `torch_*` from the stable
+  C shim, which is what makes them independent of both the torch release and the Python version;
+- the wheel is therefore tagged `py3-none-<platform>`; the `cpXY` tag `bdist_wheel` derives from the mere
+  presence of `ext_modules` is corrected in CI with
+  `python -m wheel tags --python-tag py3 --abi-tag none`;
+- the CPU and CUDA libraries register under the *same* operator names (`torch.ops.torch_ans.*`), so the
+  dispatcher picks the kernel and nothing on the Python side has to know which flavour is installed;
+- the same wheel produces a **byte-identical stream under every tested torch version** (the
+  `cross-version-load` CI job: 2.10 = the ABI floor, the build version, and the newest release).
+
+Runtime behaviour and knobs:
+
+- installation is automatic: `torch_ans/_stable_C.py` looks for `_C_cpu*` / `_C_cuda*` next to the package
+  (or in `TORCH_ANS_STABLE_LIB_DIR`) and loads them with `torch.ops.load_library`, **preferring them over any
+  compilation**. A failed load is a warning plus the normal runtime build - never an error;
+- `TORCH_ANS_NO_STABLE_ABI=1` ignores the prebuilt extension (debugging/CI); `TORCH_ANS_STABLE_LIB_DIR=<dir>`
+  points the search somewhere else (used by the tests, which build the libraries outside the source tree);
+- `incremental_compile=` has no effect on this path: the prebuilt extension contains every operator, and the
+  profiles exist to save compile time - of which there is none here;
+- the API is unchanged (same operator names, same defaults). The one internal difference: the stream capacity
+  is reserved by the Python layer and the native push only compares it (`used_bytes`), which keeps
+  `aten::resize_` and a device->host synchronisation out of every CUDA push - numbers in
+  `STABLE_ABI_MIGRATION.md` §9.2.
+
+Source distributions are unchanged: without a prebuilt `.so` the package installs as pure Python and compiles
+per torch at first use, exactly as before (`torch < 2.10` always takes that path).
+
 ### TODO
 - Docs and examples for high-level API
 - ~~Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)~~ Done for `rans32_16_i32` / `rans32_16_i4`: warp-level 32-way (and 4-way sub-warp) interleaved coding on CUDA, bit-compatible with the CPU interleaved streams (see `torch_ans/rans_warp_cuda.cuh`, technique referenced from [Recoil](https://github.com/lin-toto/recoil))

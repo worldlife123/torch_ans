@@ -6,9 +6,36 @@ The format is based on "Keep a Changelog" and this project adheres to semantic v
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-16
+
+v0.4.0 completes the libtorch **stable ABI** migration: the native code can be compiled once against the stable
+ABI (`TORCH_TARGET_VERSION` = torch 2.10), so one `.so` serves every `torch >= 2.10`, and that path is preferred
+whenever a prebuilt extension is present. Source installs and `torch < 2.10` are unchanged - they keep compiling
+per torch exactly as before. Per-file details, the rejected alternatives and the measured numbers are in
+`STABLE_ABI_MIGRATION.md` (status and verification in its §9).
+
+### Added
+
+- A prebuilt libtorch-stable-ABI wheel. `WITH_STABLE_ABI=1 pip install . --no-build-isolation` builds `torch_ans/_C_cpu.so` (all 71 schemas plus the CPU and catch-all implementations); adding `WITH_CUDA=1` also builds `torch_ans/_C_cuda.so`, which registers implementations only - a second schema declaration is rejected by the dispatcher. Both libraries export no CPython and no ATen/C++ symbols (only the stable C shim's `aoti_torch_*`/`torch_*`), which is what makes them independent of the torch release and the Python version; the wheel is therefore tagged `py3-none-<platform>`. `torch_ans/_stable_C.py` finds and loads them with `torch.ops.load_library`, ahead of any compilation, and every failure mode (old torch, missing/unloadable file, CUDA request without a CUDA library) is a warning plus the normal runtime build rather than an error. `TORCH_ANS_NO_STABLE_ABI=1` and `TORCH_ANS_STABLE_LIB_DIR` control the lookup; `incremental_compile=` has no effect on this path (the prebuilt extension has every operator).
+- `torch_ans/ta/`: the compatibility layer between the ATen build and the stable-ABI build (`torch_api.hpp` plus one header per backend and the POD `view.hpp`), so kernels and op wrappers exist once and both build modes are bit-comparable. Compile-checked in both modes and with nvcc by `scripts/check_ta_headers.py` / `tests/test_ta_headers.py`.
+- `scripts/check_stable_abi_wheel.py` (wheel shape, `nm -D -u` symbol whitelist, `readelf -d` NEEDED check) and `scripts/bench_stream_capacity.py` (the per-push cost of the capacity contract, before/after) - the numbers are recorded in `STABLE_ABI_MIGRATION.md` §9.2.
+- Tests for the new path: `tests/test_stable_abi.py` (registration, CPU/CUDA bit equality, the Python `bytes` operators, the CUDA flavour incl. warp-32 and the sparse inverse-CDF table), `tests/test_capacity_contract.py`, `tests/test_cross_version_load.py` (one wheel, several torch versions, one digest).
+- CI in `cibuildwheel.yml`: `build-stable-wheel` (build, retag to `py3-none-<platform>`, symbol whitelist, then "install it and check that using it compiles nothing"), `cross-version-load` (torch 2.10 / the build version / the newest release) and `cross-version-compare` (all digests must agree). The matrix floor is asserted against `_stable_C.STABLE_ABI_MIN_TORCH` by a test, so CI cannot drift below the ABI the `.so` targets.
+
+### Changed
+
+- Stream capacity is now a contract between Python and the native push. `TorchANSInterface` reserves the capacity (`utils._stream_budget`, a port of the wrapper's worst-case arithmetic, pinned against it by `tests/test_capacity_contract.py`) and passes it as the new trailing `used_bytes` argument; with it the wrapper only compares and raises instead of reading the stream's length word back and resizing. That removes a blocking device->host copy from every CUDA push (measured 157 -> 39 us per small push; the CPU side 21 -> 12 us) and keeps `aten::resize_` - whose schema the stable ABI does not promise - out of the hot path and out of the prebuilt library. Omitting `used_bytes` (the default, -1) keeps the previous behaviour bit for bit, so direct operator calls, existing scripts and extensions compiled before this release are unaffected; `tests/test_capacity_contract.py` covers that fallback too.
+- The native operator set, the pybind11 bindings and the stable schemas/implementations are now declared side by side in `rans_bindings.hpp`, with `lib.cpp` (CPU flavour: schemas + catch-all + CPU implementations) and the new `lib_cuda.cpp` (CUDA flavour: implementations only) as the two entry points. `pybind11` is no longer a build or runtime dependency: the ordinary build takes the headers from torch itself and the stable build needs none.
+- `tests/test_warp_cuda.py::test_high_level_rans32_16_impl_resolution` compares the resolved encoder against the module the interface actually resolved, instead of against `torch_ans._C` (a different module whenever a compiled extension and a prebuilt one coexist).
+
 ### Fixed
 
+- CUDA kernels now launch on torch's current stream (`ta::current_stream`) instead of stream 0, which was a race with any non-default `torch.cuda.Stream()` and made coding invisible to stream ordering, and a launch error is checked (`cudaGetLastError`) instead of surfacing on the next unrelated CUDA call.
 - macOS runtime builds no longer abort the process on the first parallel operation. The OpenMP variant they get from Homebrew libomp links and imports perfectly well and then dies - SIGABRT inside `rans_pmf_to_quantized_cdf`, no exception, nothing a build- or load-time check could see - with torch 2.14 (2.13 and older work), which turned the full-matrix macOS arm64 jobs red. As the crash is invisible to the build, the runtime build now runs that operator once in a child process (a build cache hit plus one call) before accepting the variant, and falls back to the flags without a second OpenMP runtime - the ones `setup.py` has always used on macOS, with `at::parallel_for` on torch's own thread pool instead of a second runtime. The outcome is remembered in an `openmp_build_state` file in the torch extensions cache directory; delete it to try OpenMP again.
+
+### Removed
+
+- `ta::safe_stream_byte_length` / `ta::ensure_stream_capacity`: an unused second copy of the stream-growth arithmetic (only the header syntax check instantiated it) that would have had to stay in step with the native wrapper and the Python budget by hand.
 
 ## [0.3.0] - 2026-09-14
 
