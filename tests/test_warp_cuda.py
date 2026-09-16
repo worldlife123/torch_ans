@@ -484,8 +484,17 @@ class TestRansWarpCuda(unittest.TestCase):
         # regression: impl="rans32_16" must resolve to the rans32_16 functions
         # (previously shadowed by the "rans32" startswith branch)
         coder = TorchANSInterface(impl="rans32_16", device="cpu")
-        from torch_ans._C import rans32_16_push as bound_push
-        self.assertIs(coder.ans_encode_func, bound_push)
+        # Compare inside the module the interface itself resolved. When a prebuilt
+        # libtorch-stable-ABI extension serves the operators, `torch_ans._C` can be
+        # a different module object - a compiled `_C*.so` beside the package
+        # shadows `_C.py` while the ops come from `torch.ops.torch_ans` - so the
+        # two sides of this check have to be taken from the same module. The wheel
+        # layout (no `_C*.so`) resolves both through the shim, which
+        # build/check_wheel_like_identity.py asserts.
+        native = coder._native
+        self.assertIs(coder.ans_encode_func, getattr(native, "rans32_16_push"))
+        # the "rans32" branch must not have won (absent from a profile build)
+        self.assertIsNot(coder.ans_encode_func, getattr(native, "rans32_push", None))
         self.assertEqual(coder.freq_precision, min(coder.freq_precision, 15))
 
 

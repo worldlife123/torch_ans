@@ -50,6 +50,25 @@ class FakeShim:
             **{n: n for n in db.profile_op_names(profile)})
 
 
+@pytest.fixture(autouse=True)
+def _no_prebuilt_stable_extension(monkeypatch):
+    """Ignore an installed prebuilt libtorch-stable-ABI extension here.
+
+    `_lazy_C.ensure_full`/`ensure_module` return the prebuilt module *before*
+    `_compile` is reached (torch_ans/_stable_C.py, migration section 1.3), so with
+    one installed - or pointed at with TORCH_ANS_STABLE_LIB_DIR - every assertion
+    about the shim's own build/cache logic below would be unreachable. The stable
+    path has its own coverage in tests/test_stable_abi.py (migration section 2.11).
+
+    The shared loader is the seam to patch rather than `_lazy_C._stable_module`:
+    `_load_shim` re-executes `_lazy_C.py` as a separate module object, which
+    resolves `torch_ans._stable_C` through the package like the real shim does.
+    """
+    from torch_ans import _stable_C
+
+    monkeypatch.setattr(_stable_C, "load_stable", lambda require_cuda=False: None)
+
+
 @pytest.fixture
 def fake_native(monkeypatch):
     shim = FakeShim()

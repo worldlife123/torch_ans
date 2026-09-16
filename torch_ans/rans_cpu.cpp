@@ -1,8 +1,9 @@
-#include <torch/extension.h>
+#include "ta/torch_api.hpp"
 
 // #include <x86intrin.h>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 // #include <span>
 // #include <bit>
@@ -12,21 +13,21 @@
 #include "rans_build_config.hpp"
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS>
-torch::Tensor rans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size) 
+ta::Tensor rans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size) 
 {
   // +1 element of slack: the branch-free renormalization in
   // APPEND_STATE_TO_STREAM_IF always writes one word past the cursor (see
   // rans_utils.hpp), so the buffer must have room for it even when the last
   // append does not commit.
-  int64_t stream_init_size = 2 + preallocate_size / sizeof(DEFAULT_TORCH_TENSOR_TYPE) + num_interleaves * ((sizeof(RANS_STATE_TYPE) + sizeof(DEFAULT_TORCH_TENSOR_TYPE) - 1) / sizeof(DEFAULT_TORCH_TENSOR_TYPE));
-  auto stream = torch::zeros({size, stream_init_size}, torch::TensorOptions().dtype(DEFAULT_TORCH_TENSOR_DTYPE));
-  auto stream_accessor = stream.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
+  int64_t stream_init_size = 2 + preallocate_size / sizeof(int32_t) + num_interleaves * ((sizeof(RANS_STATE_TYPE) + sizeof(int32_t) - 1) / sizeof(int32_t));
+  ta::Tensor stream = ta::zeros({size, stream_init_size}, ta::ScalarType::Int);
+  ta::View2<int32_t> stream_view = ta::view2<int32_t>(stream);
   // stream.index_put_({Slice(), 0}, sizeof(RANS_STATE_TYPE));
 
-  at::parallel_for(0, size, 0, [&](size_t start, size_t end) {
+  ta::parallel_for(0, size, 0, [&](int64_t start, int64_t end) {
       for (size_t b = start; b < end; b++) {
-          stream_accessor[b][0] = sizeof(RANS_STATE_TYPE) * num_interleaves;
-          RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
+          stream_view.at(b, 0) = sizeof(RANS_STATE_TYPE) * num_interleaves;
+          RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_view.row(b)+1);
           for (int64_t i = 0; i < num_interleaves; i++) {
             state_ptr[i] = RANS_STATE_LOWER_BOUND;
           }
@@ -39,38 +40,41 @@ torch::Tensor rans_init_stream(int64_t size, int64_t num_interleaves, int64_t pr
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF, size_t NUM_INTERLEAVES>
 void rans_push_indexed_cpu(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& symbols, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+  ta::Tensor stream, 
+  const ta::Tensor& symbols, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision,
   bool bypass_coding, 
   int64_t bypass_precision)
 {
 
-  AT_DISPATCH_INTEGRAL_TYPES(symbols.scalar_type(), "rans_push_indexed_cpu", [&] {
+  TA_DISPATCH_INTEGRAL(symbols.scalar_type(), "rans_push_indexed_cpu", [&] {
 
     // TORCH_CHECK(stream.dtype() == DEFAULT_TORCH_TENSOR_DTYPE);
     // TORCH_CHECK(symbols.dtype() == DEFAULT_TORCH_TENSOR_DTYPE);
-    TORCH_INTERNAL_ASSERT(stream.device().type() == torch::DeviceType::CPU);
-    TORCH_INTERNAL_ASSERT(symbols.device().type() == torch::DeviceType::CPU);
+    STD_TORCH_CHECK(ta::is_cpu(stream), "rans_push: the stream must be a CPU tensor");
+    STD_TORCH_CHECK(ta::is_cpu(symbols), "rans_push: symbols must be a CPU tensor");
     
-    TORCH_CHECK(indexes.sizes() == symbols.sizes());
-    // TORCH_CHECK(indexes.dtype() == DEFAULT_TORCH_TENSOR_DTYPE);
-    TORCH_INTERNAL_ASSERT(indexes.device().type() == torch::DeviceType::CPU);
+    // ArrayRef comparison (indexes.sizes() == symbols.sizes()) is not part of
+    // the stable interface, so compare the two dimensions explicitly.
+    STD_TORCH_CHECK(indexes.size(0) == symbols.size(0) && indexes.size(1) == symbols.size(1),
+                    "indexes and symbols must have the same shape");
+    // STD_TORCH_CHECK(indexes.dtype() == DEFAULT_TORCH_TENSOR_DTYPE);
+    STD_TORCH_CHECK(ta::is_cpu(indexes), "rans_push: indexes must be a CPU tensor");
 
     auto batch_size = stream.size(0);
 
-    auto symbols_accessor = symbols.accessor<scalar_t, 2>();
-    int64_t num_symbols = symbols_accessor.size(1);
+    ta::View2<scalar_t> symbols_view = ta::view2<scalar_t>(symbols);
+    int64_t num_symbols = symbols_view.size1;
 
-    auto stream_accessor = stream.accessor<scalar_t, 2>();
-    auto indexes_accessor = indexes.accessor<scalar_t, 2>();
+    ta::View2<scalar_t> stream_view = ta::view2<scalar_t>(stream);
+    ta::View2<scalar_t> indexes_view = ta::view2<scalar_t>(indexes);
 
     // std::cout << "num_threads" << at::get_num_threads();
-    at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
+    ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
       // Everything the inner loops read repeatedly is copied into plain locals
       // *of this body*.
       //
@@ -82,11 +86,11 @@ void rans_push_indexed_cpu(// ANSStream stream,
       // *per lane*, chaining every lane behind the previous lane's store - the
       // main reason interleaving used to be a slowdown. A local whose address
       // never escapes cannot alias the stream, so it stays in a register.
-      scalar_t* const cdfs_data = cdfs.data_ptr<scalar_t>();
+      scalar_t* const cdfs_data = ta::data_ptr<scalar_t>(cdfs);
       const int64_t cdfs_row_stride = cdfs.stride(0);
-      const scalar_t* const cdfs_sizes_data = cdfs_sizes.data_ptr<scalar_t>();
+      const scalar_t* const cdfs_sizes_data = ta::const_data_ptr<scalar_t>(cdfs_sizes);
       const int64_t cdfs_sizes_stride = cdfs_sizes.stride(0);
-      const scalar_t* const offsets_data = offsets.data_ptr<scalar_t>();
+      const scalar_t* const offsets_data = ta::const_data_ptr<scalar_t>(offsets);
       const int64_t offsets_stride = offsets.stride(0);
       const int64_t num_dists = cdfs.size(0);
       const int64_t num_syms = num_symbols;
@@ -95,14 +99,14 @@ void rans_push_indexed_cpu(// ANSStream stream,
       const int64_t bpp = bypass_precision;
       // std::cout << "range:" << start << end << std::endl;
       for (size_t b = start; b < end; b++) {
-        const auto stream_length = stream_accessor[b][0];
+        const auto stream_length = stream_view.at(b, 0);
         const auto stream_ptr_offset = stream_length / sizeof(RANS_STREAM_TYPE);
-        RANS_STATE_TYPE* state_mem = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
+        RANS_STATE_TYPE* state_mem = reinterpret_cast<RANS_STATE_TYPE*>(stream_view.row(b)+1);
         RANS_STREAM_TYPE* const stream_base = reinterpret_cast<RANS_STREAM_TYPE*>(state_mem);
         RANS_STREAM_TYPE* stream_ptr = stream_base + stream_ptr_offset - 1;
 
-        auto symbols_ptr = symbols_accessor[b].data();
-        auto indexes_ptr = indexes_accessor[b].data();
+        auto symbols_ptr = symbols_view.row(b);
+        auto indexes_ptr = indexes_view.row(b);
         // reverse coding
         const int64_t first_interleave = num_syms % NUM_INTERLEAVES;
         int64_t i = num_syms-1;
@@ -239,7 +243,7 @@ void rans_push_indexed_cpu(// ANSStream stream,
 
         for (size_t j = 0; j < static_cast<size_t>(NUM_INTERLEAVES); j++) state_mem[j] = states[j];
         // update stream length
-        stream_accessor[b][0] = (stream_ptr - stream_base + 1) * sizeof(RANS_STREAM_TYPE);
+        stream_view.at(b, 0) = (stream_ptr - stream_base + 1) * sizeof(RANS_STREAM_TYPE);
       }
     });
 
@@ -250,42 +254,42 @@ void rans_push_indexed_cpu(// ANSStream stream,
 }
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF, bool USE_INVERSED_CDF, size_t NUM_INTERLEAVES>
-torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+ta::Tensor rans_pop_indexed_cpu(// ANSStream stream,
+  ta::Tensor stream, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision,
   bool bypass_coding, 
   int64_t bypass_precision,
   int64_t inverse_cdf_precision)
 {
-  torch::Tensor symbols = torch::zeros_like(indexes);
+  ta::Tensor symbols = ta::zeros_like(indexes);
 
-  AT_DISPATCH_INTEGRAL_TYPES(symbols.scalar_type(), "rans_pop_indexed_cpu", [&] {
+  TA_DISPATCH_INTEGRAL(symbols.scalar_type(), "rans_pop_indexed_cpu", [&] {
 
     auto batch_size = stream.size(0);
 
     // TODO: accessor according to dtype
-    auto stream_accessor = stream.accessor<scalar_t, 2>();
-    auto indexes_accessor = indexes.accessor<scalar_t, 2>();
+    ta::View2<scalar_t> stream_view = ta::view2<scalar_t>(stream);
+    ta::View2<scalar_t> indexes_view = ta::view2<scalar_t>(indexes);
 
-    auto symbols_accessor = symbols.accessor<scalar_t, 2>();
-    int64_t num_symbols = symbols_accessor.size(1);
+    ta::View2<scalar_t> symbols_view = ta::view2<scalar_t>(symbols);
+    int64_t num_symbols = symbols_view.size1;
 
     using RANS_SYMBOL_TYPE = scalar_t;
     using RANS_FREQ_TYPE = scalar_t;
 
-    at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
+    ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
       // copied into locals of this body, see rans_push_indexed_cpu for why this
       // matters (captured-by-reference values are reloaded after every store
       // into the stream, which serializes the interleaved lanes)
-      scalar_t* const cdfs_data = cdfs.data_ptr<scalar_t>();
+      scalar_t* const cdfs_data = ta::data_ptr<scalar_t>(cdfs);
       const int64_t cdfs_row_stride = cdfs.stride(0);
-      const scalar_t* const cdfs_sizes_data = cdfs_sizes.data_ptr<scalar_t>();
+      const scalar_t* const cdfs_sizes_data = ta::const_data_ptr<scalar_t>(cdfs_sizes);
       const int64_t cdfs_sizes_stride = cdfs_sizes.stride(0);
-      const scalar_t* const offsets_data = offsets.data_ptr<scalar_t>();
+      const scalar_t* const offsets_data = ta::const_data_ptr<scalar_t>(offsets);
       const int64_t offsets_stride = offsets.stride(0);
       const int64_t num_dists = cdfs.size(0);
       const int64_t num_syms = num_symbols;
@@ -294,13 +298,13 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
       const int64_t bpp = bypass_precision;
       const int64_t inv_fp = inverse_cdf_precision;
       for (size_t b = start; b < end; b++) {
-        const auto stream_length = stream_accessor[b][0];
+        const auto stream_length = stream_view.at(b, 0);
         const auto stream_ptr_offset = stream_length / sizeof(RANS_STREAM_TYPE);
-        RANS_STATE_TYPE* state_mem = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
+        RANS_STATE_TYPE* state_mem = reinterpret_cast<RANS_STATE_TYPE*>(stream_view.row(b)+1);
         RANS_STREAM_TYPE* const stream_base = reinterpret_cast<RANS_STREAM_TYPE*>(state_mem);
         RANS_STREAM_TYPE* stream_ptr = stream_base + stream_ptr_offset - 1;
-        auto symbols_ptr = symbols_accessor[b].data();
-        auto indexes_ptr = indexes_accessor[b].data();
+        auto symbols_ptr = symbols_view.row(b);
+        auto indexes_ptr = indexes_view.row(b);
         const int64_t last_interleave = num_syms - (NUM_INTERLEAVES-1);
         int64_t i;
 
@@ -566,7 +570,7 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
         }
 
         // update stream length
-        stream_accessor[b][0] = (stream_ptr - stream_base + 1) * sizeof(RANS_STREAM_TYPE);
+        stream_view.at(b, 0) = (stream_ptr - stream_base + 1) * sizeof(RANS_STREAM_TYPE);
 
       }
     });
@@ -587,31 +591,31 @@ torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
 //   freq = round(pmf * 2**p) -> cdf = [0, freq...] -> total = sum -> 0 becomes 1
 //   -> cdf = (cdf * 2**p) // total  (int32 wrap, truncating division)
 //   -> inclusive cumsum -> cdf[N] = 2**p -> "steal frequency" fix-up
-torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision) {
-  auto device = pmf.device();
-  auto dtype = torch::kInt32;
-  torch::Tensor pmf_batched;
+ta::Tensor rans_pmf_to_quantized_cdf_cpu(const ta::Tensor& pmf, int64_t precision) {
+  auto device = ta::device_of(pmf);
+  auto dtype = ta::ScalarType::Int;
+  ta::Tensor pmf_batched;
   int64_t B, N;
   if (pmf.dim() == 1) {
-    pmf_batched = pmf.unsqueeze(0);
+    pmf_batched = ta::unsqueeze(pmf, 0);
     B = 1;
     N = pmf.size(0);
   } 
   else 
   // If pmf has higher dimensions, we treat the last dimension as the symbol dimension and batch over the preceding dimensions
   {
-    pmf_batched = pmf.reshape({-1, pmf.size(-1)});
+    pmf_batched = ta::reshape(pmf, {-1, pmf.size(-1)});
     B = pmf_batched.size(0);
     N = pmf_batched.size(1);
   }
   const int64_t scale = (int64_t)1 << precision;
-  auto cdf_contig = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(device));
-  auto cdf_ptr = cdf_contig.data_ptr<int32_t>();
+  ta::Tensor cdf_contig = ta::zeros({B, N + 1}, dtype, device);
+  auto cdf_ptr = ta::data_ptr<int32_t>(cdf_contig);
 
-  const torch::Tensor pmf_contig = pmf_batched.contiguous();
-  AT_DISPATCH_FLOATING_TYPES(pmf_contig.scalar_type(), "rans_pmf_to_quantized_cdf_cpu", [&] {
-    const scalar_t* pmf_ptr = pmf_contig.data_ptr<scalar_t>();
-    at::parallel_for(0, B, 0, [&](size_t start, size_t end) {
+  const ta::Tensor pmf_contig = ta::as_contiguous(pmf_batched);
+  TA_DISPATCH_FLOATING(pmf_contig.scalar_type(), "rans_pmf_to_quantized_cdf_cpu", [&] {
+    const scalar_t* pmf_ptr = ta::const_data_ptr<scalar_t>(pmf_contig);
+    ta::parallel_for(0, B, 0, [&](int64_t start, int64_t end) {
       for (size_t b = start; b < end; b++) {
         const scalar_t* pmf_row = pmf_ptr + b * N;
         int32_t* row = cdf_ptr + b * (N + 1);
@@ -646,13 +650,13 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
                 best_steal = (int)j;
               }
             }
-            TORCH_CHECK(best_steal != -1, "No symbol to steal frequency from");
+            STD_TORCH_CHECK(best_steal != -1, "No symbol to steal frequency from");
             if (best_steal < i) {
               for (int64_t j = best_steal + 1; j <= i; ++j) {
                 row[j] -= 1;
               }
             } else {
-              TORCH_CHECK(best_steal > i, "best_steal must be > i");
+              STD_TORCH_CHECK(best_steal > i, "best_steal must be > i");
               for (int64_t j = i + 1; j <= best_steal; ++j) {
                 row[j] += 1;
               }
@@ -663,11 +667,11 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
     });
   });
   if (pmf.dim() == 1) {
-    return cdf_contig[0];
+    return ta::select(cdf_contig, 0, 0);
   } else {
     auto sizes = std::vector<int64_t>(pmf.sizes().begin(), pmf.sizes().end()-1);
     sizes.push_back(N+1);
-    return cdf_contig.reshape(sizes);
+    return ta::reshape(cdf_contig, sizes);
   }
 }
 
@@ -677,22 +681,22 @@ torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t pr
 // the largest symbol index whose cdf value is <= that start. cdf[0] is always 0,
 // so the binary search below (largest i with cdf[i] <= value) is exactly the
 // value the decoder wants - no off-by-one fix-up afterwards.
-torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq_precision,
+ta::Tensor rans_build_inverse_cdf_cpu(const ta::Tensor& cdfs, int64_t freq_precision,
                                          int64_t table_precision) {
-  TORCH_CHECK(table_precision >= 1 && table_precision <= freq_precision,
-              "table_precision must be in [1, ", freq_precision, "], got ", table_precision);
+  STD_TORCH_CHECK(table_precision >= 1 && table_precision <= freq_precision,
+                  "table_precision must be in [1, ", freq_precision, "], got ", table_precision);
   const bool was_1d = cdfs.dim() == 1;
-  const torch::Tensor cdf = (was_1d ? cdfs.unsqueeze(0) : cdfs).contiguous();
+  const ta::Tensor cdf = ta::as_contiguous(was_1d ? ta::unsqueeze(cdfs, 0) : cdfs);
   const int64_t B = cdf.size(0);
   const int64_t M = cdf.size(1);
   const int64_t T = (int64_t)1 << table_precision;
   const int64_t shift = freq_precision - table_precision;
 
-  torch::Tensor out = torch::empty({B, M + T}, cdf.options());
-  AT_DISPATCH_INTEGRAL_TYPES(cdf.scalar_type(), "rans_build_inverse_cdf_cpu", [&] {
-    const scalar_t* cdf_ptr = cdf.data_ptr<scalar_t>();
-    scalar_t* out_ptr = out.data_ptr<scalar_t>();
-    at::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
+  ta::Tensor out = ta::empty({B, M + T}, cdf.scalar_type(), ta::device_of(cdf));
+  TA_DISPATCH_INTEGRAL(cdf.scalar_type(), "rans_build_inverse_cdf_cpu", [&] {
+    const scalar_t* cdf_ptr = ta::const_data_ptr<scalar_t>(cdf);
+    scalar_t* out_ptr = ta::data_ptr<scalar_t>(out);
+    ta::parallel_for(0, B, 0, [&](int64_t begin, int64_t end) {
       for (int64_t b = begin; b < end; ++b) {
         const scalar_t* row = cdf_ptr + b * M;
         scalar_t* out_row = out_ptr + b * (M + T);
@@ -709,7 +713,7 @@ torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq
     });
   });
 
-  return was_1d ? out[0] : out;
+  return was_1d ? ta::select(out, 0, 0) : out;
 }
 
 

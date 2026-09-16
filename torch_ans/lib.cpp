@@ -1,75 +1,37 @@
-#include <torch/extension.h>
+// Module entry point, in the two flavours the package ships.
+//
+//   ATen build (`#else` below): a pybind11 module, `torch_ans._C`.
+//   stable-ABI build: no Python module at all - the .so only registers ops with
+//   the dispatcher and is loaded with `torch.ops.load_library()`. That is what
+//   makes it CPython-agnostic and torch-version-agnostic
+//   (STABLE_ABI_MIGRATION.md sections 1.1-1.3, stage 3).
 
 #include "rans.hpp"
 #include "rans_bindings.hpp"
 
+#ifdef TORCH_ANS_STABLE_ABI
 
-// Optimized: torch tensor input/output
-// inline torch::Tensor rans_pmf_to_quantized_cdf(const torch::Tensor& pmf, int precision) {
-//   TORCH_CHECK(pmf.dim() == 1 || pmf.dim() == 2, "pmf must be 1D or 2D tensor");
-//   auto device = pmf.device();
-//   auto dtype = torch::kInt32;
+// The schemas are declared exactly once per process: the CUDA flavour of the
+// wheel is a second .so (lib_cuda.cpp) that registers implementations only
+// (migration section 1.2). Load order between the two does not matter. This
+// library also carries the CPU (and catch-all) kernels, so a CPU-only wheel is
+// just this one file.
+STABLE_TORCH_LIBRARY(torch_ans, m) {
+  torch_ans_register_schemas(m);
+}
 
-//   torch::Tensor pmf_batched;
-//   int64_t B, N;
-//   if (pmf.dim() == 1) {
-//     pmf_batched = pmf.unsqueeze(0); // shape (1, N)
-//     B = 1;
-//     N = pmf.size(0);
-//   } else {
-//     pmf_batched = pmf;
-//     B = pmf.size(0);
-//     N = pmf.size(1);
-//   }
+// `init_stream` has no Tensor argument, so the dispatcher cannot derive a
+// backend key from the call; those operators live under the catch-all key
+// (migration section 4, pit 9).
+STABLE_TORCH_LIBRARY_IMPL(torch_ans, CompositeExplicitAutograd, m) {
+  torch_ans_register_init_impls(m);
+}
 
-//   auto freq = torch::round(pmf_batched * (1 << precision)).to(dtype);
-//   auto cdf = torch::zeros({B, N + 1}, torch::TensorOptions().dtype(dtype).device(device));
-//   cdf.index_put_({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None)}, freq);
-//   // Step 3: Normalize frequencies per batch
-//   auto total = cdf.sum(1, true).to(dtype);
-//   total = torch::where(total == 0, torch::ones_like(total), total); // avoid div by zero
-//   cdf = ((cdf * (1 << precision)) / total).to(dtype);
-//   // Step 4: Partial sum for CDF per batch
-//   cdf = torch::cumsum(cdf, 1).to(dtype);
-//   cdf.index_put_({torch::indexing::Slice(), N}, 1 << precision);
-//   // Step 5: Ensure strictly increasing CDF per batch
-//   auto cdf_contig = cdf.contiguous();
-//   auto cdf_ptr = cdf_contig.data_ptr<int32_t>();
-//   for (int b = 0; b < B; ++b) {
-//     int32_t* row = cdf_ptr + b * (N + 1);
-//     for (int i = 0; i < N; ++i) {
-//       if (row[i] == row[i + 1]) {
-//         int32_t best_freq = INT32_MAX;
-//         int best_steal = -1;
-//         for (int j = 0; j < N; ++j) {
-//           int32_t f = row[j + 1] - row[j];
-//           if (f > 1 && f < best_freq) {
-//             best_freq = f;
-//             best_steal = j;
-//           }
-//         }
-//         TORCH_CHECK(best_steal != -1, "No symbol to steal frequency from");
-//         if (best_steal < i) {
-//           for (int j = best_steal + 1; j <= i; ++j) {
-//             row[j] -= 1;
-//           }
-//         } else {
-//           TORCH_CHECK(best_steal > i, "best_steal must be > i");
-//           for (int j = i + 1; j <= best_steal; ++j) {
-//             row[j] += 1;
-//           }
-//         }
-//       }
-//     }
-//   }
-//   if (pmf.dim() == 1) {
-//     return cdf_contig[0];
-//   } else {
-//     return cdf_contig;
-//   }
-// }
+STABLE_TORCH_LIBRARY_IMPL(torch_ans, CPU, m) {
+  torch_ans_register_cpu_impls(m);
+}
 
-
+#else
 
 // TORCH_EXTENSION_NAME is provided by torch's build systems (BuildExtension
 // defines it as the last component of the extension name, and JIT builds via
@@ -104,10 +66,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     torch_ans_bind_all(m);
 }
 
+#endif  // TORCH_ANS_STABLE_ABI
+
 
 // Defines the operators
-// NOTE: this will fail as TORCH_LIBRARY do not support std::optional
+// NOTE: this used to fail because TORCH_LIBRARY could not express
+// std::optional, which is why the bindings are pybind11. The stable ABI does
+// support `Tensor?` (the POC verified it), so the equivalent registration now
+// exists in the TORCH_ANS_STABLE_ABI branch above.
 // TORCH_LIBRARY(torch_ans, m) {
-
 //     TORCH_LIBRARY_RANS_BINDINGS(m);
 // }

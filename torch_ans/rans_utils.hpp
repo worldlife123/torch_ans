@@ -1,6 +1,17 @@
 #pragma once
 
+// Everything below is plain C++: raw pointers, std::vector and templates. The
+// only libtorch dependency used to be the default tensor dtype at the bottom of
+// this block. A libtorch-stable-ABI build (TORCH_ANS_STABLE_ABI) must not pull
+// in ATen at all - that is the whole point of the stable ABI - so the torch
+// include is skipped there and the standard headers it used to provide
+// transitively (assert / std::cout, both used below) are included directly.
+#ifndef TORCH_ANS_STABLE_ABI
 #include <torch/extension.h>
+#else
+#include <cassert>
+#include <iostream>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -16,7 +27,12 @@
 #endif
 
 // TODO: support multiple dtypes!
+// NOTE: under the stable ABI build there is no `torch::kInt32` (this header
+// includes no torch headers at all then), so only the C++ type is defined and
+// callers spell the dtype out with torch::headeronly::ScalarType::Int.
+#ifndef TORCH_ANS_STABLE_ABI
 #define DEFAULT_TORCH_TENSOR_DTYPE torch::kInt32
+#endif
 #define DEFAULT_TORCH_TENSOR_TYPE int32_t
 
 // #define DEBUG_STEPS

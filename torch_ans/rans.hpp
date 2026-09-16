@@ -1,9 +1,22 @@
 #pragma once
 
-#include <torch/extension.h>
+// Op wrappers, written once against the `ta::` compatibility layer
+// (torch_ans/ta/torch_api.hpp): the ATen build today, the libtorch-stable-ABI
+// build for the prebuilt wheel tomorrow (STABLE_ABI_MIGRATION.md stage 1).
+// Nothing in this file may reach for ATen directly any more - the two
+// `py::bytes` operators are the one exception, because the stable ABI has no
+// schema type for them; they are behind `#ifndef TORCH_ANS_STABLE_ABI` and
+// move to Python in stage 4 (migration section 1.5).
+#include "ta/torch_api.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
 
 #include "rans_utils.hpp"
 #include "rans_build_config.hpp"
@@ -12,111 +25,143 @@
 
 // template <size_t STATE_BITS, size_t STREAM_BITS>
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS=0>
-torch::Tensor rans_init_stream(int64_t size, int64_t num_interleaves=1, int64_t preallocate_size=0);
+ta::Tensor rans_init_stream(int64_t size, int64_t num_interleaves=1, int64_t preallocate_size=0);
 
 // template <typename STATE_TYPE, typename STREAM_TYPE>
 // std::vector<py::bytes> rans_flush_stream(// ANSStream stream,
-//   torch::Tensor& stream);
+//   ta::Tensor& stream);
 
-std::vector<py::bytes> rans_stream_to_byte_strings(const torch::Tensor& stream);
+#ifndef TORCH_ANS_STABLE_ABI
+// pybind11-only: `std::vector<py::bytes>` has no stable-schema equivalent, so
+// the stable build drops both operators and Python does the conversion instead
+// (`torch_ans/_stable_C.py`, migration section 1.5). The ATen build keeps them
+// until stage 4 switches the Python call sites over.
+std::vector<py::bytes> rans_stream_to_byte_strings(const ta::Tensor& stream);
 
-torch::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings);
+ta::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings);
+#endif  // TORCH_ANS_STABLE_ABI
 
-std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
-  const torch::Tensor& cdfs, const torch::Tensor& cdfs_sizes,
+std::tuple<ta::Tensor, ta::Tensor> rans_alias_build_table(
+  const ta::Tensor& cdfs, const ta::Tensor& cdfs_sizes,
   int64_t symbol_precision=8,
   int64_t freq_precision=16
 );
 
-#if defined(WITH_CUDA) || defined(WITH_HIP)
+#if TA_WITH_CUDA
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
 void rans_push_indexed_cuda(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& symbols, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+  ta::Tensor stream, 
+  const ta::Tensor& symbols, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
   int64_t bypass_precision=4);
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
-torch::Tensor rans_pop_indexed_cuda(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+ta::Tensor rans_pop_indexed_cuda(// ANSStream stream,
+  ta::Tensor stream, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
   int64_t bypass_precision=4,
   int64_t inverse_cdf_precision=-1);
 
   // Batched PMF to quantized CDF declarations
-torch::Tensor rans_pmf_to_quantized_cdf_cuda(const torch::Tensor& pmf, int64_t precision);
+ta::Tensor rans_pmf_to_quantized_cdf_cuda(const ta::Tensor& pmf, int64_t precision);
 
 // B2: fused "cdf ++ inverse-CDF table" construction (device side, one launch)
-torch::Tensor rans_build_inverse_cdf_cuda(const torch::Tensor& cdfs, int64_t freq_precision,
-                                          int64_t table_precision);
+ta::Tensor rans_build_inverse_cdf_cuda(const ta::Tensor& cdfs, int64_t freq_precision,
+                                       int64_t table_precision);
 
 #endif
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
 void rans_push_indexed_cpu(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& symbols, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+  ta::Tensor stream, 
+  const ta::Tensor& symbols, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
   int64_t bypass_precision=4);
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
-torch::Tensor rans_pop_indexed_cpu(// ANSStream stream,
-  torch::Tensor stream, 
-  const torch::Tensor& indexes, 
-  const torch::Tensor& cdfs, 
-  const torch::Tensor& cdfs_sizes, 
-  const torch::Tensor& offsets,
+ta::Tensor rans_pop_indexed_cpu(// ANSStream stream,
+  ta::Tensor stream, 
+  const ta::Tensor& indexes, 
+  const ta::Tensor& cdfs, 
+  const ta::Tensor& cdfs_sizes, 
+  const ta::Tensor& offsets,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
   int64_t bypass_precision=4,
   int64_t inverse_cdf_precision=-1);
 
 // Batched PMF to quantized CDF declarations
-torch::Tensor rans_pmf_to_quantized_cdf_cpu(const torch::Tensor& pmf, int64_t precision);
+ta::Tensor rans_pmf_to_quantized_cdf_cpu(const ta::Tensor& pmf, int64_t precision);
 
 // B2: fused "cdf ++ inverse-CDF table" construction (host side)
-torch::Tensor rans_build_inverse_cdf_cpu(const torch::Tensor& cdfs, int64_t freq_precision,
-                                         int64_t table_precision);
+ta::Tensor rans_build_inverse_cdf_cpu(const ta::Tensor& cdfs, int64_t freq_precision,
+                                      int64_t table_precision);
 
+// Encode `symbols` into `stream` (in place: `stream` is a `Tensor(a!)` argument,
+// so the caller keeps using its own tensor object).
+//
+// `used_bytes` is the caller's upper bound on the bytes already coded into the
+// longest row of `stream`; when it is given (>= 0) the caller also owns the
+// capacity - the wrapper only checks it and throws instead of growing. Python
+// passes it for every push it issues (see torch_ans/utils.py::_encode_func), so
+// the hot path does not read the length word back (a blocking D2H on CUDA) and
+// never calls `aten::resize_` (STABLE_ABI_MIGRATION.md section 4, pit 4). The
+// default -1 means "read the length word and grow the stream as needed", which is
+// what a direct op call (tests, benchmarks, scripts) keeps getting.
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, size_t NUM_INTERLEAVES=1>
 void rans_push(// ANSStream stream,
-  torch::Tensor stream, 
-  torch::Tensor symbols, 
-  std::optional<torch::Tensor> indexes, 
-  std::optional<torch::Tensor> cdfs, 
-  std::optional<torch::Tensor> cdfs_sizes, 
-  std::optional<torch::Tensor> offsets,
+  ta::Tensor stream, 
+  ta::Tensor symbols, 
+  std::optional<ta::Tensor> indexes, 
+  std::optional<ta::Tensor> cdfs, 
+  std::optional<ta::Tensor> cdfs_sizes, 
+  std::optional<ta::Tensor> offsets,
   int64_t symbol_precision=8,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
-  int64_t bypass_precision=4)
+  int64_t bypass_precision=4,
+  int64_t used_bytes=-1)
 {
   const int64_t batch_size = stream.size(0);
   const int64_t num_symbols = symbols.size(1);
-  const bool use_cuda = stream.device().is_cuda();
+  const bool use_cuda = ta::is_cuda(stream);
 
   if (symbols.size(0) != batch_size) {
-    throw py::value_error("Symbols batch size mismatch!");
+    // std::invalid_argument rather than STD_TORCH_CHECK: pybind11 maps it to
+    // ValueError, which is what this call raised before the ta:: migration
+    // (the callers in utils.py, and the tests, expect a ValueError).
+    throw std::invalid_argument("Symbols batch size mismatch!");
   }
 
-  AT_DISPATCH_INTEGRAL_TYPES(stream.scalar_type(), "rans_push_resize_stream", [&] {
-    // Resize the stream to its worst-case size. Per coded symbol the stream
-    // grows by at most:
+  TA_DISPATCH_INTEGRAL(stream.scalar_type(), "rans_push_resize_stream", [&] {
+    // Make the stream hold the worst case, growing it only when the caller did
+    // not already reserve the capacity.
+    //
+    // `used_bytes` >= 0 is the caller's *upper bound* on the bytes already coded
+    // into the longest row (Python tracks it per stream, see
+    // torch_ans/utils.py::TorchANSInterface._reserve_stream). With it the caller
+    // owns the capacity and this wrapper only compares: no `select`+`amax` here,
+    // no blocking device->host copy of the length word on every CUDA push, and no
+    // `aten::resize_` - which the stable ABI does not promise (migration section
+    // 4, pit 4). -1 keeps the historical behaviour: read the length word and grow
+    // in place, which is what a direct op call gets.
+    //
+    // Per coded symbol the stream grows by at most:
     //   * freq_precision bits -- the rANS state absorbs
     //     log2(2^freq_precision / freq) <= freq_precision bits before a
     //     renormalization flush;
@@ -125,11 +170,13 @@ void rans_push(// ANSStream stream,
     //     ceil(symbol_bits / bypass_precision) chunks for the value itself, one
     //     chunk holding the chunk count, plus one chunk per carry of that count
     //     (a carry every max_bypass_val).
-    const int64_t max_byte_length =
-        (int64_t)stream.index({torch::indexing::Slice(), 0}).max().item<scalar_t>();
+    const bool caller_owns_capacity = used_bytes >= 0;
+    const int64_t max_byte_length = caller_owns_capacity
+        ? used_bytes
+        : (int64_t)ta::max_scalar<scalar_t>(stream);
     int64_t bits_per_symbol = freq_precision;
     if (bypass_coding) {
-      TORCH_CHECK(bypass_precision >= 1, "bypass_precision must be >= 1");
+      STD_TORCH_CHECK(bypass_precision >= 1, "bypass_precision must be >= 1");
       const int64_t symbol_bits = (int64_t)sizeof(scalar_t) * 8;
       const int64_t max_bypass_val = ((int64_t)1 << bypass_precision) - 1;
       const int64_t n_bypass = (symbol_bits + bypass_precision - 1) / bypass_precision;
@@ -146,7 +193,7 @@ void rans_push(// ANSStream stream,
         + ((int64_t)NUM_INTERLEAVES + 1) * (int64_t)sizeof(RANS_STREAM_TYPE);
 
     if (safe_byte_length < max_byte_length) {
-      throw py::value_error("Overflow!");
+      throw std::invalid_argument("Overflow!");
     }
 
     // NOTE: the computation above is deliberately kept in int64_t rather than a
@@ -161,59 +208,82 @@ void rans_push(// ANSStream stream,
     const int64_t safe_tensor_length = safe_byte_length / (int64_t)sizeof(scalar_t) + 1;
     const uint64_t total_bytes =
         (uint64_t)batch_size * (uint64_t)safe_tensor_length * (uint64_t)sizeof(scalar_t);
-    TORCH_CHECK(total_bytes <= (uint64_t)std::numeric_limits<size_t>::max(),
-                "rans_push: the stream would need ", total_bytes,
-                " bytes, which is not addressable on this platform");
+    STD_TORCH_CHECK(total_bytes <= (uint64_t)std::numeric_limits<size_t>::max(),
+                    "rans_push: the stream would need ", total_bytes,
+                    " bytes, which is not addressable on this platform");
     if (safe_tensor_length > stream.size(1)) {
-      const auto stream_copy = stream.clone();
-      stream = stream.resize_({batch_size, safe_tensor_length}).contiguous();
-      stream.index_put_({torch::indexing::Slice(), torch::indexing::Slice(0, stream_copy.size(1))}, stream_copy);
+      if (caller_owns_capacity) {
+        // The caller reserved the capacity, so a stream that is still too small
+        // is a bug on its side: report it loudly rather than papering over it
+        // with a resize (which would need the length word this parameter exists
+        // to avoid reading) - and certainly rather than letting the kernel write
+        // past the row.
+        throw std::invalid_argument(
+            "rans_push: the stream has " + std::to_string(stream.size(1)) +
+            " columns but this call needs " + std::to_string(safe_tensor_length) +
+            " (used_bytes=" + std::to_string(used_bytes) +
+            "); when used_bytes is given the caller owns the stream capacity");
+      }
+      // `resize_` in place, then copy the old contents back into the first
+      // stream_copy.size(1) columns. ATen's index_put_ with a Slice pair has no
+      // stable equivalent; narrow + copy_ is the same operation (migration
+      // section 2.2), and ta::resize2d is the one dispatcher call the layer
+      // keeps (no stable wrapper for aten::resize_ exists).
+      const ta::Tensor stream_copy = ta::clone(stream);
+      ta::resize2d(stream, batch_size, safe_tensor_length);
+      stream = ta::as_contiguous(stream);
+      ta::Tensor dst = ta::narrow(stream, 1, 0, stream_copy.size(1));
+      ta::copy_(dst, stream_copy);
     }
   });
 
   // indexed cdf
   if (indexes.has_value()) {
 
-    TORCH_CHECK(cdfs.has_value());
-    TORCH_CHECK(cdfs_sizes.has_value());
+    STD_TORCH_CHECK(cdfs.has_value());
+    STD_TORCH_CHECK(cdfs_sizes.has_value());
 
-    torch::Tensor offsets_tensor;
+    ta::Tensor offsets_tensor;
     if (!offsets.has_value()) 
-      offsets_tensor = torch::zeros({cdfs.value().size(0)}, indexes.value().options());
+      offsets_tensor = ta::new_zeros_1d(indexes.value(), cdfs.value().size(0));
     else
       offsets_tensor = offsets.value();
 
     if (use_cuda) {
-#if defined(WITH_CUDA) || defined(WITH_HIP)
+#if TA_WITH_CUDA
+      // The tensors must live on the device `stream` lives on; `.cuda()` used
+      // to mean "the current device", which is the same thing here because
+      // use_cuda is derived from stream itself.
+      const ta::Device device = ta::device_of(stream);
       return rans_push_indexed_cuda<RANS_STATE_TYPE, RANS_STREAM_TYPE, USE_ALIAS_SAMPLING_CDF, NUM_INTERLEAVES>(
-        stream.contiguous().cuda(), symbols.contiguous().cuda(), 
-        indexes.value().contiguous().cuda(), cdfs.value().contiguous().cuda(), 
-        cdfs_sizes.value().contiguous().cuda(), offsets_tensor.contiguous().cuda(), 
+        ta::as_contiguous(ta::to(stream, device)), ta::as_contiguous(ta::to(symbols, device)), 
+        ta::as_contiguous(ta::to(indexes.value(), device)), ta::as_contiguous(ta::to(cdfs.value(), device)), 
+        ta::as_contiguous(ta::to(cdfs_sizes.value(), device)), ta::as_contiguous(ta::to(offsets_tensor, device)), 
         freq_precision, bypass_coding, bypass_precision);
 #else
-      AT_ERROR("torch_ans is not compiled with GPU support!");
+      STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif
     }
 
     return rans_push_indexed_cpu<RANS_STATE_TYPE, RANS_STREAM_TYPE, USE_ALIAS_SAMPLING_CDF, NUM_INTERLEAVES>(
-      stream.contiguous(), symbols.contiguous(), 
-      indexes.value().contiguous(), cdfs.value().contiguous(), 
-      cdfs_sizes.value().contiguous(), offsets_tensor.contiguous(), 
+      ta::as_contiguous(stream), ta::as_contiguous(symbols), 
+      ta::as_contiguous(indexes.value()), ta::as_contiguous(cdfs.value()), 
+      ta::as_contiguous(cdfs_sizes.value()), ta::as_contiguous(offsets_tensor), 
       freq_precision, bypass_coding, bypass_precision);
 
   }
   else {
     // per-symbol cdf
     if (cdfs.has_value()) {
-      // TORCH_CHECK(cdfs_sizes.has_value(), #cdfs_sizes " must exist");
-      // TORCH_CHECK(offsets.has_value(), #offsets " must exist");
+      // STD_TORCH_CHECK(cdfs_sizes.has_value(), #cdfs_sizes " must exist");
+      // STD_TORCH_CHECK(offsets.has_value(), #offsets " must exist");
 
-      // auto cdfs_accessor = cdfs.value().accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
-      // auto cdfs_sizes_accessor = cdfs_sizes.value().accessor<DEFAULT_TORCH_TENSOR_TYPE, 1>();
-      // auto offsets_accessor = offsets.value().accessor<DEFAULT_TORCH_TENSOR_TYPE, 1>();
+      // auto cdfs_accessor = ta::view2<DEFAULT_TORCH_TENSOR_TYPE>(cdfs.value());
+      // auto cdfs_sizes_accessor = ta::view1<DEFAULT_TORCH_TENSOR_TYPE>(cdfs_sizes.value());
+      // auto offsets_accessor = ta::view1<DEFAULT_TORCH_TENSOR_TYPE>(offsets.value());
 
-      // at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
-      //     for (size_t b = start; b < end; b++) {
+      // ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+      //     for (int64_t b = start; b < end; b++) {
       //       auto stream_ptr_offset = stream_accessor[b][0] / sizeof(RANS_STREAM_TYPE);
       //       RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
       //       RANS_STREAM_TYPE* stream_ptr = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr+1) + stream_ptr_offset - 1;
@@ -236,8 +306,8 @@ void rans_push(// ANSStream stream,
     }
     // direct coding
     else {
-      // at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
-      //     for (size_t b = start; b < end; b++) {
+      // ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+      //     for (int64_t b = start; b < end; b++) {
       //       auto stream_ptr_offset = stream_accessor[b][0] / sizeof(RANS_STREAM_TYPE);
       //       RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data()+1);
       //       RANS_STREAM_TYPE* stream_ptr = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr+1) + stream_ptr_offset - 1;
@@ -266,57 +336,58 @@ void rans_push(// ANSStream stream,
 
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF=false, bool USE_INVERSED_CDF=false, size_t NUM_INTERLEAVES=1>
-torch::Tensor rans_pop(// ANSStream stream,
-  torch::Tensor stream, 
-  std::optional<torch::Tensor> indexes, 
-  std::optional<torch::Tensor> cdfs, 
-  std::optional<torch::Tensor> cdfs_sizes, 
-  std::optional<torch::Tensor> offsets,
+ta::Tensor rans_pop(// ANSStream stream,
+  ta::Tensor stream, 
+  std::optional<ta::Tensor> indexes, 
+  std::optional<ta::Tensor> cdfs, 
+  std::optional<ta::Tensor> cdfs_sizes, 
+  std::optional<ta::Tensor> offsets,
   int64_t symbol_precision=8,
   int64_t freq_precision=16,
   bool bypass_coding=true, 
   int64_t bypass_precision=4,
   int64_t inverse_cdf_precision=-1)
 {
-  torch::Tensor symbols;
-  const bool use_cuda = stream.device().is_cuda();
+  ta::Tensor symbols;
+  const bool use_cuda = ta::is_cuda(stream);
 
 
 
   // indexed cdf
   if (indexes.has_value()) {
 
-    TORCH_CHECK(cdfs.has_value());
-    TORCH_CHECK(cdfs_sizes.has_value());
+    STD_TORCH_CHECK(cdfs.has_value());
+    STD_TORCH_CHECK(cdfs_sizes.has_value());
 
-    torch::Tensor offsets_tensor;
+    ta::Tensor offsets_tensor;
     if (!offsets.has_value()) 
-      offsets_tensor = torch::zeros({cdfs.value().size(0)}, indexes.value().options());
+      offsets_tensor = ta::new_zeros_1d(indexes.value(), cdfs.value().size(0));
     else
       offsets_tensor = offsets.value();
 
     if (use_cuda) {
-#if defined(WITH_CUDA) || defined(WITH_HIP)
+#if TA_WITH_CUDA
+      const ta::Device device = ta::device_of(stream);
       return rans_pop_indexed_cuda<RANS_STATE_TYPE, RANS_STREAM_TYPE, USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, NUM_INTERLEAVES>(
-        stream.contiguous().cuda(),
-        indexes.value().contiguous().cuda(), cdfs.value().contiguous().cuda(), 
-        cdfs_sizes.value().contiguous().cuda(), offsets_tensor.contiguous().cuda(), 
+        ta::as_contiguous(ta::to(stream, device)),
+        ta::as_contiguous(ta::to(indexes.value(), device)), ta::as_contiguous(ta::to(cdfs.value(), device)), 
+        ta::as_contiguous(ta::to(cdfs_sizes.value(), device)), ta::as_contiguous(ta::to(offsets_tensor, device)), 
         freq_precision, bypass_coding, bypass_precision, inverse_cdf_precision);
 #else
-      AT_ERROR("torch_ans is not compiled with GPU support!");
+      STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif
     }
 
     return rans_pop_indexed_cpu<RANS_STATE_TYPE, RANS_STREAM_TYPE, USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, NUM_INTERLEAVES>(
-        stream.contiguous(),
-        indexes.value().contiguous(), cdfs.value().contiguous(), 
-        cdfs_sizes.value().contiguous(), offsets_tensor.contiguous(), 
+        ta::as_contiguous(stream),
+        ta::as_contiguous(indexes.value()), ta::as_contiguous(cdfs.value()), 
+        ta::as_contiguous(cdfs_sizes.value()), ta::as_contiguous(offsets_tensor), 
         freq_precision, bypass_coding, bypass_precision, inverse_cdf_precision);
 
   }
   else {
     // TODO:
-    // throw py::not_implemented_error("");
+    // throw std::invalid_argument("");
   }
   // TODO: shrink stream
 
@@ -325,12 +396,12 @@ torch::Tensor rans_pop(// ANSStream stream,
 }
 
 
-inline torch::Tensor rans_pmf_to_quantized_cdf(const torch::Tensor& pmfs, int64_t precision) {
-  if (pmfs.device().is_cuda()) {
-#if defined(WITH_CUDA) || defined(WITH_HIP)
+inline ta::Tensor rans_pmf_to_quantized_cdf(const ta::Tensor& pmfs, int64_t precision) {
+  if (ta::is_cuda(pmfs)) {
+#if TA_WITH_CUDA
     return rans_pmf_to_quantized_cdf_cuda(pmfs, precision);
 #else
-    AT_ERROR("torch_ans is not compiled with GPU support!");
+    STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif
   } else {
     return rans_pmf_to_quantized_cdf_cpu(pmfs, precision);
@@ -342,13 +413,13 @@ inline torch::Tensor rans_pmf_to_quantized_cdf(const torch::Tensor& pmfs, int64_
 // each torch call costs ~40 us of dispatch on this machine - more than the
 // coding itself for small tensors, because init_params runs per encode/decode
 // call in the dist_freqs API.
-inline torch::Tensor rans_build_inverse_cdf(const torch::Tensor& cdfs, int64_t freq_precision,
-                                            int64_t table_precision) {
-  if (cdfs.device().is_cuda()) {
-#if defined(WITH_CUDA) || defined(WITH_HIP)
+inline ta::Tensor rans_build_inverse_cdf(const ta::Tensor& cdfs, int64_t freq_precision,
+                                         int64_t table_precision) {
+  if (ta::is_cuda(cdfs)) {
+#if TA_WITH_CUDA
     return rans_build_inverse_cdf_cuda(cdfs, freq_precision, table_precision);
 #else
-    AT_ERROR("torch_ans is not compiled with GPU support!");
+    STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif
   } else {
     return rans_build_inverse_cdf_cpu(cdfs, freq_precision, table_precision);

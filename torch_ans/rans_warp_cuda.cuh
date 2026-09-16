@@ -26,7 +26,11 @@
 // most one stream word per renormalization step for all allowed precisions
 // (freq_precision <= 15), which the ballot/prefix scheme relies on.
 
-#include <torch/extension.h>
+// Kernels and launchers go through the ta:: compatibility layer, so this header
+// compiles in both build modes (ATen / libtorch stable ABI) - it is included by
+// rans_cuda.cu, which defines RANS_CUDA_API before including rans_utils.hpp.
+#include "ta/torch_api.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <type_traits>
@@ -214,12 +218,12 @@ __device__ __forceinline__ TORCH_TENSOR_TYPE rans_warp_pop_lookup(
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename TORCH_TENSOR_TYPE,
           bool USE_ALIAS_SAMPLING_CDF = false, size_t NUM_INTERLEAVES = 1>
 __global__ void rans_warp_push_indexed_kernel(
-  torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> stream_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> symbols_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> indexes_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> cdfs_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> cdfs_sizes_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> offsets_accessor,
+  ta::View2<TORCH_TENSOR_TYPE> stream_view,
+  const ta::View2<TORCH_TENSOR_TYPE> symbols_view,
+  const ta::View2<TORCH_TENSOR_TYPE> indexes_view,
+  const ta::View2<TORCH_TENSOR_TYPE> cdfs_view,
+  const ta::View1<TORCH_TENSOR_TYPE> cdfs_sizes_view,
+  const ta::View1<TORCH_TENSOR_TYPE> offsets_view,
   const int freq_precision, const bool bypass_coding, const int bypass_precision)
 {
   static_assert(NUM_INTERLEAVES <= 32 && (NUM_INTERLEAVES & (NUM_INTERLEAVES - 1)) == 0,
@@ -238,22 +242,22 @@ __global__ void rans_warp_push_indexed_kernel(
   const unsigned mask_le = group_mask & ((((1u << lane) - 1u) | (1u << lane)) << group_start_in_warp);
 
   const int64_t b = (int64_t)blockIdx.x * groups_per_block + group_in_block;
-  if (b >= stream_accessor.size(0)) return;  // uniform per group
+  if (b >= stream_view.size0) return;  // uniform per group
 
-  const int64_t num_symbols = symbols_accessor.size(1);
-  const int64_t num_cdfs = cdfs_accessor.size(0);
+  const int64_t num_symbols = symbols_view.size1;
+  const int64_t num_cdfs = cdfs_view.size0;
   const int p = freq_precision;
 
-  const auto stream_length = stream_accessor[b][0];
-  RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data() + 1);
+  const auto stream_length = stream_view.at(b, 0);
+  RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_view.row(b) + 1);
   RANS_STREAM_TYPE* base = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr);
   // the cursor names the last written word; appends start at cursor + 1
   RANS_STREAM_TYPE* cursor = base + stream_length / sizeof(RANS_STREAM_TYPE) - 1;
 
   RANS_STATE_TYPE state = state_ptr[lane];
 
-  const TORCH_TENSOR_TYPE* symbols_ptr = symbols_accessor[b].data();
-  const TORCH_TENSOR_TYPE* indexes_ptr = indexes_accessor[b].data();
+  const TORCH_TENSOR_TYPE* symbols_ptr = symbols_view.row(b);
+  const TORCH_TENSOR_TYPE* indexes_ptr = indexes_view.row(b);
 
   // --- tail: the top (num_symbols % N) symbols, one at a time, lane s % N ---
   const int64_t first_interleave = num_symbols % (int64_t)N;
@@ -273,9 +277,9 @@ __global__ void rans_warp_push_indexed_kernel(
       const auto index = indexes_ptr[s];
       valid = (index >= 0 && index < num_cdfs);
       if (valid) {
-        const auto cdf_size = cdfs_sizes_accessor[index];
-        const auto cdf_ptr = cdfs_accessor[index].data();
-        TORCH_TENSOR_TYPE value = symbols_ptr[s] - offsets_accessor[index];
+        const auto cdf_size = cdfs_sizes_view.at(index);
+        const auto cdf_ptr = cdfs_view.row(index);
+        TORCH_TENSOR_TYPE value = symbols_ptr[s] - offsets_view.at(index);
         if (bypass_coding) {
           const auto max_value = cdf_size - 2;
           TORCH_TENSOR_TYPE raw_val = 0;
@@ -326,10 +330,10 @@ __global__ void rans_warp_push_indexed_kernel(
     unsigned run_words = 0;
     bool is_sentinel = false;
     if (valid) {
-      const auto cdf_size = cdfs_sizes_accessor[index];
+      const auto cdf_size = cdfs_sizes_view.at(index);
       if (bypass_coding) {
         const auto max_value = cdf_size - 2;
-        TORCH_TENSOR_TYPE value = symbols_ptr[s] - offsets_accessor[index];
+        TORCH_TENSOR_TYPE value = symbols_ptr[s] - offsets_view.at(index);
         // zig-zag raw value; |value| must stay below ~2^30 for int32 symbols,
         // see the range-limit note in rans_push_step (rans_utils.hpp)
         if (value < 0) {
@@ -347,7 +351,7 @@ __global__ void rans_warp_push_indexed_kernel(
             tmp, raw_val, bypass_precision, (RANS_STREAM_TYPE*)nullptr);
         }
       } else {
-        cdf_value = symbols_ptr[s] - offsets_accessor[index];
+        cdf_value = symbols_ptr[s] - offsets_view.at(index);
       }
     }
 
@@ -377,11 +381,11 @@ __global__ void rans_warp_push_indexed_kernel(
     TORCH_TENSOR_TYPE start = 0, freq = 0;
     const TORCH_TENSOR_TYPE* alias_remap_ptr = nullptr;
     if (valid) {
-      const auto cdf_ptr = cdfs_accessor[index].data();
+      const auto cdf_ptr = cdfs_view.row(index);
       start = cdf_ptr[cdf_value];
       freq = cdf_ptr[cdf_value + 1] - start;
       if constexpr (USE_ALIAS_SAMPLING_CDF) {
-        alias_remap_ptr = cdf_ptr + cdfs_sizes_accessor[index];
+        alias_remap_ptr = cdf_ptr + cdfs_sizes_view.at(index);
       }
       pred = state >= ((RANS_STATE_LOWER_BOUND >> p) << RANS_STREAM_BITS) * (unsigned long long)freq;
     }
@@ -404,7 +408,7 @@ __global__ void rans_warp_push_indexed_kernel(
   }
 
   if (lane == 0) {
-    stream_accessor[b][0] = (TORCH_TENSOR_TYPE)((cursor - base + 1) * (int64_t)sizeof(RANS_STREAM_TYPE));
+    stream_view.at(b, 0) = (TORCH_TENSOR_TYPE)((cursor - base + 1) * (int64_t)sizeof(RANS_STREAM_TYPE));
   }
   state_ptr[lane] = state;
 }
@@ -421,12 +425,12 @@ template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, typename TORCH_TE
           bool USE_ALIAS_SAMPLING_CDF = false, bool USE_INVERSED_CDF = false,
           bool USE_SHARED_CDF = false, size_t NUM_INTERLEAVES = 1>
 __global__ void rans_warp_pop_indexed_kernel(
-  torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> stream_accessor,
-  torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> symbols_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> indexes_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 2, torch::RestrictPtrTraits> cdfs_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> cdfs_sizes_accessor,
-  const torch::PackedTensorAccessor32<TORCH_TENSOR_TYPE, 1, torch::RestrictPtrTraits> offsets_accessor,
+  ta::View2<TORCH_TENSOR_TYPE> stream_view,
+  ta::View2<TORCH_TENSOR_TYPE> symbols_view,
+  const ta::View2<TORCH_TENSOR_TYPE> indexes_view,
+  const ta::View2<TORCH_TENSOR_TYPE> cdfs_view,
+  const ta::View1<TORCH_TENSOR_TYPE> cdfs_sizes_view,
+  const ta::View1<TORCH_TENSOR_TYPE> offsets_view,
   const int freq_precision, const bool bypass_coding, const int bypass_precision,
   const int inverse_cdf_precision, const int smem_cdf_cols)
 {
@@ -444,10 +448,10 @@ __global__ void rans_warp_pop_indexed_kernel(
   extern __shared__ char rans_smem_raw[];
   TORCH_TENSOR_TYPE* const scdf = reinterpret_cast<TORCH_TENSOR_TYPE*>(rans_smem_raw);
   if constexpr (USE_SHARED_CDF) {
-    const int64_t n_cdf = cdfs_accessor.size(0);
+    const int64_t n_cdf = cdfs_view.size0;
     const int64_t total = n_cdf * (int64_t)smem_cdf_cols;
     for (int64_t k = (int64_t)threadIdx.x; k < total; k += (int64_t)blockDim.x) {
-      scdf[k] = cdfs_accessor[k / smem_cdf_cols][k % smem_cdf_cols];
+      scdf[k] = cdfs_view.at(k / smem_cdf_cols, k % smem_cdf_cols);
     }
     __syncthreads();
   }
@@ -463,22 +467,22 @@ __global__ void rans_warp_pop_indexed_kernel(
   const unsigned mask_le = group_mask & ((((1u << lane) - 1u) | (1u << lane)) << group_start_in_warp);
 
   const int64_t b = (int64_t)blockIdx.x * groups_per_block + group_in_block;
-  if (b >= stream_accessor.size(0)) return;  // uniform per group
+  if (b >= stream_view.size0) return;  // uniform per group
 
-  const int64_t num_symbols = symbols_accessor.size(1);
-  const int64_t num_cdfs = cdfs_accessor.size(0);
+  const int64_t num_symbols = symbols_view.size1;
+  const int64_t num_cdfs = cdfs_view.size0;
   const int p = freq_precision;
 
-  const auto stream_length = stream_accessor[b][0];
-  RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_accessor[b].data() + 1);
+  const auto stream_length = stream_view.at(b, 0);
+  RANS_STATE_TYPE* state_ptr = reinterpret_cast<RANS_STATE_TYPE*>(stream_view.row(b) + 1);
   RANS_STREAM_TYPE* base = reinterpret_cast<RANS_STREAM_TYPE*>(state_ptr);
   // the cursor names the last unconsumed word; pops read at cursor and below
   RANS_STREAM_TYPE* cursor = base + stream_length / sizeof(RANS_STREAM_TYPE) - 1;
 
   RANS_STATE_TYPE state = state_ptr[lane];
 
-  TORCH_TENSOR_TYPE* symbols_ptr = symbols_accessor[b].data();
-  const TORCH_TENSOR_TYPE* indexes_ptr = indexes_accessor[b].data();
+  TORCH_TENSOR_TYPE* symbols_ptr = symbols_view.row(b);
+  const TORCH_TENSOR_TYPE* indexes_ptr = indexes_view.row(b);
 
   const int64_t last_interleave = num_symbols - (int64_t)(N - 1);
   int64_t i = 0;
@@ -490,17 +494,17 @@ __global__ void rans_warp_pop_indexed_kernel(
     RANS_STATE_TYPE new_state = 0;
     TORCH_TENSOR_TYPE out_value = 0, offset_v = 0, max_value = 0;
     if (valid) {
-      const auto cdf_size = cdfs_sizes_accessor[index];
+      const auto cdf_size = cdfs_sizes_view.at(index);
       // with USE_SHARED_CDF the whole row (cdf + appended inverse-CDF table) is
       // staged, so both pointers come from shared memory
       const TORCH_TENSOR_TYPE* cdf_ptr;
       if constexpr (USE_SHARED_CDF) {
         cdf_ptr = scdf + (int64_t)index * smem_cdf_cols;
       } else {
-        cdf_ptr = cdfs_accessor[index].data();
+        cdf_ptr = cdfs_view.row(index);
       }
       const TORCH_TENSOR_TYPE* const inv_cdf_ptr = cdf_ptr + cdf_size;
-      offset_v = offsets_accessor[index];
+      offset_v = offsets_view.at(index);
       max_value = cdf_size - 2;
       const RANS_STATE_TYPE mask_p = (RANS_STATE_TYPE)((1ull << p) - 1);
       const TORCH_TENSOR_TYPE cum_freq = (TORCH_TENSOR_TYPE)(state & mask_p);
@@ -570,15 +574,15 @@ __global__ void rans_warp_pop_indexed_kernel(
     if (is_active) {
       const auto index = indexes_ptr[i];
       if (index >= 0 && index < num_cdfs) {
-        const auto cdf_size = cdfs_sizes_accessor[index];
+        const auto cdf_size = cdfs_sizes_view.at(index);
         const TORCH_TENSOR_TYPE* cdf_ptr;
         if constexpr (USE_SHARED_CDF) {
           cdf_ptr = scdf + (int64_t)index * smem_cdf_cols;
         } else {
-          cdf_ptr = cdfs_accessor[index].data();
+          cdf_ptr = cdfs_view.row(index);
         }
         const TORCH_TENSOR_TYPE* const inv_cdf_ptr = cdf_ptr + cdf_size;
-        const auto offset_v = offsets_accessor[index];
+        const auto offset_v = offsets_view.at(index);
         const auto max_value = cdf_size - 2;
         const RANS_STATE_TYPE mask_p = (RANS_STATE_TYPE)((1ull << p) - 1);
         const TORCH_TENSOR_TYPE cum_freq = (TORCH_TENSOR_TYPE)(state & mask_p);
@@ -617,7 +621,7 @@ __global__ void rans_warp_pop_indexed_kernel(
   }
 
   if (lane == 0) {
-    stream_accessor[b][0] = (TORCH_TENSOR_TYPE)((cursor - base + 1) * (int64_t)sizeof(RANS_STREAM_TYPE));
+    stream_view.at(b, 0) = (TORCH_TENSOR_TYPE)((cursor - base + 1) * (int64_t)sizeof(RANS_STREAM_TYPE));
   }
   state_ptr[lane] = state;
 }
@@ -629,60 +633,66 @@ __global__ void rans_warp_pop_indexed_kernel(
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF = false,
           size_t NUM_INTERLEAVES = 1>
 void rans_warp_push_indexed_cuda(
-  torch::Tensor stream,
-  const torch::Tensor& symbols,
-  const torch::Tensor& indexes,
-  const torch::Tensor& cdfs,
-  const torch::Tensor& cdfs_sizes,
-  const torch::Tensor& offsets,
+  ta::Tensor stream,
+  const ta::Tensor& symbols,
+  const ta::Tensor& indexes,
+  const ta::Tensor& cdfs,
+  const ta::Tensor& cdfs_sizes,
+  const ta::Tensor& offsets,
   int64_t freq_precision,
   bool bypass_coding,
   int64_t bypass_precision)
 {
-  TORCH_CHECK(freq_precision > 0 && freq_precision <= RANS_STATE_USED_BITS - RANS_STREAM_BITS,
+  STD_TORCH_CHECK(freq_precision > 0 && freq_precision <= RANS_STATE_USED_BITS - RANS_STREAM_BITS,
               "freq_precision must be in (0, ", RANS_STATE_USED_BITS - RANS_STREAM_BITS,
               "] for the warp-level interleaved kernels");
   if (bypass_coding) {
-    TORCH_CHECK(bypass_precision >= 1 && bypass_precision < freq_precision,
+    STD_TORCH_CHECK(bypass_precision >= 1 && bypass_precision < freq_precision,
                 "bypass_precision must be in [1, freq_precision)");
   }
 
-  AT_DISPATCH_INTEGRAL_TYPES(indexes.scalar_type(), "rans_warp_push_indexed_cuda", [&] {
+  // The warp kernels launch on the tensor's device and on torch's current
+  // stream, exactly like the non-interleaved ones in rans_cuda.cu.
+  const ta::DeviceGuard device_guard(ta::device_index(stream));
+  const cudaStream_t cuda_stream = ta::current_stream(stream);
+
+  TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "rans_warp_push_indexed_cuda", [&] {
     const int64_t batch_size = stream.size(0);
     constexpr int num_threads_per_block = WARP_NUM_THREADS_PER_BLOCK;
     constexpr int groups_per_block = num_threads_per_block / (int)NUM_INTERLEAVES;
     const int num_blocks = (int)((batch_size + groups_per_block - 1) / groups_per_block);
 
     rans_warp_push_indexed_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t, USE_ALIAS_SAMPLING_CDF,
-                                  NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
-        stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-        cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-        offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+                                  NUM_INTERLEAVES><<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
+        ta::view2<scalar_t>(stream),
+        ta::view2<scalar_t>(symbols),
+        ta::view2<scalar_t>(indexes),
+        ta::view2<scalar_t>(cdfs),
+        ta::view1<scalar_t>(cdfs_sizes),
+        ta::view1<scalar_t>(offsets),
         (int)freq_precision, bypass_coding, (int)bypass_precision);
+    TA_CUDA_CHECK(cudaGetLastError());
   });
 }
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, bool USE_ALIAS_SAMPLING_CDF = false,
           bool USE_INVERSED_CDF = false, size_t NUM_INTERLEAVES = 1>
-torch::Tensor rans_warp_pop_indexed_cuda(
-  torch::Tensor stream,
-  const torch::Tensor& indexes,
-  const torch::Tensor& cdfs,
-  const torch::Tensor& cdfs_sizes,
-  const torch::Tensor& offsets,
+ta::Tensor rans_warp_pop_indexed_cuda(
+  ta::Tensor stream,
+  const ta::Tensor& indexes,
+  const ta::Tensor& cdfs,
+  const ta::Tensor& cdfs_sizes,
+  const ta::Tensor& offsets,
   int64_t freq_precision,
   bool bypass_coding,
   int64_t bypass_precision,
   int64_t inverse_cdf_precision = -1)
 {
-  TORCH_CHECK(freq_precision > 0 && freq_precision <= RANS_STATE_USED_BITS - RANS_STREAM_BITS,
+  STD_TORCH_CHECK(freq_precision > 0 && freq_precision <= RANS_STATE_USED_BITS - RANS_STREAM_BITS,
               "freq_precision must be in (0, ", RANS_STATE_USED_BITS - RANS_STREAM_BITS,
               "] for the warp-level interleaved kernels");
   if (bypass_coding) {
-    TORCH_CHECK(bypass_precision >= 1 && bypass_precision < freq_precision,
+    STD_TORCH_CHECK(bypass_precision >= 1 && bypass_precision < freq_precision,
                 "bypass_precision must be in [1, freq_precision)");
   }
   // inverse_cdf_precision <= 0 means "dense table", the historical behaviour:
@@ -690,13 +700,17 @@ torch::Tensor rans_warp_pop_indexed_cuda(
   const int64_t inv_cdf_precision =
       (inverse_cdf_precision > 0) ? inverse_cdf_precision : freq_precision;
   if constexpr (USE_INVERSED_CDF) {
-    TORCH_CHECK(inv_cdf_precision >= 1 && inv_cdf_precision <= freq_precision,
+    STD_TORCH_CHECK(inv_cdf_precision >= 1 && inv_cdf_precision <= freq_precision,
                 "inverse_cdf_precision must be in [1, ", freq_precision, "]");
   }
 
-  torch::Tensor symbols = torch::zeros_like(indexes);
+  ta::Tensor symbols = ta::zeros_like(indexes);
 
-  AT_DISPATCH_INTEGRAL_TYPES(indexes.scalar_type(), "rans_warp_pop_indexed_cuda", [&] {
+  // See rans_warp_push_indexed_cuda: launch on the tensor's device and stream.
+  const ta::DeviceGuard device_guard(ta::device_index(stream));
+  const cudaStream_t cuda_stream = ta::current_stream(stream);
+
+  TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "rans_warp_pop_indexed_cuda", [&] {
     const int64_t batch_size = stream.size(0);
     // A6 tried to spread a small batch over more, smaller blocks; rejected, see
     // SPARSE_INVCDF_SUMMARY.md (A6 实测记录): warps == rows is fixed, so block
@@ -740,27 +754,29 @@ torch::Tensor rans_warp_pop_indexed_cuda(
     if (smem_cdf_cols > 0) {
       rans_warp_pop_indexed_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t,
                                    USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, true,
-                                   NUM_INTERLEAVES><<<num_blocks, num_threads_per_block, smem_bytes>>>(
-          stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-          offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+                                   NUM_INTERLEAVES><<<num_blocks, num_threads_per_block, smem_bytes, cuda_stream>>>(
+          ta::view2<scalar_t>(stream),
+          ta::view2<scalar_t>(symbols),
+          ta::view2<scalar_t>(indexes),
+          ta::view2<scalar_t>(cdfs),
+          ta::view1<scalar_t>(cdfs_sizes),
+          ta::view1<scalar_t>(offsets),
           (int)freq_precision, bypass_coding, (int)bypass_precision, (int)inv_cdf_precision,
           smem_cdf_cols);
+      TA_CUDA_CHECK(cudaGetLastError());
     } else {
       rans_warp_pop_indexed_kernel<RANS_STATE_TYPE, RANS_STREAM_TYPE, scalar_t,
                                    USE_ALIAS_SAMPLING_CDF, USE_INVERSED_CDF, false,
-                                   NUM_INTERLEAVES><<<num_blocks, num_threads_per_block>>>(
-          stream.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          symbols.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          indexes.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          cdfs.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
-          cdfs_sizes.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
-          offsets.packed_accessor32<scalar_t, 1, torch::RestrictPtrTraits>(),
+                                   NUM_INTERLEAVES><<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
+          ta::view2<scalar_t>(stream),
+          ta::view2<scalar_t>(symbols),
+          ta::view2<scalar_t>(indexes),
+          ta::view2<scalar_t>(cdfs),
+          ta::view1<scalar_t>(cdfs_sizes),
+          ta::view1<scalar_t>(offsets),
           (int)freq_precision, bypass_coding, (int)bypass_precision, (int)inv_cdf_precision,
           0);
+      TA_CUDA_CHECK(cudaGetLastError());
     }
   });
 

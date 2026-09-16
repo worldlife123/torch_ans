@@ -101,21 +101,27 @@
 // instantiation also survives -O3, which the address-of-an-unused-static idiom
 // does not (gcc drops both the variable and the instantiation).
 //
-// Requires <torch/extension.h> (for torch::Tensor) to be included first, which
-// rans.hpp, rans_cpu.cpp and rans_cuda.cu all do.
+// The signatures below are spelled in ta::Tensor (the compatibility layer's
+// tensor alias) instead of torch::Tensor, so that the same instantiation macros
+// serve the ATen build and the libtorch-stable-ABI build. ta::Tensor *is*
+// at::Tensor in the ATen build, so this is not a type change there. The layer
+// is pulled in here rather than assumed, because rans_cuda.cu includes this
+// header directly.
 // ---------------------------------------------------------------------------
 
+#include "ta/torch_api.hpp"
+
 #define TORCH_ANS_INST_INIT(STATE, STREAM) \
-  template torch::Tensor rans_init_stream<STATE, STREAM>(int64_t, int64_t, int64_t)
+  template ta::Tensor rans_init_stream<STATE, STREAM>(int64_t, int64_t, int64_t)
 
 #define TORCH_ANS_INST_PUSH(FN, STATE, STREAM, ALIAS, ILV) \
   template void FN<STATE, STREAM, ALIAS, ILV>( \
-      torch::Tensor, const torch::Tensor&, const torch::Tensor&, \
-      const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, \
+      ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
+      const ta::Tensor&, const ta::Tensor&, const ta::Tensor&, \
       int64_t, bool, int64_t)
 
 #define TORCH_ANS_INST_POP(FN, STATE, STREAM, ALIAS, INV, ILV) \
-  template torch::Tensor FN<STATE, STREAM, ALIAS, INV, ILV>( \
-      torch::Tensor, const torch::Tensor&, const torch::Tensor&, \
-      const torch::Tensor&, const torch::Tensor&, int64_t, bool, int64_t, \
+  template ta::Tensor FN<STATE, STREAM, ALIAS, INV, ILV>( \
+      ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
+      const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t, \
       int64_t)

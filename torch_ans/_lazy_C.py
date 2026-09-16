@@ -20,6 +20,13 @@ torch_ans/_dynamic_build.py and rans_build_config.hpp).
 Any already loaded module that exports everything a request asks for is reused,
 so the full build satisfies every profile and creating a second interface with
 a different configuration never rebuilds operators that are already there.
+
+A prebuilt libtorch-stable-ABI extension wins over both of those paths when it
+is available (torch_ans/_stable_C.py, STABLE_ABI_MIGRATION.md section 1.3): it
+contains every operator and is not tied to the local torch version, so nothing
+has to be compiled at all. That is also why the incremental profile machinery is
+bypassed for it - the point of profiles is to save compile time, and a prebuilt
+wheel does not compile.
 """
 from __future__ import annotations
 
@@ -99,8 +106,21 @@ def _usable(module, needed, require_cuda: bool) -> bool:
     return all(hasattr(module, name) for name in needed)
 
 
+def _stable_module(require_cuda: bool = False):
+    """The prebuilt libtorch-stable-ABI module, or None when there is none.
+
+    Split out so that both entry points ask the same question; the lookup and
+    the `torch.ops.load_library` calls are cached in torch_ans/_stable_C.py.
+    """
+    from . import _stable_C
+    return _stable_C.load_stable(require_cuda=require_cuda)
+
+
 def ensure_full(verbose: bool = True, require_cuda: bool = False):
     """Build/load the native extension that contains every operator."""
+    stable = _stable_module(require_cuda)
+    if stable is not None:
+        return stable
     from . import _dynamic_build
 
     key = _cache_key(_FULL_MODULE_NAME, require_cuda)
@@ -122,6 +142,9 @@ def ensure_module(profile=None, verbose: bool = True, require_cuda: bool = False
     reused instead of being rebuilt. With ``require_cuda`` a module that is
     known to lack CUDA support is never reused and the build insists on CUDA.
     """
+    stable = _stable_module(require_cuda)
+    if stable is not None:
+        return stable
     if profile is None:
         return ensure_full(verbose=verbose, require_cuda=require_cuda)
 

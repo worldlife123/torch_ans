@@ -1,26 +1,37 @@
+// The two `py::bytes` operators and the alias-table builder.
+//
+// The bytes pair cannot be expressed in a stable schema - `std::vector<py::bytes>`
+// has no StableIValue representation - so the stable build drops them and the
+// Python layer does the conversion instead (torch_ans/_stable_C.py, migration
+// section 1.5). The ATen build keeps them until the Python call sites switch
+// over in stage 4.
+//
+// `rans_alias_build_table` is an ordinary tensor op (Tensor in, two Tensors
+// out) and is shared by both builds.
 
 #include "rans.hpp"
 
+#ifndef TORCH_ANS_STABLE_ABI
 
-std::vector<py::bytes> rans_stream_to_byte_strings(const torch::Tensor& stream)
+std::vector<py::bytes> rans_stream_to_byte_strings(const ta::Tensor& stream)
 {
-  auto stream_safe = stream.cpu().contiguous();
-  auto stream_accessor = stream_safe.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
+  auto stream_safe = ta::as_contiguous(ta::to(stream, ta::Device(ta::DeviceType::CPU, 0)));
+  ta::View2<int32_t> stream_view = ta::view2<int32_t>(stream_safe);
 
   std::vector<py::bytes> output(stream.size(0));
   // NOTE: this cause error with openmp! maybe python objects cannot use parallel_for?
-  // at::parallel_for(0, stream.size(0), 0, [&](size_t start, size_t end) {
-  size_t start=0;
-  size_t end=stream.size(0);
-      for (size_t b = start; b < end; b++) {
-          output[b] = py::bytes(reinterpret_cast<char*>(stream_accessor[b].data()+1), stream_accessor[b][0]);
+  // ta::parallel_for(0, stream.size(0), 0, [&](int64_t start, int64_t end) {
+  int64_t start=0;
+  int64_t end=stream.size(0);
+      for (int64_t b = start; b < end; b++) {
+          output[b] = py::bytes(reinterpret_cast<char*>(stream_view.row(b)+1), stream_view.at(b, 0));
       }
   // });
 
   return output;
 }
 
-torch::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings)
+ta::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings)
 {
   // NOTE: implicit convert py::bytes to std::string
   // const std::string max_length_bytes = *std::max_element(byte_strings.begin(), byte_strings.end(), [](std::string s1, std::string s2){return s1.size()<s2.size();});
@@ -31,20 +42,20 @@ torch::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings)
     if (bytes.size() > max_length) max_length = bytes.size();
   }
 
-  const int64_t stream_length = (max_length + sizeof(DEFAULT_TORCH_TENSOR_TYPE) - 1) / sizeof(DEFAULT_TORCH_TENSOR_TYPE) + 1;
+  const int64_t stream_length = (max_length + sizeof(int32_t) - 1) / sizeof(int32_t) + 1;
 
-  auto stream = torch::zeros({batch_size, stream_length}, torch::TensorOptions().dtype(DEFAULT_TORCH_TENSOR_DTYPE));
-  auto stream_accessor = stream.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
+  ta::Tensor stream = ta::zeros({batch_size, stream_length}, ta::ScalarType::Int);
+  ta::View2<int32_t> stream_view = ta::view2<int32_t>(stream);
   // stream.index_put_({Slice(), 0}, sizeof(RANS_STATE_TYPE));
 
-  at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
-      for (size_t b = start; b < end; b++) {
+  ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+      for (int64_t b = start; b < end; b++) {
         // TODO: does it copy memory?
         std::string bytes = byte_strings[b];
         const auto byte_length = bytes.size();
         const char* bytes_ptr = bytes.data();
-        stream_accessor[b][0] = byte_length;
-        char* stream_ptr = reinterpret_cast<char*>(stream_accessor[b].data()+1);
+        stream_view.at(b, 0) = byte_length;
+        char* stream_ptr = reinterpret_cast<char*>(stream_view.row(b)+1);
         std::copy(bytes_ptr, bytes_ptr + byte_length, stream_ptr);
       }
   });
@@ -52,31 +63,34 @@ torch::Tensor rans_byte_strings_to_stream(std::vector<py::bytes> byte_strings)
   return stream;
 }
 
+#endif  // TORCH_ANS_STABLE_ABI
 
-std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
-  const torch::Tensor& cdfs, const torch::Tensor& cdfs_sizes,
+
+std::tuple<ta::Tensor, ta::Tensor> rans_alias_build_table(
+  const ta::Tensor& cdfs, const ta::Tensor& cdfs_sizes,
   int64_t symbol_precision,
   int64_t freq_precision
 )
 {
-  auto cdfs_accessor = cdfs.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
-  auto cdfs_sizes_accessor = cdfs_sizes.accessor<DEFAULT_TORCH_TENSOR_TYPE, 1>();
+  ta::View2<int32_t> cdfs_view = ta::view2<int32_t>(cdfs);
+  ta::View1<int32_t> cdfs_sizes_view = ta::view1<int32_t>(cdfs_sizes);
   const int64_t batch_size = cdfs.size(0);
   const int64_t max_cdf_size = cdfs.size(1);
 
   // TODO: confirm the max size of cdfs_with_alias_table
-  auto cdfs_with_alias_table = torch::zeros({batch_size, static_cast<int64_t>(max_cdf_size + max_cdf_size*(sizeof(RANSAliasSamplingCDFTableElement<DEFAULT_TORCH_TENSOR_TYPE>)/sizeof(DEFAULT_TORCH_TENSOR_TYPE)))}, 
-    torch::TensorOptions().dtype(DEFAULT_TORCH_TENSOR_DTYPE));
-  auto cdfs_with_alias_table_accessor = cdfs_with_alias_table.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
-  auto cdfs_with_alias_remap = torch::zeros({batch_size, max_cdf_size + (1<<freq_precision)}, torch::TensorOptions().dtype(DEFAULT_TORCH_TENSOR_DTYPE));
-  auto cdfs_with_alias_remap_accessor = cdfs_with_alias_remap.accessor<DEFAULT_TORCH_TENSOR_TYPE, 2>();
+  ta::Tensor cdfs_with_alias_table = ta::zeros(
+    {batch_size, static_cast<int64_t>(max_cdf_size + max_cdf_size*(sizeof(RANSAliasSamplingCDFTableElement<int32_t>)/sizeof(int32_t)))},
+    ta::ScalarType::Int);
+  ta::View2<int32_t> cdfs_with_alias_table_view = ta::view2<int32_t>(cdfs_with_alias_table);
+  ta::Tensor cdfs_with_alias_remap = ta::zeros({batch_size, max_cdf_size + (1<<freq_precision)}, ta::ScalarType::Int);
+  ta::View2<int32_t> cdfs_with_alias_remap_view = ta::view2<int32_t>(cdfs_with_alias_remap);
 
-  at::parallel_for(0, batch_size, 0, [&](size_t start, size_t end) {
-      for (size_t b = start; b < end; b++) {
-        auto cdf_ptr = cdfs_accessor[b].data();
-        auto cdf_size = cdfs_sizes_accessor[b];
-        auto cdf_alias_table_ptr = cdfs_with_alias_table_accessor[b].data();
-        auto cdf_alias_remap_ptr = cdfs_with_alias_remap_accessor[b].data();
+  ta::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+      for (int64_t b = start; b < end; b++) {
+        auto cdf_ptr = cdfs_view.row(b);
+        auto cdf_size = cdfs_sizes_view[b];
+        auto cdf_alias_table_ptr = cdfs_with_alias_table_view.row(b);
+        auto cdf_alias_remap_ptr = cdfs_with_alias_remap_view.row(b);
         // copy existing cdf to new tensors
         std::copy(cdf_ptr, cdf_ptr + cdf_size, cdf_alias_table_ptr);
         cdf_alias_table_ptr += cdf_size;
@@ -87,13 +101,13 @@ std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
         // to exactly 2**freq_precision). Ignoring it used to leave a partially
         // built table behind, which silently produced a wrong stream on every
         // symbol instead of an error - so fail loudly.
-        const bool built = build_alias_mapping<DEFAULT_TORCH_TENSOR_TYPE, DEFAULT_TORCH_TENSOR_TYPE>(
+        const bool built = build_alias_mapping<int32_t, int32_t>(
           cdf_ptr, cdf_size,
-          reinterpret_cast<RANSAliasSamplingCDFTableElement<DEFAULT_TORCH_TENSOR_TYPE>*>(cdf_alias_table_ptr), 
-          reinterpret_cast<DEFAULT_TORCH_TENSOR_TYPE*>(cdf_alias_remap_ptr), 
+          reinterpret_cast<RANSAliasSamplingCDFTableElement<int32_t>*>(cdf_alias_table_ptr), 
+          reinterpret_cast<int32_t*>(cdf_alias_remap_ptr), 
           symbol_precision, freq_precision
         );
-        TORCH_CHECK(built,
+        STD_TORCH_CHECK(built,
           "alias sampling table could not be built: it requires "
           "2**symbol_precision == cdfs_sizes[i] - 1 and a cdf whose frequencies sum to "
           "2**freq_precision. Got cdf_size=", cdf_size, " (symbol_precision=",
@@ -101,5 +115,5 @@ std::tuple<torch::Tensor, torch::Tensor> rans_alias_build_table(
       }
   });
 
-  return std::tuple<torch::Tensor, torch::Tensor>(cdfs_with_alias_remap, cdfs_with_alias_table);
+  return std::tuple<ta::Tensor, ta::Tensor>(cdfs_with_alias_remap, cdfs_with_alias_table);
 }

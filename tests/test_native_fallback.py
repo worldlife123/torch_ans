@@ -1,13 +1,19 @@
 """Tests for the native-module fallbacks in torch_ans.utils.
 
-Three situations are covered, none of which compiles anything:
+Four situations are covered, none of which compiles anything:
 
 1. the pre-built ``torch_ans._C`` cannot be imported at all (e.g. it was
    compiled against another torch) -> the lazy shim takes over;
 2. ``TORCH_ANS_FORCE_RUNTIME_BUILD=1`` bypasses the pre-built extension;
 3. CUDA coding is requested from a module that was built without CUDA support
    -> warn and switch to a locally compiled CUDA module, or explain what to
-   install when that is not possible.
+   install when that is not possible;
+4. the same contract for the prebuilt libtorch-stable-ABI extension
+   (``torch_ans/_stable_C.py``, migration section 5.2): it is preferred over
+   compiling, and every way of not having a usable one - an old torch, the
+   opt-out switch, a missing or unloadable file, a CUDA request without a CUDA
+   library - has to return None so that the runtime build takes over instead of
+   the call failing.
 """
 import contextlib
 import importlib.util
@@ -41,6 +47,22 @@ def _no_warnings():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_prebuilt_stable_extension(monkeypatch):
+    """No prebuilt stable-ABI extension for the tests in this module.
+
+    `_lazy_C.ensure_full`/`ensure_module` return the prebuilt module before
+    `_compile` is reached (torch_ans/_stable_C.py, migration section 1.3), which
+    would bypass the shim/runtime-build behaviour asserted below whenever one is
+    installed or pointed at with TORCH_ANS_STABLE_LIB_DIR. `_stable_module` is the
+    shim's own seam onto the loader, so the section-6 tests - which call
+    `_stable_C.load_stable` directly to cover the loader itself - keep working.
+    """
+    from torch_ans import _lazy_C
+
+    monkeypatch.setattr(_lazy_C, "_stable_module", lambda require_cuda=False: None)
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +390,162 @@ def test_interface_resolve_native_requests_a_cuda_module(monkeypatch):
     assert utils.module_has_cuda(interface._native) is True
     # the operators were rebound to the new module
     assert interface.ans_encode_func == "rans64_push"
+
+
+# ---------------------------------------------------------------------------
+# 6. the prebuilt libtorch-stable-ABI extension
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def stable_loader(monkeypatch, tmp_path):
+    """`_stable_C` with an isolated search path and a fresh answer cache.
+
+    The torch version is forced up: the gate itself is tested separately, and the
+    rest of these tests must not depend on the interpreter's torch being >= 2.10
+    (the prebuilt extension is usually exercised from a source checkout, which can
+    run on an older torch).
+    """
+    from torch_ans import _stable_C
+
+    monkeypatch.setattr(_stable_C, "_loaded", {})
+    monkeypatch.setattr(_stable_C, "_search_dirs", lambda: [tmp_path])
+    monkeypatch.setattr(_stable_C, "_torch_version_tuple", lambda: (3, 0, 0))
+    monkeypatch.delenv(_stable_C.DISABLE_ENV_VAR, raising=False)
+    return _stable_C, tmp_path
+
+
+def _fake_load_library(monkeypatch, recorder=None, fail_for=()):
+    """Replace `torch.ops.load_library` (which would register real operators)."""
+    import torch
+
+    def load(path):
+        if recorder is not None:
+            recorder.append(path)
+        for marker in fail_for:
+            if marker in path:
+                raise OSError(f"{marker}: cannot load, wrong ABI")
+
+    monkeypatch.setattr(torch.ops, "load_library", load)
+
+
+def test_stable_loader_is_disabled_by_the_opt_out_switch(stable_loader, monkeypatch):
+    stable, directory = stable_loader
+    (directory / "_C_cpu.so").write_bytes(b"")
+    monkeypatch.setenv(stable.DISABLE_ENV_VAR, "1")
+
+    assert stable.load_stable() is None
+
+
+def test_stable_loader_requires_torch_2_10(stable_loader, monkeypatch):
+    """Below the target ABI the prebuilt .so must not even be tried."""
+    stable, directory = stable_loader
+    (directory / "_C_cpu.so").write_bytes(b"")
+    monkeypatch.setattr(stable, "_torch_version_tuple", lambda: (2, 9, 1))
+
+    assert stable.load_stable() is None
+
+
+def test_stable_loader_without_the_extension_falls_back(stable_loader):
+    stable, _ = stable_loader
+
+    assert stable.load_stable() is None, "no _C_cpu*.so -> the runtime build"
+
+
+def test_stable_loader_prefers_and_caches_the_cpu_library(stable_loader, monkeypatch):
+    stable, directory = stable_loader
+    cpu = directory / "_C_cpu.so"
+    cpu.write_bytes(b"")
+    loaded = []
+    _fake_load_library(monkeypatch, loaded)
+
+    module = stable.load_stable()
+    assert module is not None
+    assert loaded == [str(cpu)]
+    assert module._torch_ans_with_cuda is False
+    # the answer is cached: loading a library registers process-wide operators
+    assert stable.load_stable() is module
+
+
+def test_stable_loader_refuses_a_cuda_request_without_the_cuda_library(
+        stable_loader, monkeypatch):
+    """A CUDA request must reach the runtime build, not a CPU-only library."""
+    stable, directory = stable_loader
+    (directory / "_C_cpu.so").write_bytes(b"")
+    loaded = []
+    _fake_load_library(monkeypatch, loaded)
+
+    assert stable.load_stable(require_cuda=True) is None
+    assert loaded == [], "the CPU library is not even loaded for a CUDA request"
+    # ... while a plain CPU request is served, and reports the truth
+    assert stable.load_stable()._torch_ans_with_cuda is False
+
+
+def test_stable_loader_warns_and_falls_back_when_loading_fails(
+        stable_loader, monkeypatch):
+    stable, directory = stable_loader
+    (directory / "_C_cpu.so").write_bytes(b"")
+    _fake_load_library(monkeypatch, fail_for=("_C_cpu.so",))
+
+    with pytest.warns(RuntimeWarning, match="could not be loaded"):
+        assert stable.load_stable() is None
+
+
+def test_stable_loader_warns_when_only_the_cuda_library_is_unusable(
+        stable_loader, monkeypatch):
+    """A broken CUDA library must not break CPU coding."""
+    stable, directory = stable_loader
+    (directory / "_C_cpu.so").write_bytes(b"")
+    (directory / "_C_cuda.so").write_bytes(b"")
+    _fake_load_library(monkeypatch, fail_for=("_C_cuda.so",))
+
+    with pytest.warns(RuntimeWarning, match="CUDA extension"):
+        assert stable.load_stable(require_cuda=True) is None
+
+    # a CPU request still succeeds, with the same warning and without CUDA
+    monkeypatch.setattr(stable, "_loaded", {})
+    with pytest.warns(RuntimeWarning, match="CUDA extension"):
+        module = stable.load_stable()
+    assert module is not None and module._torch_ans_with_cuda is False
+
+
+def test_stable_loader_exposes_the_python_bytes_operators():
+    """The two `py::bytes` operators live in Python (migration section 1.5)."""
+    from torch_ans import _stable_C
+
+    module = _stable_C._StableModule(with_cuda=False, loaded_paths=[])
+    for name in _stable_C.PYTHON_OPS:
+        assert getattr(module, name) is getattr(_stable_C, name)
+        assert name in dir(module)
+    # anything else has to name what was loaded instead of failing obscurely
+    # (a deliberately impossible name: a real operator may be registered by
+    # another test in the same session)
+    with pytest.raises(AttributeError, match="does not provide"):
+        module.this_operator_does_not_exist
+
+
+def test_lazy_shim_prefers_the_prebuilt_extension(monkeypatch):
+    """No compilation when the prebuilt extension is there (migration 1.3).
+
+    `_stable_module` is the shim's seam onto `torch_ans._stable_C`: stubbing it
+    here (rather than the loader) keeps this test independent of the module-wide
+    switch-off in the autouse fixture above.
+    """
+    from torch_ans import _lazy_C
+
+    sentinel = types.SimpleNamespace(_torch_ans_with_cuda=True)
+    monkeypatch.setattr(_lazy_C, "_stable_module",
+                        lambda require_cuda=False: sentinel)
+    monkeypatch.setattr(_lazy_C, "_modules", {})
+    monkeypatch.setattr(db, "build_extension",
+                        lambda *args, **kwargs: pytest.fail(
+                            "the prebuilt extension was ignored"))
+
+    assert _lazy_C.ensure_full() is sentinel
+    assert _lazy_C.ensure_module(db.BuildProfile(family="rans64")) is sentinel
+    # and a CUDA requirement is forwarded to the loader
+    seen = []
+    monkeypatch.setattr(_lazy_C, "_stable_module",
+                        lambda require_cuda=False: seen.append(require_cuda) or sentinel)
+    assert _lazy_C.ensure_module(db.BuildProfile(family="rans64"),
+                                 require_cuda=True) is sentinel
+    assert seen == [True]

@@ -574,7 +574,12 @@ def build_extension(module_name: str = "torch_ans_C_ext", with_cuda: Optional[bo
     _patch_file_baton_stale_lock()
 
     pkg_dir = Path(__file__).resolve().parent
-    cpp_sources = [str(p) for p in pkg_dir.glob("*.cpp")]
+    # lib_cuda.cpp is the entry point of the *stable-ABI* CUDA library (built by
+    # `WITH_STABLE_ABI=1 pip install .`): its registration is compiled out here
+    # (see the file), and the runtime build is the ATen one, so it is left out of
+    # the source list entirely rather than contributing an empty object file.
+    cpp_sources = [str(p) for p in pkg_dir.glob("*.cpp")
+                   if p.name != "lib_cuda.cpp"]
     cu_sources = [str(p) for p in pkg_dir.glob("*.cu")]
     if len(cpp_sources) == 0:
         raise RuntimeError("No C++ sources found in package for runtime compilation")

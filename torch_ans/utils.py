@@ -206,6 +206,85 @@ RANS_INVCDF_POP_OP_NAMES = {
 _EXPORTED_NATIVE_OPS = frozenset(_build_config.profile_op_names(None))
 
 
+# ---------------------------------------------------------------------------
+# stream capacity contract (STABLE_ABI_MIGRATION.md section 7, decision B)
+# ---------------------------------------------------------------------------
+#: (state bytes, stream word bytes) per rANS family - the two sizes rans_push's
+#: worst-case formula and rans_init_stream's initial length word are built from.
+_STREAM_SIZES = {
+    "rans64": (8, 4),      # uint64 state, uint32 stream words
+    "rans32": (4, 1),      # uint32 state, uint8 stream words
+    "rans32_16": (4, 2),   # uint32 state, uint16 stream words (incl. the warp path)
+}
+
+
+def _op_takes_kwarg(op, name) -> bool:
+    """Whether a native op accepts the keyword argument `name`.
+
+    A pybind11 function publishes its argument list in `__doc__`; a `torch.ops`
+    overload packet - what the prebuilt stable-ABI library exposes - has no
+    `__doc__` at all, so its schema is asked for instead. Either way this answers
+    once per interface, when the operators are resolved (never on the encode
+    path), and an extension compiled from older sources - without the capacity
+    parameter - simply answers False, which leaves the wrapper's own stream growth
+    in charge.
+    """
+    doc = getattr(op, "__doc__", None) or ""
+    if name in doc:
+        return True
+    op_name = getattr(op, "__name__", None)
+    if not op_name:
+        return False
+    try:
+        import torch
+        schemas = torch._C._jit_get_schemas_for_operator(f"torch_ans::{op_name}")
+    except Exception:
+        return False
+    return any(name in str(schema) for schema in schemas)
+
+
+def _stream_budget(used_bytes, num_symbols, freq_precision, bypass_coding,
+                   bypass_precision, num_interleaves, word_bytes, item_size):
+    """Worst case a push of `num_symbols` symbols needs: (columns, bytes).
+
+    The exact Python port of the `safe_byte_length` / `safe_tensor_length`
+    computation in `rans_push` (torch_ans/rans.hpp), including its use of
+    `sizeof(int32_t)` for the bypass chunks regardless of the stream dtype. Python
+    reserves the capacity with it and the native wrapper only compares - that is
+    what removes both the per-push device->host read of the length word and the
+    `aten::resize_` call the stable ABI does not promise (migration section 7,
+    risk 1 + 2). tests/test_capacity_contract.py pins the two computations
+    against each other.
+    """
+    if bypass_coding and int(bypass_precision) < 1:
+        raise ValueError(f"bypass_precision must be >= 1, got {bypass_precision}")
+    bits_per_symbol = int(freq_precision)
+    if bypass_coding:
+        symbol_bits = 32  # sizeof(int32_t) * 8, as in rans.hpp
+        max_bypass_val = (1 << int(bypass_precision)) - 1
+        n_bypass = -(-symbol_bits // int(bypass_precision))  # ceil
+        bits_per_symbol += (n_bypass + 1 + n_bypass // max_bypass_val) * int(bypass_precision)
+    safe_byte_length = (
+        int(used_bytes)
+        + (int(num_symbols) * bits_per_symbol + 7) // 8
+        + (int(num_interleaves) + 1) * int(word_bytes)  # unflushed states + renorm word
+    )
+    return safe_byte_length // int(item_size) + 1, safe_byte_length
+
+
+def _grow_stream(stream: torch.Tensor, columns: int) -> None:
+    """Grow `stream` to `columns` in place, keeping the coded prefix.
+
+    The Python counterpart of the growth the native wrapper performs when it owns
+    the capacity (clone -> resize_ -> copy back, see rans.hpp): doing it here keeps
+    `aten::resize_` out of the prebuilt extension, whose ABI promise covers the
+    call mechanism but not the operator's schema (migration section 4, pit 4).
+    """
+    previous = stream.clone()
+    stream.resize_(stream.size(0), int(columns))
+    stream[:, :previous.size(1)].copy_(previous)
+
+
 def __getattr__(name):
     """Lazily expose the native operators that used to be imported here.
 
@@ -1125,6 +1204,18 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._base_impl = base_impl
         self._incremental_compile = incremental_compile
         self._configured_invcdf_decode = use_invcdf_decode
+
+        # Stream-capacity contract (STABLE_ABI_MIGRATION.md section 7, decision B):
+        # this interface owns the capacity of the streams it codes, so the native
+        # push does not have to read the stream's length word back (a blocking
+        # device->host copy on CUDA) and never goes through `aten::resize_`.
+        # `_mirrored_*` is the upper bound of the bytes coded into the longest row
+        # of the stream it was adopted for (see _reserve_stream).
+        self._mirrored_stream = None
+        self._mirrored_capacity = -1
+        self._mirrored_used_bytes = 0
+        # set by _resolve_native: whether the native push takes `used_bytes`
+        self._push_takes_used_bytes = False
         self._resolve_native()
 
     def _build_profile(self):
@@ -1159,6 +1250,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
 
         self.ans_init_func, self.ans_encode_func, self.ans_decode_func = _bind(RANS_IMPL_OP_NAMES[impl_key])
         self._binary_decode_func = self.ans_decode_func
+        # Whether the resolved module takes the capacity parameter (see
+        # _encode_push). A module compiled from older sources does not, and then
+        # the wrapper keeps reading the length word and growing the stream itself.
+        self._push_takes_used_bytes = _op_takes_kwarg(self.ans_encode_func, "used_bytes")
 
         self._decode_extra_kwargs = {}
         self._invcdf_decode_func = None
@@ -1217,13 +1312,83 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         except Exception as exc:
             raise RuntimeError(_CUDA_UNAVAILABLE_HINT) from exc
 
+    def _stream_sizes(self):
+        """(state bytes, stream word bytes) of this interface's family."""
+        return _STREAM_SIZES[self._base_impl]
+
+    def _adopt_stream(self, stream, used_bytes) -> None:
+        """Remember `stream` and what it holds, for the capacity contract."""
+        self._mirrored_stream = stream
+        self._mirrored_capacity = int(stream.size(1))
+        self._mirrored_used_bytes = int(used_bytes)
+
+    def _stream_used_bytes(self, stream) -> int:
+        """Upper bound of the bytes already coded into the longest row.
+
+        The stream itself is read only when the mirror does not apply: a stream
+        this interface has not coded yet, or one whose column count changed - which
+        is what a push from outside this interface looks like, since the native
+        wrapper grows the stream in place when it owns the capacity. That is one
+        device->host copy per stream instead of one per push.
+        """
+        if stream is self._mirrored_stream and int(stream.size(1)) == self._mirrored_capacity:
+            return self._mirrored_used_bytes
+        # Element 0 of every row is its byte length (AGENTS.md, "stream tensor
+        # layout"); the longest row is what the capacity has to fit.
+        used = 0 if stream.size(0) == 0 else int(stream[:, 0].max().item())
+        self._adopt_stream(stream, used)
+        return used
+
+    def _reserve_stream(self, stream, num_symbols) -> int:
+        """Make room for a push of `num_symbols` symbols; return `used_bytes`.
+
+        Growth happens here, in Python, rather than in the native wrapper: the
+        capacity is reserved for a whole push, so `aten::resize_` stays out of the
+        prebuilt extension (migration section 7, decision B).
+        """
+        used_bytes = self._stream_used_bytes(stream)
+        if stream.size(0) == 0:
+            return used_bytes
+        _, word_bytes = self._stream_sizes()
+        required, upper_bound = _stream_budget(
+            used_bytes, num_symbols, self.freq_precision, self.bypass_coding,
+            self.bypass_precision, self.num_interleaves, word_bytes,
+            stream.element_size())
+        if required > stream.size(1):
+            _grow_stream(stream, required)
+        # the push can add at most `upper_bound - used_bytes` bytes to a row
+        self._adopt_stream(stream, upper_bound)
+        return used_bytes
+
+    def _encode_push(self, stream, symbols, indexes, cdfs, cdfs_sizes, offsets) -> None:
+        """One push, using the capacity contract when the native side has it."""
+        if not self._push_takes_used_bytes:
+            # An extension compiled from older sources grows the stream itself.
+            self.ans_encode_func(
+                stream, symbols, indexes, cdfs, cdfs_sizes, offsets,
+                freq_precision=self.freq_precision,
+                bypass_coding=self.bypass_coding,
+                bypass_precision=self.bypass_precision)
+            return
+        used_bytes = self._reserve_stream(stream, symbols.size(1))
+        self.ans_encode_func(
+            stream, symbols, indexes, cdfs, cdfs_sizes, offsets,
+            freq_precision=self.freq_precision,
+            bypass_coding=self.bypass_coding,
+            bypass_precision=self.bypass_precision,
+            used_bytes=used_bytes)
+
     def _init_stream(self, num_parallel_states=None, **kwargs) -> torch.Tensor:
         """
         Initializes the rANS stream tensor with the configured number of parallel states.
         """
         num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
         num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
-        return self._init_tensor(self.ans_init_func(num_parallel_states, self.num_interleaves))
+        stream = self._init_tensor(self.ans_init_func(num_parallel_states, self.num_interleaves))
+        # A fresh stream needs no adoption read: rans_init_stream leaves the length
+        # word at `state bytes * num_interleaves` (see rans_cpu.cpp).
+        self._adopt_stream(stream, self._stream_sizes()[0] * self.num_interleaves)
+        return stream
 
     def _reshape_for_parallel(self, tensor : torch.Tensor, num_parallel_states=None, padding_value=0, **kwargs) -> torch.Tensor:
         """
@@ -1334,18 +1499,19 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         else:
             num_parallel_states = stream.size(0)
 
+        # One reshape for both call shapes below; its second dimension is the
+        # number of symbols per row, i.e. what the capacity contract has to fit.
+        symbols_shaped = self._reshape_for_parallel(
+            symbols, num_parallel_states=num_parallel_states)
+
         if dist_indexes is not None:
             cdfs = self.cdfs if cdfs is None else self._init_tensor(cdfs)
             cdfs_sizes = self.cdfs_sizes if cdfs_sizes is None else self._init_tensor(cdfs_sizes)
             offsets = self.offsets if offsets is None else self._init_tensor(offsets)
-            self.ans_encode_func(stream, 
-                self._reshape_for_parallel(symbols, num_parallel_states=num_parallel_states),
+            self._encode_push(
+                stream, symbols_shaped,
                 self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
-                cdfs, cdfs_sizes, offsets,
-                freq_precision=self.freq_precision, 
-                bypass_coding=self.bypass_coding, 
-                bypass_precision=self.bypass_precision
-            )
+                cdfs, cdfs_sizes, offsets)
         elif dist_freqs is not None:
             self.init_params(
                 dist_freqs.reshape(-1, dist_freqs.shape[-1]), 
@@ -1354,14 +1520,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             )
             dist_indexes = torch.arange(symbols.numel(), dtype=self.dtype, device=stream.device)\
                 .reshape_as(symbols)
-            self.ans_encode_func(stream, 
-                self._reshape_for_parallel(symbols, num_parallel_states=num_parallel_states),
+            self._encode_push(
+                stream, symbols_shaped,
                 self._reshape_for_parallel(dist_indexes, num_parallel_states=num_parallel_states, padding_value=-1), # invalid indexes, will skip during coding
-                self.cdfs, self.cdfs_sizes, self.offsets,
-                freq_precision=self.freq_precision, 
-                bypass_coding=self.bypass_coding, 
-                bypass_precision=self.bypass_precision
-            )
+                self.cdfs, self.cdfs_sizes, self.offsets)
         else:
             # TODO: implement encode_symbols pattern if needed
             raise NotImplementedError("Unsupported encoding pattern. Please provide either dist_indexes or dist_freqs.")
@@ -1380,6 +1542,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                      **kwargs) -> torch.Tensor:
         # See _encode_func: the stream tensor decides whether CUDA is needed.
         self._ensure_native_for(stream)
+        # The pop rewinds the stream's length word, so the capacity mirror for this
+        # stream is stale from here on: the next push adopts it again (one read).
+        self._mirrored_stream = None
 
         num_parallel_states = stream.size(0) if self.num_parallel_states is None else self.num_parallel_states
         

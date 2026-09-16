@@ -5,6 +5,62 @@ import platform
 from glob import glob
 
 
+# ---------------------------------------------------------------------------
+# Build flavours
+#
+# The default build (no switches below) is the ATen/pybind11 extension compiled
+# against the local torch: `pip install .` and the runtime JIT both use it, and
+# nothing in this file changes that path.
+#
+# WITH_STABLE_ABI=1 produces the prebuilt libtorch-stable-ABI libraries instead
+# (STABLE_ABI_MIGRATION.md sections 1.1/5): one `.so` per flavour that every
+# torch >= 2.10 can load, because it only talks to the stable C shim. torch is
+# needed for its headers at build time and not at all at runtime.
+# ---------------------------------------------------------------------------
+WITH_STABLE_ABI = os.getenv("WITH_STABLE_ABI", "0") == "1"
+
+#: Minimum libtorch ABI a prebuilt .so targets, encoded as
+#: [MAJ][MIN][PATCH][ABI tag] for -DTORCH_TARGET_VERSION (torch 2.10).
+STABLE_ABI_TORCH_TARGET_VERSION = "0x020a000000000000"
+
+#: Archs a CUDA flavour is compiled for. Explicit on purpose: torch's own
+#: `torch.cuda.get_arch_list()` is whatever that torch build shipped (6 archs on
+#: the local cu130 build -> ~55-60 MB of kernels instead of ~14 MB), and a wheel
+#: has to name its archs anyway. 7.5 (2080 Ti) through 9.0 plus a PTX fallback
+#: covers every card from the 20-series up. Override with TORCH_CUDA_ARCH_LIST
+#: (e.g. `TORCH_CUDA_ARCH_LIST=7.5` for a fast local build).
+STABLE_ABI_CUDA_ARCH_LIST = os.getenv("TORCH_CUDA_ARCH_LIST", "7.5;8.0;8.6;9.0+PTX")
+
+
+def write_build_metadata(extension_dir, torch_version, with_cuda, with_hip,
+                         stable_abi=False):
+    """Record how the native extension was built (read by torch_ans/__init__.py).
+
+    The ATen build records the torch it compiled against, because such an
+    extension is bound to that ABI and the runtime check in `__init__.py` warns
+    when the two differ.
+
+    The stable-ABI build must *not* record it: being torch-version independent is
+    the whole point (TORCH_TARGET_VERSION = torch 2.10), so a "compiled with torch
+    X, running torch Y" warning would be exactly the false positive the migration
+    removes. It writes BUILD_STABLE_ABI instead and leaves BUILD_TORCH_VERSION
+    absent, which makes that check a no-op. BUILD_WITH_CUDA still matters:
+    `utils.module_has_cuda()` falls back to it for an extension too old to carry
+    the `_torch_ans_with_cuda` attribute.
+    """
+    try:
+        build_ver_path = os.path.join(extension_dir, "_torch_build_version.py")
+        with open(build_ver_path, "w") as handle:
+            if not stable_abi:
+                handle.write(f"BUILD_TORCH_VERSION = {repr(torch_version)}\n")
+            handle.write(f"BUILD_STABLE_ABI = {repr(bool(stable_abi))}\n")
+            handle.write(f"BUILD_WITH_CUDA = {repr(bool(with_cuda))}\n")
+            handle.write(f"BUILD_WITH_HIP = {repr(bool(with_hip))}\n")
+    except Exception:
+        # If writing fails for any reason, continue; the runtime check will be skipped.
+        pass
+
+
 def get_extension_config():
     """Import torch and torch extension builders only when we are building extensions.
 
@@ -21,7 +77,12 @@ def get_extension_config():
     import torch
 
     extension_dir = "torch_ans"
-    sources = glob(f"{extension_dir}/*.cpp")
+    # lib_cuda.cpp is the entry point of the *stable-ABI* CUDA library
+    # (WITH_STABLE_ABI=1, get_stable_abi_extension_config below). It compiles to an
+    # empty translation unit here (see the file), so leaving it out only keeps this
+    # build's source list exactly what it was before the migration.
+    sources = [path for path in glob(f"{extension_dir}/*.cpp")
+               if os.path.basename(path) != "lib_cuda.cpp"]
     include_dirs = [extension_dir]
 
     # extra_compile_args = {"cxx": ["-std=c++17", "-O3", '-fopenmp', '-march=native']}
@@ -102,16 +163,115 @@ def get_extension_config():
     ]
     cmdclass = {"build_ext": BuildExtension}
     # Record the torch version used at build time so we can verify at runtime.
-    try:
-        build_ver_path = os.path.join(extension_dir, "_torch_build_version.py")
-        with open(build_ver_path, "w") as _bv:
-            _bv.write(f"BUILD_TORCH_VERSION = {repr(torch.__version__)}\n")
-            _bv.write(f"BUILD_WITH_CUDA = {repr('nvcc' in extra_compile_args)}\n")
-            _bv.write(f"BUILD_WITH_HIP = {repr('hipcc' in extra_compile_args)}\n")
-    except Exception:
-        # If writing fails for any reason, continue; the runtime check will be skipped.
-        pass
+    write_build_metadata(extension_dir, torch.__version__,
+                         with_cuda="nvcc" in extra_compile_args,
+                         with_hip="hipcc" in extra_compile_args)
     return ext_modules, cmdclass
+
+
+def get_stable_abi_extension_config():
+    """The prebuilt libtorch-stable-ABI libraries (migration section 5).
+
+    Same shape as the POC (poc/stable_abi/setup.py), which is the configuration
+    that was measured:
+
+      * ``torch_ans._C_cpu``  - always: every schema plus the CPU and catch-all
+        implementations;
+      * ``torch_ans._C_cuda`` - with WITH_CUDA=1: CUDA implementations only, no
+        schema (registering the same operator twice is rejected by the
+        dispatcher, migration section 4, pit 8).
+
+    Differences from the ATen build, each with its reason in the migration doc:
+    no pybind11 (the .so exports no Python symbols at all), no ``-fopenmp`` (a
+    second OpenMP runtime next to torch's gives the process two thread pools and
+    aborts on macOS - pit 5), no ``-march=native`` (a wheel has to run on any
+    x86-64, and it was measured to make no difference - section 7, risk 4) and
+    ``-Wl,--as-needed``, so the ``-ltorch_python`` that cpp_extension links
+    unconditionally is dropped instead of becoming a DT_NEEDED entry.
+    """
+    from torch.utils import cpp_extension
+    import torch
+
+    # The CUDA flavour is built on request only - the same switch the ATen path
+    # uses - and a wheel builder without a visible GPU sets FORCE_CUDA=1.
+    with_cuda = bool(
+        (torch.cuda.is_available() and os.getenv("WITH_CUDA", "0") == "1")
+        or os.getenv("FORCE_CUDA", "0") == "1"
+    )
+
+    keep_cuda_check = os.getenv("TORCH_ANS_STABLE_KEEP_CUDA_CHECK", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+    if with_cuda and not keep_cuda_check:
+        # cpp_extension refuses a toolkit whose *major* version differs from the
+        # one torch was built with. That is the right default for an ordinary
+        # extension - it links libcudart *and* ATen's CUDA headers, which do have
+        # to match - but a stable-ABI .so only talks to the C shim, and building
+        # it with CUDA 11.8 while the running torch is cu130 is a configuration
+        # that was measured to work (poc/stable_abi/README.md section 3.4). Set
+        # TORCH_ANS_STABLE_KEEP_CUDA_CHECK=1 to keep torch's behaviour.
+        print("[torch_ans] WITH_STABLE_ABI: bypassing "
+              "torch.utils.cpp_extension._check_cuda_version (a stable-ABI "
+              "extension does not link against ATen's CUDA headers)")
+        cpp_extension._check_cuda_version = lambda *args, **kwargs: None
+
+    package_dir = "torch_ans"
+    common_defines = [
+        "-DTORCH_ANS_STABLE_ABI=1",
+        "-DTORCH_TARGET_VERSION=" + STABLE_ABI_TORCH_TARGET_VERSION,
+    ]
+    extra_link_args = ["-Wl,--as-needed"]
+
+    ext_modules = [
+        cpp_extension.CppExtension(
+            "torch_ans._C_cpu",
+            sources=[os.path.join(package_dir, name)
+                     for name in ("rans_cpu.cpp", "rans.cpp", "lib.cpp")],
+            include_dirs=[package_dir],
+            extra_compile_args={"cxx": ["-O3"] + common_defines},
+            extra_link_args=extra_link_args,
+        )
+    ]
+
+    if with_cuda:
+        # -DUSE_CUDA makes the stable C shim declare its CUDA entries and
+        # -DWITH_CUDA sets the ta:: layer's TA_WITH_CUDA gate; the two are
+        # separate switches and both are required (migration section 4, pit 1).
+        # The host compiler matters too: nvcc refuses a gcc it does not know
+        # (CUDA 11.8 + gcc 11 is the usual case), so an explicit
+        # `-ccbin <path>` is supported through TORCH_ANS_STABLE_CUDA_CCBIN
+        # (STABLE_ABI_MIGRATION.md section 4, pit 7). CUDA_HOME selects the
+        # toolkit itself, as always.
+        cuda_defines = common_defines + ["-DWITH_CUDA=1", "-DUSE_CUDA=1"]
+        nvcc_flags = ["-O3"] + cuda_defines
+        cuda_ccbin = os.getenv("TORCH_ANS_STABLE_CUDA_CCBIN")
+        if cuda_ccbin:
+            nvcc_flags += ["-ccbin", cuda_ccbin]
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", STABLE_ABI_CUDA_ARCH_LIST)
+        ext_modules.append(
+            cpp_extension.CUDAExtension(
+                "torch_ans._C_cuda",
+                # rans_cpu.cpp belongs to the CUDA library on purpose: rans_push /
+                # rans_pop are *one* wrapper each that routes on the tensor device
+                # at runtime (rans.hpp), so the CPU kernels have to link here too.
+                # The duplicated CPU code is ~3 MB next to ~14 MB of kernels, and
+                # it keeps the two dispatch keys registering the same wrappers.
+                # rans.cpp (the host-only alias table builder) rides along so that
+                # the CPU-registration function - which is only *defined* here -
+                # can never leave an unresolved symbol behind.
+                sources=[os.path.join(package_dir, name)
+                         for name in ("rans_cuda.cu", "rans_cpu.cpp", "rans.cpp",
+                                      "lib_cuda.cpp")],
+                include_dirs=[package_dir],
+                extra_compile_args={
+                    "cxx": ["-O3"] + cuda_defines,
+                    "nvcc": nvcc_flags,
+                },
+                extra_link_args=extra_link_args,
+            )
+        )
+
+    cmdclass = {"build_ext": cpp_extension.BuildExtension}
+    return ext_modules, cmdclass, with_cuda
 
 
 # Only import/build extensions when building distributions or extensions.
@@ -132,19 +292,41 @@ want_build = any(arg in sys.argv for arg in ("build_ext", "bdist_wheel", "bdist_
 if SKIP_BUILD_EXT:
     print("SKIP_BUILD_EXT=1: skipping build of C++/CUDA extensions at install time")
 elif want_build:
-    # Try to import torch in a safe manner; if it's not available we assume
-    # an isolated build environment and skip building the native extension.
-    try:
-        import importlib
-        _torch = importlib.import_module("torch")
-        # If import succeeded, proceed to get extension config and build.
-        ext_modules, cmdclass = get_extension_config()
-    except Exception:
-        print(
-            "torch is not importable during build; skipping native extension build. "
-            "If you want to build the extension during install, ensure torch is pre-installed "
-            "in the build environment (e.g. use `pip install . --no-build-isolation`)."
-        )
+    if WITH_STABLE_ABI:
+        # Unlike the ATen path below, a failure here is not a "pure-Python
+        # install that compiles later": it would silently produce a wheel without
+        # the extension the switch exists to ship. Only the missing-torch case is
+        # tolerated (with a message); a broken toolchain propagates.
+        try:
+            import importlib
+            _torch = importlib.import_module("torch")
+        except Exception:
+            print(
+                "torch is not importable during build; cannot produce the prebuilt "
+                "libtorch-stable-ABI libraries. Install torch in the build environment "
+                "(e.g. use `pip install . --no-build-isolation`) or drop WITH_STABLE_ABI=1."
+            )
+        else:
+            ext_modules, cmdclass, _stable_with_cuda = get_stable_abi_extension_config()
+            # No BUILD_TORCH_VERSION on purpose: a stable-ABI .so targets torch
+            # >= 2.10 and must not trigger the "compiled with torch X" warning.
+            write_build_metadata("torch_ans", _torch.__version__,
+                                 with_cuda=_stable_with_cuda, with_hip=False,
+                                 stable_abi=True)
+    else:
+        # Try to import torch in a safe manner; if it's not available we assume
+        # an isolated build environment and skip building the native extension.
+        try:
+            import importlib
+            _torch = importlib.import_module("torch")
+            # If import succeeded, proceed to get extension config and build.
+            ext_modules, cmdclass = get_extension_config()
+        except Exception:
+            print(
+                "torch is not importable during build; skipping native extension build. "
+                "If you want to build the extension during install, ensure torch is pre-installed "
+                "in the build environment (e.g. use `pip install . --no-build-isolation`)."
+            )
 
 
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"), encoding="utf-8") as _f:
@@ -175,7 +357,7 @@ def _setuptools_reads_pyproject_metadata() -> bool:
 #: version in both places: tests/test_packaging_metadata.py checks they agree.
 _LEGACY_METADATA = {
     "name": "torch_ans",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "PyTorch extension for parallel-enabled ANS-based compression (C++/CUDA)",
     "long_description": _long_description,
     "long_description_content_type": "text/markdown",
@@ -183,7 +365,7 @@ _LEGACY_METADATA = {
     "author": "worldlife",
     "author_email": "worldlife@sjtu.edu.cn",
     "url": "https://github.com/worldlife123/torch_ans",
-    "install_requires": ["torch>=1.10", "pybind11", "ninja"],
+    "install_requires": ["torch>=1.10", "ninja"],
     "python_requires": ">=3.7",
 }
 
