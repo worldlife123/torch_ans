@@ -184,7 +184,8 @@ def _invcdf_op_names(family, num_interleaves):
 
 # (impl family, num_interleaves) -> operator names, mirroring the gated
 # bindings in torch_ans/rans_bindings.hpp. The keys double as the validation of
-# what each impl supports.
+# what each impl supports. The names are historical: the tables cover every
+# family, rANS and tANS alike.
 RANS_IMPL_OP_NAMES = {
     (family, interleave): _impl_op_names(family, interleave)
     for family, interleaves in _build_config.SUPPORTED_INTERLEAVES.items()
@@ -197,7 +198,7 @@ RANS_ALIAS_OP_NAMES = {
 }
 RANS_INVCDF_POP_OP_NAMES = {
     (family, interleave): _invcdf_op_names(family, interleave)
-    for family, interleaves in _build_config.SUPPORTED_INTERLEAVES.items()
+    for family, interleaves in _build_config.INVCDF_INTERLEAVES.items()
     for interleave in interleaves
 }
 
@@ -209,12 +210,21 @@ _EXPORTED_NATIVE_OPS = frozenset(_build_config.profile_op_names(None))
 # ---------------------------------------------------------------------------
 # stream capacity contract: the caller reserves, the native push compares
 # ---------------------------------------------------------------------------
-#: (state bytes, stream word bytes) per rANS family - the two sizes rans_push's
-#: worst-case formula and rans_init_stream's initial length word are built from.
+#: (per-lane header bytes, stream word bytes) per family - the two sizes the
+#: worst-case formula (torch_ans/stream_capacity.hpp) and the initial length word
+#: of `<family>_init_stream` are built from.
+#:
+#: For a rANS family the header *is* the state. A tANS stream carries a 3-word
+#: header (state, residual bit buffer, bit count - see torch_ans/tans_utils.hpp)
+#: because a fixed-width tANS state cannot absorb the bits it does not emit, so
+#: the entry is 12 for all three tANS families whatever their state width is.
 _STREAM_SIZES = {
     "rans64": (8, 4),      # uint64 state, uint32 stream words
     "rans32": (4, 1),      # uint32 state, uint8 stream words
     "rans32_16": (4, 2),   # uint32 state, uint16 stream words (incl. the warp path)
+    "tans32": (12, 2),     # uint32 state, uint16 stream words
+    "tans16": (12, 1),     # uint16 state, uint8 stream words
+    "tans8": (12, 1),      # uint8 state, uint8 stream words
 }
 
 
@@ -1068,12 +1078,26 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
     Implements encoding/decoding using rANS variants and manages coder parameters.
 
     Args:
-        impl (str): rANS implementation variant ("rans64", "rans32", "rans32_16", etc.).
+        impl (str): Coder implementation variant.
+                    rANS ("rans64", "rans32", "rans32_16"): a Renormalization
+                    interval + division per symbol, symbol lookup by search or by
+                    an inverse-CDF table; supports `num_interleaves` (1/2/4/8, and
+                    32 for "rans32_16" on CUDA) and, on CUDA, the whole family.
+                    tANS ("tans32", "tans16", "tans8"): a table-driven coder (FSE
+                    style) whose `freq_precision` is *also* the spread table size,
+                    i.e. 2**freq_precision slots per distribution (capped at 15, and
+                    at 7 for "tans8"), so it is much cheaper at a small
+                    `freq_precision`; symbol lookup is a single table access instead
+                    of a search. The three tANS families differ only in the state /
+                    stream word width (uint32+uint16, uint16+uint8, uint8+uint8) and
+                    share their tables. tANS is CPU-only and single-lane for now:
+                    `num_interleaves` must be 1 and `inverse_cdf_precision` /
+                    `alias_sampling` do not apply (the tANS table is the lookup).
         bypass_coding (bool): Enable bypass coding for out-of-range symbols. 
                               This may not be supported in all implementations, or may reduce throughput!
         bypass_precision (int): Precision for bypass coding.
         num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
-        num_interleaves (int): Number of interleaved rANS states per stream (1, 4, or 32).
+        num_interleaves (int): Number of interleaved ANS states per stream (1, 4, or 32).
                                32 uses the warp-level CUDA interleaved kernels on GPU (rans32_16 only);
                                interleaved streams are bit-compatible between CPU and GPU implementations.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
@@ -1153,6 +1177,17 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             base_impl, precision_cap = "rans32_16", 15
         elif self.impl.startswith("rans32") or self.impl.startswith("rans_byte"):
             base_impl, precision_cap = "rans32", 23
+        # tANS: freq_precision *is* table_log here (the cdf differences are the
+        # normalized counter), so the cap is the table size limit the encoder's
+        # fixed point arithmetic imposes (15, see TANS_MAX_TABLELOG) or the
+        # state width (tans8: 8 - 1 = 7). The three tANS families are not
+        # prefixes of each other, so the order does not matter.
+        elif self.impl.startswith("tans32"):
+            base_impl, precision_cap = "tans32", 15
+        elif self.impl.startswith("tans16"):
+            base_impl, precision_cap = "tans16", 15
+        elif self.impl.startswith("tans8"):
+            base_impl, precision_cap = "tans8", 7
         else:
             raise NotImplementedError(f"Unknown impl {self.impl}")
         self.freq_precision = min(self.freq_precision, precision_cap)
@@ -1202,6 +1237,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         # _ensure_native_for).
         self._impl_key = impl_key
         self._base_impl = base_impl
+        # tANS needs one extra init_params step (the table build) and no
+        # inverse-CDF/alias machinery; the flag keeps that branch in one place.
+        self._is_tans = base_impl.startswith("tans")
         self._incremental_compile = incremental_compile
         self._configured_invcdf_decode = use_invcdf_decode
 
@@ -1443,7 +1481,21 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                 self.inverse_cdf_precision = q
                 self._decode_extra_kwargs = {"inverse_cdf_precision": q}
                 self.ans_decode_func = self._invcdf_decode_func
-        if self.impl_use_inverse_cdf:
+        if self._is_tans:
+            # tANS: the *table* tensor replaces the cdf in the coding call - it
+            # carries both directions (tans_utils.hpp), so `push` and `pop` read
+            # the same `self.cdfs` and the call sites stay family agnostic. It
+            # depends only on (cdf, table_log = freq_precision), which is why the
+            # three tANS families share one builder and one tensor, and why this
+            # is the whole init_params difference: no inverse-CDF table, no alias
+            # table, no auto precision - the tANS table *is* the lookup.
+            #
+            # Built on the host (a CPU-only op, like the alias table) and moved
+            # to self.device by the assignment below - a tANS interface on a CUDA
+            # device therefore fails at the first push with the family's
+            # "CPU-only for now" message rather than here.
+            cdfs = self._native.tans_build_tables(cdfs, cdfs_sizes, self.freq_precision)
+        elif self.impl_use_inverse_cdf:
             # B2: single allocation, table written in place (no separate table
             # tensor, no cat) - init_params runs per encode/decode call in the
             # dist_freqs API, so this is on the hot path

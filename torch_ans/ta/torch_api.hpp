@@ -42,16 +42,21 @@
 namespace ta {
 
 // ---------------------------------------------------------------------------
-// stream growth: one implementation, in rans_push
+// stream growth: one implementation, shared by every push
 // ---------------------------------------------------------------------------
 // A `ta::safe_stream_byte_length` / `ta::ensure_stream_capacity` pair used to
 // live here as a second copy of the wrapper's arithmetic. It was never called
 // (only the syntax-check TU in scripts/check_ta_headers.py instantiated it) and
 // it had to stay in step with two other places by hand, which is exactly the
-// drift the capacity contract cannot afford. The three are now:
+// drift the capacity contract cannot afford. The copies are now:
 //
-//   * `rans_push`          - the worst case, and the compare/throw that enforces
-//                            the caller's capacity (torch_ans/rans.hpp);
+//   * `ans_ensure_stream_capacity` - the worst case, and the compare/throw/grow
+//                            that enforces the caller's capacity
+//                            (torch_ans/stream_capacity.hpp), called by
+//                            `rans_push` and `tans_push` alike - the bound is
+//                            family independent (at most `freq_precision` bits
+//                            per symbol plus the bypass chunks), so this is one
+//                            implementation rather than one per family;
 //   * `_stream_budget`     - the same arithmetic in Python, which reserves the
 //                            capacity (torch_ans/utils.py);
 //   * tests/test_capacity_contract.py - pins the two against each other by using

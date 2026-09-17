@@ -28,8 +28,12 @@ ALPHABET = 16
 
 #: (family, interleaves) pairs whose CPU push is always compiled; the 32-way
 #: variant is CUDA-only in practice and is covered by the CUDA test below.
+#: The tANS families share the *arithmetic* (see stream_capacity.hpp), but their
+#: stream header is three words instead of a state, so they are worth pinning
+#: against Python's `_stream_budget` separately.
 FAMILIES = [("rans64", 1), ("rans64", 4), ("rans32", 1),
-            ("rans32_16", 1), ("rans32_16", 4)]
+            ("rans32_16", 1), ("rans32_16", 4),
+            ("tans32", 1), ("tans16", 1), ("tans8", 1)]
 
 
 def _setup(impl="rans64", num_interleaves=1, freq_precision=12, device="cpu", **kwargs):
@@ -37,8 +41,21 @@ def _setup(impl="rans64", num_interleaves=1, freq_precision=12, device="cpu", **
     pmf = torch.randint(1, 100, (NUM_DISTS, ALPHABET), dtype=torch.int32)
     num_freqs = torch.full((NUM_DISTS,), ALPHABET, dtype=torch.int32)
     offsets = torch.zeros(NUM_DISTS, dtype=torch.int32)
-    coder = TorchANSInterface(impl=impl, num_interleaves=num_interleaves,
-                              freq_precision=freq_precision, device=device, **kwargs)
+    try:
+        coder = TorchANSInterface(impl=impl, num_interleaves=num_interleaves,
+                                  freq_precision=freq_precision, device=device, **kwargs)
+    except AttributeError as exc:
+        # A prebuilt extension from before a family existed does not export its
+        # operators; the family's own tests cover that case (tests/test_tans.py).
+        pytest.skip("this native build does not provide %s (%s)" % (impl, exc))
+    except RuntimeError as exc:
+        # ... and the runtime build of a family can legitimately fail here (no
+        # toolchain, a CUDA attempt that cannot work). Only the tANS families are
+        # treated that way: they are the ones this file covers *in addition* to
+        # the rANS matrix, and a rANS build failure is a real failure.
+        if not impl.startswith("tans"):
+            raise
+        pytest.skip("could not resolve %s (%s)" % (impl, exc))
     coder.init_params(pmf, num_freqs, offsets)
     symbols = torch.randint(0, ALPHABET, (BATCH, SEQ), dtype=torch.int32, device=device)
     indexes = torch.randint(0, NUM_DISTS, (BATCH, SEQ), dtype=torch.int32, device=device)

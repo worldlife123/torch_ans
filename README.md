@@ -137,6 +137,46 @@ With a sparse table the memory footprint is modest and the decode speedup is rea
 
 Use alias coding for fast decoding when memory usage during encoding is not a concern. Use inverse CDF coding (usually with `"auto"`) for maximum decoding speed when a small per-distribution table is acceptable.
 
+### tANS (table-driven ANS)
+
+`torch_ans` also ships tANS — the table-driven ANS coder (FSE style), ported from the
+reference in `3rdparty/ans/tans.cpp`/`tans.hpp` — behind the same three call sites as the
+rANS families, selected with `impl="tans32"` / `"tans16"` / `"tans8"`:
+
+| Variant  | State Bits | Stream Bits | Max Freq Bits | Table slots       | Interleaved States | Symbol Lookup     | Device Support | init_func          | push_func   | pop_func   |
+|----------|------------|-------------|---------------|-------------------|--------------------|-------------------|----------------|--------------------|-------------|------------|
+| tans32   | 32         | 16          | 15            | 2**freq_precision | 1                  | tANS spread table | CPU only       | tans32_init_stream | tans32_push | tans32_pop |
+| tans16   | 16         | 8           | 15            | 2**freq_precision | 1                  | tANS spread table | CPU only       | tans16_init_stream | tans16_push | tans16_pop |
+| tans8    | 8          | 8           | 7             | 2**freq_precision | 1                  | tANS spread table | CPU only       | tans8_init_stream  | tans8_push  | tans8_pop  |
+
+What is different from rANS:
+
+- **The coder is table driven.** `tans_build_tables(cdfs, cdfs_sizes, table_log)` turns the
+  quantized cdf into a spread table of `2**table_log` slots per distribution plus the
+  encoder's symbol transformation table, and both directions are then a single table access
+  per symbol — no division on encode, no search on decode. `table_log` **is** `freq_precision`
+  here: torch_ans' quantized cdf is already a normalized counter (every symbol owns at least
+  one unit and the last entry is `2**freq_precision`), so its differences are the slot counts
+  directly and FSE's renormalization step is not needed. All three families share one table —
+  it only depends on `(cdf, table_log)` — and it travels in the `cdfs` slot of `push`/`pop`,
+  so a `TorchANSInterface` call site does not change.
+- **Table size is the price.** `2**freq_precision` slots per distribution (`3 * 2**freq_precision
+  + 2 * cdf_row` int32 words: ~0.4 MB per distribution at the maximum `freq_precision=15`,
+  ~1.5 kB at `tans8`'s 7), so pick the family by how many distributions you code: `tans8` for
+  thousands of them, `tans32`/`tans16` for a few. A smaller `freq_precision` also quantizes the
+  probabilities coarser, so there is a compression/size trade-off on top.
+- **The state is fixed width** (`[2**L, 2**(L+1))` encoding, `[0, 2**L)` decoding), so unlike a
+  rANS state it cannot hold the bits it does not emit. Those live in a 3-word stream header
+  (state, residual bit buffer, bit count) which is part of the byte string — that is what keeps
+  the stream layout, the capacity contract, `rans_stream_to_byte_strings`/`rans_byte_strings_to_stream`
+  and the whole high-level API identical to rANS.
+- **Bypass coding writes the out-of-range value as raw bits** instead of coding it with a
+  uniform tANS table as the reference does; both cost exactly `bypass_precision` bits per digit,
+  so out-of-range symbols behave like they do in rANS.
+- **Limits.** CPU only for now (a CUDA tensor raises an explicit `CPU-only` error),
+  `num_interleaves` must be 1, and there is no `alias_sampling` / `inverse_cdf_precision`
+  variant — the tANS table *is* the symbol lookup.
+
 ### Parallel ANS stream
 
 All encoding (push) and decoding (pop) operations in torch_ans are fully parallelized. The batch size of the rANS stream tensor (`stream.shape[0]`) determines the number of parallel states processed simultaneously. This enables efficient utilization of multi-core CPUs and GPUs for large-scale data compression.
@@ -701,7 +741,7 @@ per torch at first use, exactly as before (`torch < 2.10` always takes that path
 - Docs and examples for high-level API
 - ~~Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)~~ Done for `rans32_16_i32` / `rans32_16_i4`: warp-level 32-way (and 4-way sub-warp) interleaved coding on CUDA, bit-compatible with the CPU interleaved streams (see `torch_ans/rans_warp_cuda.cuh`, technique referenced from [Recoil](https://github.com/lin-toto/recoil))
 - ~~Implement lookup table logic in push/pop steps for possible acceleration~~ Done: inverse-CDF lookup with a tunable (dense/sparse/`"auto"`) `2**q` table on CPU and CUDA, warp-level shared-memory staging on CUDA, and a `"auto"` precision heuristic.
-- Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))
+- ~~Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))~~ Done: `impl="tans32" / "tans16" / "tans8"` (CPU, single-lane), with the FSE-style spread table built by `tans_build_tables`, a bit buffer in the stream header and the same capacity contract / high-level API as rANS (see [tANS](#tans-table-driven-ans)). Still open: CUDA kernels and interleaved tANS.
 - Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression
 

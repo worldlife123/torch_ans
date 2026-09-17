@@ -32,30 +32,64 @@ from typing import Dict, List, Optional, Tuple
 #: Environment variable that turns incremental compilation off (``0``/``false``).
 INCREMENTAL_ENV_VAR = "TORCH_ANS_INCREMENTAL_COMPILE"
 
-#: rANS family -> the macro that enables it, see rans_build_config.hpp
+#: family -> the macro that enables it, see rans_build_config.hpp
 FAMILY_MACROS = {
     "rans64": "TORCH_ANS_WITH_RANS64",
     "rans32": "TORCH_ANS_WITH_RANS32",
     "rans32_16": "TORCH_ANS_WITH_RANS32_16",
+    "tans32": "TORCH_ANS_WITH_TANS32",
+    "tans16": "TORCH_ANS_WITH_TANS16",
+    "tans8": "TORCH_ANS_WITH_TANS8",
 }
 
 #: short family code used in the module name / build directory
-FAMILY_TAGS = {"rans64": "r64", "rans32": "r32", "rans32_16": "r3216"}
+FAMILY_TAGS = {
+    "rans64": "r64",
+    "rans32": "r32",
+    "rans32_16": "r3216",
+    # the tANS families *are* their (state, stream) pair, so the tag is the
+    # family name itself
+    "tans32": "tans32",
+    "tans16": "tans16",
+    "tans8": "tans8",
+}
 
 #: operator-name infix per interleave factor (``rans64_i4_push``, ...)
 OP_SUFFIX = {1: "", 2: "_i2", 4: "_i4", 8: "_i8", 32: "_i32"}
 
-#: interleave factors supported per family, and those with alias variants
-#: (32-way interleaving is rans32_16-only and has no alias binding)
+#: interleave factors supported per family, and those with alias / inverse-CDF
+#: variants (32-way interleaving is rans32_16-only and has no alias binding).
+#:
+#: tANS is CPU-only and single-lane for now: an interleaved tANS stream would
+#: need one state per lane *and* a shared bit buffer, which the kernels do not
+#: implement (tans_init_stream rejects num_interleaves != 1 rather than building
+#: a stream they cannot read). It has neither lookup variant either - the tANS
+#: table *is* the lookup - so both tuples are empty.
 SUPPORTED_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),
     "rans32": (1, 2, 4, 8),
     "rans32_16": (1, 2, 4, 8, 32),
+    "tans32": (1,),
+    "tans16": (1,),
+    "tans8": (1,),
 }
 ALIAS_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),
     "rans32": (1, 2, 4, 8),
     "rans32_16": (1, 2, 4, 8),
+    "tans32": (),
+    "tans16": (),
+    "tans8": (),
+}
+#: interleave factors with an ``_invcdf_pop`` variant (same shape as
+#: ALIAS_INTERLEAVES: it is what `profile_op_names` asks the bindings for).
+INVCDF_INTERLEAVES = {
+    "rans64": (1, 2, 4, 8),
+    "rans32": (1, 2, 4, 8),
+    "rans32_16": (1, 2, 4, 8, 32),
+    "tans32": (),
+    "tans16": (),
+    "tans8": (),
 }
 
 #: operators that are not gated (needed by every interface)
@@ -65,6 +99,10 @@ COMMON_OPS = (
     "rans_alias_build_table",
     "rans_pmf_to_quantized_cdf",
     "rans_build_inverse_cdf",
+    # tANS: both directions of the table in one host-side op, shared by all three
+    # tANS families (the table only depends on the cdf and table_log), so it is
+    # part of every build - see rans_build_config.hpp.
+    "tans_build_tables",
 )
 
 #: JIT name of the full build. Not "torch_ans_C_<something>": it is the name
@@ -147,10 +185,10 @@ def profile_module_name(profile: Optional[BuildProfile]) -> str:
 
 
 def _ilv_op_names(family: str, interleave: int, alias: bool, invcdf: bool,
-                  alias_ok: bool) -> List[str]:
+                  alias_ok: bool, invcdf_ok: bool = True) -> List[str]:
     suffix = OP_SUFFIX[interleave]
     names = ["%s%s_push" % (family, suffix), "%s%s_pop" % (family, suffix)]
-    if invcdf:
+    if invcdf and invcdf_ok:
         names.append("%s%s_invcdf_pop" % (family, suffix))
     if alias and alias_ok:
         names += ["%s_alias%s_push" % (family, suffix),
@@ -174,14 +212,16 @@ def profile_op_names(profile: Optional[BuildProfile] = None) -> Tuple[str, ...]:
             for interleave in interleaves:
                 names += _ilv_op_names(
                     family, interleave, alias=True, invcdf=True,
-                    alias_ok=interleave in ALIAS_INTERLEAVES[family])
+                    alias_ok=interleave in ALIAS_INTERLEAVES[family],
+                    invcdf_ok=interleave in INVCDF_INTERLEAVES[family])
         return tuple(names)
     if profile.family is not None:
         names.append("%s_init_stream" % profile.family)
         names += _ilv_op_names(
             profile.family, profile.interleave, alias=profile.alias,
             invcdf=profile.invcdf,
-            alias_ok=profile.interleave in ALIAS_INTERLEAVES.get(profile.family, ()))
+            alias_ok=profile.interleave in ALIAS_INTERLEAVES.get(profile.family, ()),
+            invcdf_ok=profile.interleave in INVCDF_INTERLEAVES.get(profile.family, ()))
     return tuple(names)
 
 
