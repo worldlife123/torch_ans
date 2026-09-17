@@ -23,11 +23,22 @@ import torch
 
 from torch_ans.utils import TorchANSInterface
 
+#: family -> interleave factors. The tANS families are here too: like rANS they
+#: keep one state per lane (on top of the bit buffer the lanes share), but they
+#: also spend `2**freq_precision` table slots per distribution, so an alphabet
+#: that does not fit the table is skipped below instead of being measured wrong.
 SUPPORTED = {
     "rans64": [1, 2, 4, 8],
     "rans32": [1, 2, 4, 8],
     "rans32_16": [1, 2, 4, 8, 32],
+    "tans32": [1, 2, 4, 8],
+    "tans16": [1, 2, 4, 8],
+    "tans8": [1, 2, 4, 8],
 }
+
+#: freq_precision cap per family (see rans_build_config.hpp / tans_utils.hpp)
+PRECISION_CAPS = {"rans64": 31, "rans32": 23, "rans32_16": 15,
+                  "tans32": 15, "tans16": 15, "tans8": 7}
 
 
 def build_data(num_symbols, num_distributions, alphabet_size, seed=0, target=1 << 15):
@@ -125,11 +136,21 @@ def main():
           f"{'enc us':>9} {'dec us':>9} {'size':>10}")
     results = {}
     for impl, interleaves in SUPPORTED.items():
+        # tANS codes a spread of 2**freq_precision slots, so the alphabet (plus
+        # the bypass sentinel) has to fit; its own cap comes first (the interface
+        # would silently lower freq_precision otherwise, which is not a
+        # comparison any more). scripts/bench_tans_vs_rans.py sweeps the sizes.
+        precision = min(args.precision, PRECISION_CAPS[impl])
+        if impl.startswith("tans") and \
+                args.alphabet + (1 if not args.no_bypass else 0) > (1 << precision):
+            print(f"{impl:<10} {'skipped':>11} (alphabet {args.alphabet} does not fit "
+                  f"2**{precision} table slots)")
+            continue
         for k in interleaves:
             te, td, size = bench_one(
                 impl, k, symbols, indexes, freqs, num_freqs, offsets,
                 args.parallel_states, args.reps,
-                bypass=not args.no_bypass, freq_precision=args.precision,
+                bypass=not args.no_bypass, freq_precision=precision,
                 inverse_cdf_precision=inverse_cdf)
             enc_mbs = raw_mb / te
             dec_mbs = raw_mb / td

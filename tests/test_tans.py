@@ -24,6 +24,15 @@ while ``tans8`` (uint8 + uint8) stops at 7 (its state has to hold
 ``[2**L, 2**(L+1))``). It is the small-table tier: ``2**7`` slots per
 distribution instead of ``2**15``, at a coarser probability resolution.
 
+Like the rANS families every tANS family is also available interleaved
+(``num_interleaves`` 1/2/4/8, CPU only): each lane owns one state while the bit
+buffer stays shared, so the header is ``num_interleaves`` state words plus the
+two bit-buffer words (``4 * (num_interleaves + 2)`` bytes, 12 at one lane - the
+value the single-lane header has always been). The lane of a symbol is its index
+% ``num_interleaves``, and push and pop walk the lanes in mirrored order, which
+is what the interleaved round-trips below pin down (including the leftover
+head/tail a symbol count that is not a multiple of the lane count produces).
+
 Every test needs a native build that provides the family. A prebuilt extension
 from before tANS existed makes them skip; otherwise the runtime build compiles a
 module for the profile on first use (~30 s, then cached in the torch extension
@@ -41,33 +50,45 @@ from torch_ans.utils import TorchANSInterface
 #: (family, freq_precision cap) - see rans_build_config.hpp / tans_utils.hpp
 FAMILIES = (("tans32", 15), ("tans16", 15), ("tans8", 7))
 
-#: one module (or one failure) per profile, so a family is resolved once per
-#: session. Caching the *failure* matters as much as caching the module: with
-#: neither a prebuilt extension nor a working toolchain, resolving a family
-#: starts a JIT build (~30 s up to a few minutes when it fails), and without this
-#: each of the tests below would pay for it again.
+#: one module (or one failure) per key, so a build happens once per session.
+#: Caching the *failure* matters as much as caching the module: with neither a
+#: prebuilt extension nor a working toolchain, resolving a family starts a JIT
+#: build (~30 s up to a few minutes when it fails), and without this each of the
+#: tests below would pay for it again.
 _MODULES = {}
 _UNRESOLVED = {}
 
 
-def _tans_module(family):
-    """The native module that provides `family`; skips when there is none."""
-    if family in _UNRESOLVED:
-        pytest.skip(_UNRESOLVED[family])
-    module = _MODULES.get(family)
+def _tans_module(family, num_interleaves=1):
+    """The native module that provides `family`; skips when there is none.
+
+    A single-lane test gets the (cheap) incremental profile build of its family.
+    An interleaved one needs several interleave factors at once, and a profile
+    build contains exactly one - so those go through the full build, which is
+    compiled once and then serves every (family, num_interleaves) pair below.
+    """
+    if num_interleaves == 1:
+        key, profile = family, build_config.BuildProfile(family=family)
+        incremental = None
+    else:
+        key, profile = "full", None
+        incremental = False
+    if key in _UNRESOLVED:
+        pytest.skip(_UNRESOLVED[key])
+    module = _MODULES.get(key)
     if module is None:
         try:
-            module = utils._native_module(build_config.BuildProfile(family=family))
+            module = utils._native_module(profile, incremental_compile=incremental)
         except Exception as exc:  # no prebuilt extension and the build failed
-            _UNRESOLVED[family] = ("the %s family could not be resolved, so no "
-                                   "native build provides it: %s" % (family, exc))
-            pytest.skip(_UNRESOLVED[family])
-        _MODULES[family] = module
-    if not hasattr(module, "%s_push" % family):
-        _UNRESOLVED[family] = ("this native build does not provide the %s family "
-                              "(a prebuilt torch_ans/_C from before it existed?)"
-                              % family)
-        pytest.skip(_UNRESOLVED[family])
+            _UNRESOLVED[key] = ("the %s family could not be resolved, so no "
+                                "native build provides it: %s" % (key, exc))
+            pytest.skip(_UNRESOLVED[key])
+        _MODULES[key] = module
+    if not hasattr(module, _op_name(family, num_interleaves, "push")):
+        _UNRESOLVED[key] = ("this native build does not provide %s "
+                            "(a prebuilt torch_ans/_C from before it existed?)"
+                            % _op_name(family, num_interleaves, "push"))
+        pytest.skip(_UNRESOLVED[key])
     return module
 
 
@@ -90,10 +111,15 @@ def _distribution(module, alphabet, freq_precision, bypass_coding=True, num_dist
     return cdfs, sizes
 
 
+def _op_name(family, num_interleaves, direction):
+    """`tans32_push` / `tans32_i4_push` / ... (see _dynamic_build.OP_SUFFIX)."""
+    return f"{family}{build_config.OP_SUFFIX[num_interleaves]}_{direction}"
+
+
 def _roundtrip(family, alphabet, freq_precision, bypass_coding, batch=3,
-               num_symbols=257, seed=0):
+               num_symbols=257, seed=0, num_interleaves=1):
     """init + build_tables + push + pop; returns (symbols, indexes, decoded, stream)."""
-    module = _tans_module(family)
+    module = _tans_module(family, num_interleaves)
     cdfs, cdfs_sizes = _distribution(module, alphabet, freq_precision, bypass_coding)
     tables = module.tans_build_tables(cdfs, cdfs_sizes, freq_precision)
 
@@ -108,11 +134,12 @@ def _roundtrip(family, alphabet, freq_precision, bypass_coding, batch=3,
                                 generator=generator)
     offsets = torch.zeros(cdfs.size(0), dtype=torch.int32)
 
-    stream = getattr(module, family + "_init_stream")(symbols.size(0), 1, 0)
-    getattr(module, family + "_push")(stream, symbols, indexes, tables, cdfs_sizes,
-                                      offsets, 8, freq_precision, bypass_coding, 4)
-    decoded = getattr(module, family + "_pop")(stream, indexes, tables, cdfs_sizes,
-                                               offsets, 8, freq_precision, bypass_coding, 4)
+    stream = getattr(module, family + "_init_stream")(symbols.size(0), num_interleaves, 0)
+    getattr(module, _op_name(family, num_interleaves, "push"))(
+        stream, symbols, indexes, tables, cdfs_sizes, offsets, 8, freq_precision,
+        bypass_coding, 4)
+    decoded = getattr(module, _op_name(family, num_interleaves, "pop"))(
+        stream, indexes, tables, cdfs_sizes, offsets, 8, freq_precision, bypass_coding, 4)
     return symbols, indexes, decoded, stream
 
 
@@ -191,6 +218,153 @@ def test_push_pop_roundtrips(family, cap, alphabet, bypass):
     # every row still describes a stream, and the length word is a byte count
     assert int(stream[:, 0].min()) > 0
     assert int(stream[:, 0].max()) <= stream.size(1) * stream.element_size()
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("alphabet,bypass", [(2, True), (8, True), (8, False)])
+@pytest.mark.parametrize("num_symbols", [1, 7, 257])
+def test_interleaved_push_pop_roundtrips(family, cap, num_interleaves, alphabet,
+                                         bypass, num_symbols):
+    """One state per lane, one shared bit buffer - and the lanes come back.
+
+    `num_symbols` also covers the leftover head/tail: a symbol count that is not
+    a multiple of the lane count is what exercises them (the lane of a symbol is
+    its index % num_interleaves, so the leftover has to land on its own lanes).
+    """
+    symbols, _, decoded, stream = _roundtrip(
+        family, alphabet, cap, bypass, num_symbols=num_symbols,
+        num_interleaves=num_interleaves)
+    assert torch.equal(decoded, symbols)
+    assert int(stream[:, 0].min()) >= 4 * (num_interleaves + 2)
+    assert int(stream[:, 0].max()) <= stream.size(1) * stream.element_size()
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_interleaved_bypass_codes_symbols_outside_the_alphabet(family, cap,
+                                                               num_interleaves):
+    """The sentinel path, with the bypass digits shared between the lanes."""
+    module = _tans_module(family, num_interleaves)
+    alphabet, fp = 16, min(cap, 8)
+    cdfs, cdfs_sizes = _distribution(module, alphabet, fp, bypass_coding=True)
+    tables = module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.tensor([0, 1000, -250], dtype=torch.int32)
+    generator = torch.Generator().manual_seed(7)
+    symbols = torch.randint(-40, alphabet + 40, (3, 128), dtype=torch.int32,
+                            generator=generator)
+    indexes = torch.randint(0, 3, (3, 128), dtype=torch.int32, generator=generator)
+
+    stream = getattr(module, family + "_init_stream")(3, num_interleaves, 0)
+    getattr(module, _op_name(family, num_interleaves, "push"))(
+        stream, symbols, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    decoded = getattr(module, _op_name(family, num_interleaves, "pop"))(
+        stream, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    # the same symbols are far out of range for some of the distributions
+    assert torch.equal(decoded, symbols)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_interleaved_padding_indexes_are_skipped(family, cap, num_interleaves):
+    """The batched API pads with index -1; those lanes must stay untouched."""
+    module = _tans_module(family, num_interleaves)
+    alphabet, fp = 8, min(cap, 8)
+    cdfs, cdfs_sizes = _distribution(module, alphabet, fp)
+    tables = module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    # one row per interesting case: a padding lane in the middle of a group, one
+    # at its end and one in the leftover head
+    indexes = torch.tensor([[0, 1, -1, 2, -1, 0, 1, 2, -1, 1, 0]], dtype=torch.int32)
+    symbols = torch.tensor([[3, 5, 99, 1, 42, 7, 0, 6, 11, 2, 4]], dtype=torch.int32)
+    offsets = torch.zeros(3, dtype=torch.int32)
+
+    stream = getattr(module, family + "_init_stream")(1, num_interleaves, 0)
+    getattr(module, _op_name(family, num_interleaves, "push"))(
+        stream, symbols, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    decoded = getattr(module, _op_name(family, num_interleaves, "pop"))(
+        stream, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    expected = symbols.clone()
+    expected[0, indexes[0] < 0] = 0
+    assert torch.equal(decoded, expected)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_interleaved_two_pushes_share_one_stream(family, cap, num_interleaves):
+    """A second push continues where the first stopped, and a pop rewinds."""
+    module = _tans_module(family, num_interleaves)
+    alphabet, fp = 8, min(cap, 10)
+    cdfs, cdfs_sizes = _distribution(module, alphabet, fp)
+    tables = module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.zeros(3, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(11)
+    first = torch.randint(0, alphabet, (2, 64), dtype=torch.int32, generator=generator)
+    second = torch.randint(0, alphabet, (2, 64), dtype=torch.int32, generator=generator)
+    first_idx = torch.randint(0, 3, (2, 64), dtype=torch.int32, generator=generator)
+    second_idx = torch.randint(0, 3, (2, 64), dtype=torch.int32, generator=generator)
+
+    stream = getattr(module, family + "_init_stream")(2, num_interleaves, 0)
+    push = getattr(module, _op_name(family, num_interleaves, "push"))
+    pop = getattr(module, _op_name(family, num_interleaves, "pop"))
+    push(stream, first, first_idx, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    length_after_first = int(stream[:, 0].max())
+    push(stream, second, second_idx, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    assert int(stream[:, 0].max()) > length_after_first
+
+    assert torch.equal(pop(stream, second_idx, tables, cdfs_sizes, offsets, 8, fp, True, 4),
+                       second)
+    assert torch.equal(pop(stream, first_idx, tables, cdfs_sizes, offsets, 8, fp, True, 4),
+                       first)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_interleaved_byte_string_roundtrip(family, cap, num_interleaves):
+    """The header is part of the byte string, so it has to survive it."""
+    module = _tans_module(family, num_interleaves)
+    fp, alphabet = min(cap, 8), 8
+    cdfs, cdfs_sizes = _distribution(module, alphabet, fp, True)
+    tables = module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.zeros(3, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(13)
+    indexes = torch.randint(0, 3, (3, 257), dtype=torch.int32, generator=generator)
+    symbols = torch.randint(-40, alphabet + 40, (3, 257), dtype=torch.int32,
+                            generator=generator)
+
+    stream = getattr(module, family + "_init_stream")(3, num_interleaves, 0)
+    getattr(module, _op_name(family, num_interleaves, "push"))(
+        stream, symbols, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    byte_strings = module.rans_stream_to_byte_strings(stream)
+    raw = stream.view(torch.uint8).reshape(stream.shape[0], -1)
+    lengths = stream[:, 0].tolist()
+    for row, byte_string in enumerate(byte_strings):
+        assert bytes(byte_string) == bytes(raw[row, 4:4 + int(lengths[row])].tolist())
+
+    restored = module.rans_byte_strings_to_stream(byte_strings)
+    decoded = getattr(module, _op_name(family, num_interleaves, "pop"))(
+        restored, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
+    assert torch.equal(decoded, symbols)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_interleaved_high_level_api(family, cap, num_interleaves):
+    """`TorchANSInterface` drives interleaved tANS like interleaved rANS."""
+    _tans_module(family, num_interleaves)  # see test_high_level_api
+    freq_precision = min(cap, 10)
+    interface = TorchANSInterface(impl=family, num_interleaves=num_interleaves,
+                                  freq_precision=freq_precision)
+    alphabet, num_dists = 8, 4
+    generator = torch.Generator().manual_seed(5)
+    freqs = torch.randint(1, 50, (num_dists, alphabet), generator=generator).to(torch.int32)
+    num_freqs = torch.full((num_dists,), alphabet, dtype=torch.int32)
+    offsets = torch.zeros(num_dists, dtype=torch.int32)
+    interface.init_params(freqs, num_freqs, offsets)
+
+    symbols = torch.randint(0, alphabet, (2, 128), dtype=torch.int32, generator=generator)
+    indexes = torch.randint(0, num_dists, (2, 128), dtype=torch.int32, generator=generator)
+    encoded = interface.encode_with_indexes(symbols, indexes)
+    assert torch.equal(interface.decode_with_indexes(encoded, indexes), symbols)
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
@@ -384,9 +558,10 @@ def test_the_family_caps_freq_precision(family, cap):
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
 def test_unsupported_options_are_rejected(family, cap):
-    """tANS has no interleaving, no alias table and no inverse-CDF variant."""
-    with pytest.raises(NotImplementedError, match="num_interleaves=2"):
-        TorchANSInterface(impl=family, num_interleaves=2)
+    """tANS has no 32-way variant, no alias table and no inverse-CDF variant."""
+    # 32-way is the CUDA warp path, and the tANS families are CPU-only
+    with pytest.raises(NotImplementedError, match="num_interleaves=32"):
+        TorchANSInterface(impl=family, num_interleaves=32)
     with pytest.raises(NotImplementedError, match="alias sampling"):
         TorchANSInterface(impl=family, num_interleaves=1, alias_sampling=True)
     with pytest.raises(NotImplementedError, match="inverse CDF"):
@@ -413,10 +588,24 @@ def test_table_log_above_the_fixed_point_limit_is_rejected():
         module.tans_build_tables(cdfs, sizes, 16)
 
 
-def test_num_interleaves_other_than_one_is_rejected():
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+def test_an_interleaved_stream_carries_one_state_per_lane(num_interleaves):
+    """The header is `num_interleaves` state words + the shared bit buffer."""
     module = _tans_module("tans32")
-    with pytest.raises((ValueError, RuntimeError), match="num_interleaves=1"):
-        module.tans32_init_stream(2, 4, 0)
+    stream = module.tans32_init_stream(2, num_interleaves, 0)
+    # the length word counts the header, and the payload starts right after it
+    assert int(stream[:, 0].unique().item()) == 4 * (num_interleaves + 2)
+    assert stream.size(1) >= 1 + num_interleaves + 2
+    # every lane's state starts at 0 ("fresh stream")
+    assert int(stream[:, 1:1 + num_interleaves].abs().max()) == 0
+
+
+def test_unsupported_interleave_factors_are_rejected():
+    """1/2/4/8 are the bound ones; anything else must say so."""
+    module = _tans_module("tans32")
+    for unsupported in (0, 3, 16, 32):
+        with pytest.raises((ValueError, RuntimeError), match="num_interleaves"):
+            module.tans32_init_stream(2, unsupported, 0)
 
 
 def test_a_cuda_stream_is_reported_not_silently_mis_coded():

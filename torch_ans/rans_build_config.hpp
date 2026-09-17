@@ -24,8 +24,10 @@
 //   TORCH_ANS_WITH_INVCDF
 //       inverse-CDF table pop (`inverse_cdf_precision`)
 //   TORCH_ANS_WITH_TANS32 / _TANS16 / _TANS8
-//       tANS families (CPU only, interleave 1). The three differ only in the
-//       state/stream width, which is also their freq_precision cap:
+//       tANS families (CPU only; interleave 1 always, 2/4/8 behind the shared
+//       TORCH_ANS_WITH_INTERLEAVE_* gates, no 32-way - that one is the CUDA warp
+//       path). The three differ only in the state/stream width, which is also
+//       their freq_precision cap:
 //       tans32 <uint32, uint16> <= 15, tans16 <uint16, uint8> <= 15,
 //       tans8 <uint8, uint8> <= 7. The table builder (tans_build_tables) is
 //       *not* gated: all three share the same int32 tables - see
@@ -152,19 +154,22 @@
       const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t, \
       int64_t)
 
-// tANS: the family is the (state, stream) pair - see tans.hpp. No interleave or
-// lookup template parameter: interleaving is not implemented for tANS (the op
-// rejects it) and the symbol lookup is the tANS table itself.
+// tANS: the family is the (state, stream) pair - see tans.hpp. The symbol lookup
+// is the tANS table itself, so there is no alias or inverse-CDF parameter; the
+// interleave factor is a template parameter like the rANS one (the per-lane
+// states have to be compile-time indexed to stay in registers). The stream
+// initializer takes `num_interleaves` as a runtime argument instead, so it is
+// instantiated once per family.
 #define TORCH_ANS_INST_TANS_INIT(STATE, STREAM) \
   template ta::Tensor tans_init_stream<STATE, STREAM>(int64_t, int64_t, int64_t)
 
-#define TORCH_ANS_INST_TANS_PUSH(STATE, STREAM) \
-  template void tans_push_indexed_cpu<STATE, STREAM>( \
+#define TORCH_ANS_INST_TANS_PUSH(STATE, STREAM, ILV) \
+  template void tans_push_indexed_cpu<STATE, STREAM, ILV>( \
       ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
       const ta::Tensor&, const ta::Tensor&, const ta::Tensor&, \
       int64_t, bool, int64_t)
 
-#define TORCH_ANS_INST_TANS_POP(STATE, STREAM) \
-  template ta::Tensor tans_pop_indexed_cpu<STATE, STREAM>( \
+#define TORCH_ANS_INST_TANS_POP(STATE, STREAM, ILV) \
+  template ta::Tensor tans_pop_indexed_cpu<STATE, STREAM, ILV>( \
       ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
       const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t)

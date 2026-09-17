@@ -29,11 +29,15 @@ ALPHABET = 16
 #: (family, interleaves) pairs whose CPU push is always compiled; the 32-way
 #: variant is CUDA-only in practice and is covered by the CUDA test below.
 #: The tANS families share the *arithmetic* (see stream_capacity.hpp), but their
-#: stream header is three words instead of a state, so they are worth pinning
-#: against Python's `_stream_budget` separately.
+#: stream header is `num_interleaves` state words plus the shared bit buffer
+#: instead of just the states, so their initial length word grows differently -
+#: they are worth pinning against Python's `_stream_budget`, at more than one
+#: lane count.
 FAMILIES = [("rans64", 1), ("rans64", 4), ("rans32", 1),
             ("rans32_16", 1), ("rans32_16", 4),
-            ("tans32", 1), ("tans16", 1), ("tans8", 1)]
+            ("tans32", 1), ("tans16", 1), ("tans8", 1),
+            ("tans32", 4), ("tans16", 4), ("tans8", 4),
+            ("tans32", 8)]
 
 
 def _setup(impl="rans64", num_interleaves=1, freq_precision=12, device="cpu", **kwargs):

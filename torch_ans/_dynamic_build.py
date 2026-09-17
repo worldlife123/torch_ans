@@ -60,18 +60,17 @@ OP_SUFFIX = {1: "", 2: "_i2", 4: "_i4", 8: "_i8", 32: "_i32"}
 #: interleave factors supported per family, and those with alias / inverse-CDF
 #: variants (32-way interleaving is rans32_16-only and has no alias binding).
 #:
-#: tANS is CPU-only and single-lane for now: an interleaved tANS stream would
-#: need one state per lane *and* a shared bit buffer, which the kernels do not
-#: implement (tans_init_stream rejects num_interleaves != 1 rather than building
-#: a stream they cannot read). It has neither lookup variant either - the tANS
-#: table *is* the lookup - so both tuples are empty.
+#: tANS is CPU-only, so it has no 32-way variant either (that one is the CUDA
+#: warp path); 1/2/4/8 give it one state per lane on top of the bit buffer the
+#: lanes share, exactly like the rANS families. It has neither lookup variant -
+#: the tANS table *is* the lookup - so both tuples are empty.
 SUPPORTED_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),
     "rans32": (1, 2, 4, 8),
     "rans32_16": (1, 2, 4, 8, 32),
-    "tans32": (1,),
-    "tans16": (1,),
-    "tans8": (1,),
+    "tans32": (1, 2, 4, 8),
+    "tans16": (1, 2, 4, 8),
+    "tans8": (1, 2, 4, 8),
 }
 ALIAS_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),

@@ -98,27 +98,41 @@ TANS_API TANS_INLINE int64_t tans_table_row_words(int64_t ts, int64_t max_symbol
 // stream header
 // ---------------------------------------------------------------------------
 // Per row, right after the length word (which counts bytes from row+1 and does
-// include this header):
+// include this header), one word per interleave lane plus the shared bit buffer:
 //
-//   word 0: encoder state (a valid state is in [2**L, 2**(L+1)), so 0 means
-//           "fresh stream" - the first push initializes it to 2**L; this is
-//           what lets tans_init_stream keep rans_init_stream's signature, which
-//           does not know table_log);
-//   word 1: bitbuf, the not-yet-committed bits (< 2**stream_bits at rest);
-//   word 2: nbits, how many bits of bitbuf are valid (< stream_bits at rest).
+//   words 0 .. ilv-1: the encoder state of each lane (a valid state is in
+//           [2**L, 2**(L+1)), so 0 means "fresh stream" - the first push
+//           initializes it to 2**L; this is what lets tans_init_stream keep
+//           rans_init_stream's signature, which does not know table_log);
+//   word  ilv : bitbuf, the not-yet-committed bits (< 2**stream_bits at rest);
+//   word  ilv+1: nbits, how many bits of bitbuf are valid (< stream_bits at
+//           rest).
+//
+// The bit buffer is *shared* by the lanes, exactly like the stream cursor of an
+// interleaved rANS stream: the lanes only own their state, and the bits they
+// emit are one bit sequence (see tans_cpu.cpp for the order). Giving every lane
+// its own bit buffer would need a per-lane length word next to the shared one,
+// and no interleaved rANS stream has that.
 //
 // A decoded stream keeps this header (pop does not rewind the length word -
 // unlike rANS, the payload position cannot be recovered from a bit cursor);
 // pushing onto a decoded stream is not a supported flow, same as for rANS.
-#define TANS_HEADER_WORDS 3
-// Absolute word indices inside a stream row - word 0 is the length - so the
-// kernels can index them straight off the row pointer without an offset (which
-// is also why they are NOT 0/1/2: the first one would be the length word and a
-// write to it would destroy the length the header is counted by).
-#define TANS_STATE_SLOT 1
-#define TANS_BITBUF_SLOT 2
-#define TANS_NBITS_SLOT 3
-#define TANS_HEADER_BYTES (TANS_HEADER_WORDS * 4)
+//
+// The functions below take `num_interleaves`, and `num_interleaves == 1` is
+// what the single-lane header used to be spelled as (state/bitbuf/nbits at
+// words 1/2/3, three header words, 12 header bytes) - that is what keeps the
+// serialized byte string of a 1-lane stream unchanged.
+TANS_API TANS_INLINE int64_t tans_state_slot(int64_t lane) { return 1 + lane; }
+TANS_API TANS_INLINE int64_t tans_bitbuf_slot(int64_t num_interleaves) { return 1 + num_interleaves; }
+TANS_API TANS_INLINE int64_t tans_nbits_slot(int64_t num_interleaves) { return 2 + num_interleaves; }
+TANS_API TANS_INLINE int64_t tans_header_words(int64_t num_interleaves) { return num_interleaves + 2; }
+TANS_API TANS_INLINE int64_t tans_header_bytes(int64_t num_interleaves) {
+  return 4 * tans_header_words(num_interleaves);
+}
+// The length word counts bytes and the payload cursor is derived from it as
+// `length / sizeof(TANS_STREAM_TYPE)` (see tans_cpu.cpp), so the header has to
+// end on a whole stream word: `4 * (ilv + 2)` is a multiple of 4, which every
+// stream word width (1 or 2 bytes) divides.
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -290,34 +304,67 @@ TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
 // deltaFindState = total - norm[s] is negative for the first symbols - and the
 // reference relies on it: the index lands inside the symbol's own slot range
 // [total, total + norm[s]), the invariant the tables were built for.
+// The three pieces `tans_encode_symbol` is made of, split out so that the
+// interleaved kernel can issue them per lane instead of per symbol (the loads
+// of `nextState` in particular, which is the dependent load interleaving
+// overlaps) without carrying a second copy of the arithmetic.
+TANS_API TANS_INLINE const int32_t* tans_symbol_tt_row(const int32_t* row, uint32_t ts,
+                                                       uint32_t symbol) {
+  return row + tans_symbol_tt_offset(ts) + 2 * (int64_t)symbol;
+}
+
+// nbBits = maxBitsOut - [state < minStatePlus], computed in the reference's
+// way: the sum is non-negative by construction (see TANS_MAX_TABLELOG).
+TANS_API TANS_INLINE uint32_t tans_encode_nb_bits(uint32_t state, const int32_t* symbol_tt) {
+  return (uint32_t)(((int64_t)state + (int64_t)symbol_tt[0]) >> 16);
+}
+
+TANS_API TANS_INLINE int64_t tans_encode_next_index(uint32_t state, const int32_t* symbol_tt,
+                                                    uint32_t nb_bits) {
+  return (int64_t)(state >> nb_bits) + (int64_t)symbol_tt[1];
+}
+
+TANS_API TANS_INLINE uint32_t tans_encode_next_state(const int32_t* row, int64_t next_index) {
+  return (uint32_t)row[tans_next_state_offset() + next_index];
+}
+
 template <typename TANS_STREAM_TYPE>
 TANS_INLINE uint32_t tans_encode_symbol(uint32_t state, const int32_t* row,
                                         uint32_t ts, uint32_t symbol,
                                         TansBitWriter<TANS_STREAM_TYPE>* bw) {
-  const int32_t* const symbol_tt = row + tans_symbol_tt_offset(ts) + 2 * (int64_t)symbol;
-  const int32_t delta_nb_bits = symbol_tt[0];
-  const int32_t delta_find_state = symbol_tt[1];
-
-  // nbBits = maxBitsOut - [state < minStatePlus], computed in the reference's
-  // way: the sum is non-negative by construction (see TANS_MAX_TABLELOG).
-  const uint32_t nb_bits = (uint32_t)(((int64_t)state + (int64_t)delta_nb_bits) >> 16);
+  const int32_t* const symbol_tt = tans_symbol_tt_row(row, ts, symbol);
+  const uint32_t nb_bits = tans_encode_nb_bits(state, symbol_tt);
   bw->append(state, nb_bits);  // the low nb_bits of the state, masked in append()
-
-  const int64_t next_index = (int64_t)(state >> nb_bits) + (int64_t)delta_find_state;
-  return (uint32_t)row[tans_next_state_offset() + next_index];
+  return tans_encode_next_state(row, tans_encode_next_index(state, symbol_tt, nb_bits));
 }
 
 // Decoder: the mirror; returns the new state and writes the symbol out.
+// The decoder's mirror of the helpers above, split the same way: the table
+// loads (both planes, indexed by the lane's state) are what the interleaved
+// kernel issues for every lane at once, and only `take()` has to walk the lanes
+// in order.
+TANS_API TANS_INLINE uint32_t tans_decode_word(const int32_t* row, uint32_t ts, uint32_t state) {
+  return (uint32_t)row[tans_decode_offset(ts) + (int64_t)state];
+}
+TANS_API TANS_INLINE uint32_t tans_decode_symbol_of(const int32_t* row, uint32_t ts,
+                                                    uint32_t state) {
+  return (uint32_t)row[tans_symbol_offset(ts) + (int64_t)state];
+}
+TANS_API TANS_INLINE uint32_t tans_decode_nb_bits(uint32_t word) {
+  return (word >> TANS_NBITS_SHIFT) & 0x1Fu;
+}
+TANS_API TANS_INLINE uint32_t tans_decode_new_state(uint32_t word, uint32_t low_bits) {
+  return (word & TANS_NEW_STATE_MASK) + low_bits;
+}
+
 template <typename TANS_STREAM_TYPE>
 TANS_INLINE uint32_t tans_decode_symbol(uint32_t state, const int32_t* row,
                                         uint32_t ts, TansBitReader<TANS_STREAM_TYPE>* br,
                                         uint32_t* symbol_out) {
-  const uint32_t word =
-      (uint32_t)row[tans_decode_offset(ts) + (int64_t)state];
-  const uint32_t nb_bits = (word >> TANS_NBITS_SHIFT) & 0x1Fu;
-  *symbol_out = (uint32_t)row[tans_symbol_offset(ts) + (int64_t)state];
-  const uint32_t low_bits = br->take(nb_bits);
-  return (word & TANS_NEW_STATE_MASK) + low_bits;
+  const uint32_t word = tans_decode_word(row, ts, state);
+  const uint32_t nb_bits = tans_decode_nb_bits(word);
+  *symbol_out = tans_decode_symbol_of(row, ts, state);
+  return tans_decode_new_state(word, br->take(nb_bits));
 }
 
 // ---------------------------------------------------------------------------

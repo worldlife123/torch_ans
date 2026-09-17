@@ -1,0 +1,130 @@
+{
+  "machine": {
+    "machine": "x86_64",
+    "torch": "2.11.0+cu130",
+    "python": "3.11.5",
+    "threads": 1
+  },
+  "config": {
+    "symbols": 1048576,
+    "distributions": 4096,
+    "parallel_states": 8,
+    "reps": 5,
+    "bypass": true
+  },
+  "results": [
+    {
+      "impl": "tans8",
+      "interleaves": 1,
+      "alphabet": 32,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 4.774036884307861,
+      "enc_s": 0.025348154013045132,
+      "dec_s": 0.025020354019943625,
+      "coded_bytes": 628907,
+      "table_bytes": 7405568
+    },
+    {
+      "impl": "tans8",
+      "interleaves": 8,
+      "alphabet": 32,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 4.774036884307861,
+      "enc_s": 0.01605935097904876,
+      "dec_s": 0.01408748101675883,
+      "coded_bytes": 629150,
+      "table_bytes": 7405568
+    },
+    {
+      "impl": "rans32_16",
+      "interleaves": 1,
+      "alphabet": 32,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 4.774036884307861,
+      "enc_s": 0.014432079973630607,
+      "dec_s": 0.027134492993354797,
+      "coded_bytes": 627776,
+      "table_bytes": 557056
+    },
+    {
+      "impl": "rans32_16",
+      "interleaves": 8,
+      "alphabet": 32,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 4.774036884307861,
+      "enc_s": 0.012598095985595137,
+      "dec_s": 0.018536960007622838,
+      "coded_bytes": 627950,
+      "table_bytes": 557056
+    },
+    {
+      "impl": "tans8",
+      "interleaves": 1,
+      "alphabet": 64,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 5.8451032638549805,
+      "enc_s": 0.025917624006979167,
+      "dec_s": 0.025372122996486723,
+      "coded_bytes": 770163,
+      "table_bytes": 8454144
+    },
+    {
+      "impl": "tans8",
+      "interleaves": 8,
+      "alphabet": 64,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 5.8451032638549805,
+      "enc_s": 0.016764834988862276,
+      "dec_s": 0.014576422981917858,
+      "coded_bytes": 770368,
+      "table_bytes": 8454144
+    },
+    {
+      "impl": "rans32_16",
+      "interleaves": 1,
+      "alphabet": 64,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 5.8451032638549805,
+      "enc_s": 0.014922956004738808,
+      "dec_s": 0.03733466594712809,
+      "coded_bytes": 768332,
+      "table_bytes": 1081344
+    },
+    {
+      "impl": "rans32_16",
+      "interleaves": 8,
+      "alphabet": 64,
+      "freq_precision": 7,
+      "bypass": true,
+      "symbols": 1048576,
+      "distributions": 4096,
+      "entropy": 5.8451032638549805,
+      "enc_s": 0.013293208961840719,
+      "dec_s": 0.021362019004300237,
+      "coded_bytes": 768502,
+      "table_bytes": 1081344
+    }
+  ],
+  "skipped": []
+}

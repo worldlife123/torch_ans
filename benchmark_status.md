@@ -160,3 +160,156 @@ python scripts/generate_benchmark_report.py \
 
 A version that cannot be built any more can be skipped; the report then shows `—` in that column and no gain.
 
+---
+
+# tANS vs rANS (measured 2026-09-18)
+
+A second, separate measurement: the **tANS families against the rANS ones at matched
+parameters**, with `scripts/bench_tans_vs_rans.py` (raw results:
+`benchmarks/tans_vs_rans_cpu.json`). Same rules as above — local, committed by hand,
+every configuration round-trip checked before it is timed.
+
+## Environment
+
+| item | value |
+|---|---|
+| CPU | Intel(R) Core(TM) i7-6800K CPU @ 3.40GHz (6C/12T) |
+| torch | 2.11.0+cu130 (CPU-only extension: this machine's CUDA toolchain does not build) |
+| Python | 3.11.5 |
+| torch intra-op threads | 1 (isolates the out-of-order effect of interleaving) |
+| workload | 1,048,576 symbols, 256 distributions, 8 parallel states, bypass on, symbols drawn **from** the per-distribution pmf |
+| method | high-level API (`encode_with_indexes` / `decode_with_indexes`), best of 5 |
+
+Throughput is **MB/s of symbols coded** (1 byte per symbol). `H` is the mean
+per-distribution entropy and `over` is `bits/symbol - H`, i.e. what the coder loses
+against the distribution it is given — the column that makes "faster" comparable
+across families. `table KB` is the per-distribution state the impl carries (for tANS
+that *is* the spread table, `3 * 2**freq_precision + 2 * cdf_row` int32 words).
+
+## Selected results (alphabet 64; alphabet 256 behaves the same way)
+
+| impl | ilv | fp | enc MB/s | dec MB/s | bits/sym | H | over | table KB |
+|---|---|---|---|---|---|---|---|---|
+| tans32 | 1 | 7 | 66.0 | 86.6 | 5.877 | 5.847 | 0.030 | 516 |
+| tans32 | 8 | 7 | 83.5 | 108.3 | 5.879 | 5.847 | 0.032 | 516 |
+| rans32 | 1 | 7 | 101.5 | 45.1 | 5.863 | 5.847 | 0.017 | 66 |
+| rans32 | 8 | 7 | 111.3 | 70.4 | 5.865 | 5.847 | 0.018 | 66 |
+| tans32 | 1 | 10 | 46.2 | 50.1 | 5.734 | 5.730 | 0.004 | 3 204 |
+| tans32 | 8 | 10 | 75.5 | 91.0 | 5.736 | 5.730 | 0.005 | 3 204 |
+| rans32 | 1 | 10 | 96.3 | 44.8 | 5.733 | 5.730 | 0.002 | 66 |
+| rans32 | 8 | 10 | 108.2 | 69.6 | 5.734 | 5.730 | 0.004 | 66 |
+| tans32 | 1 | 15 | 15.3 | 13.6 | 5.725 | 5.724 | 0.001 | 98 436 |
+| tans32 | 8 | 15 | 39.7 | 29.7 | 5.727 | 5.724 | 0.003 | 98 436 |
+| rans32 | 1 | 15 | 94.3 | 44.7 | 5.725 | 5.724 | 0.001 | 66 |
+| rans32 | 8 | 15 | 108.7 | 69.6 | 5.726 | 5.724 | 0.002 | 66 |
+
+`alphabet=256, fp=15` (the worst case for tANS, 96 MB of tables) is the same picture:
+tans32 8-way 38.4 MB/s encode / 29.7 MB/s decode against rans32 8-way 103.9 / 58.3.
+
+## Findings
+
+- **Decode is what tANS is for.** Against the fastest rANS family at the same
+  `freq_precision`, tANS decodes **1.5×–1.9× faster at `freq_precision=7`** (one table
+  access instead of a search) and ~1.0×–1.25× at 10; from 12 upwards it loses, and at 15
+  with 256 distributions it is 3×–4× *slower* — the table no longer fits any cache level
+  (98 MB against rANS' 258 KB) and every symbol is a cache miss.
+- **Encode is rANS' side**, at every precision: tANS reaches 0.65×–0.75× of the fastest
+  rANS at `freq_precision=7`, 0.48×–0.66× at 10 and 0.16×–0.34× at 15. The table-driven
+  encode is not cheaper than rANS' division plus renormalization on a CPU.
+- **Interleaving helps tANS more than rANS when the table is cache-bound**: up to
+  **2.6× encode / 2.2× decode at `freq_precision=15`, 8 lanes** (rANS: 1.3×–1.5×), because
+  the lanes overlap exactly the cache misses that otherwise serialize. Where the table
+  fits (`freq_precision=7`), the gain shrinks to ~1.2×–1.25× — the same order as rANS.
+  The three tANS families track each other within noise at every configuration.
+- **Compression**: at `freq_precision=7` tANS loses ~0.030 bit/symbol to the spread
+  against rANS' ~0.017; by 12–15 both are within 0.002–0.005 of the entropy. So the
+  tANS compression penalty is real but small, and it is a penalty of the *small*
+  `freq_precision` — which is also the only regime where tANS is fast.
+
+**Rule of thumb:** `tans8` / `tans16` / `tans32` with `freq_precision <= 10` and a few
+dozen to a few hundred distributions, for decode-heavy work; a rANS family with
+`num_interleaves=4` (plus `inverse_cdf_precision="auto"`) otherwise. `tans8` (cap 7) is
+the pick when there are thousands of distributions, since its table is 1.5 kB each.
+
+Reproduce with:
+
+```bash
+pip install . --no-build-isolation   # the scripts import the *installed* torch_ans
+python scripts/bench_tans_vs_rans.py --json benchmarks/tans_vs_rans_cpu.json
+```
+
+## Supplement: `tans8` at `freq_precision=7`
+
+`tans8` is the small-table tier (its `freq_precision` cap *is* 7, i.e. 128 spread slots
+per distribution) and its whole point is many distributions, so the main sweep — which
+only had `alphabet=64` at that precision, and which cannot code `alphabet=256` at all
+(257 symbols into 128 slots) — is not enough to judge it. Measured separately
+(`benchmarks/tans8_fp7_cpu.json`, `benchmarks/tans8_fp7_many_dists_cpu.json`, same
+environment as above, `freq_precision=7`, bypass on):
+
+### 1 M symbols, 256 distributions
+
+| alphabet | impl | ilv | enc MB/s | dec MB/s | bits/sym | H | over | table KB |
+|---|---|---|---|---|---|---|---|---|
+| 16 | `tans8` | 1 | 78.0 | 84.2 | 3.757 | 3.736 | 0.020 | 420 |
+| 16 | `tans8` | 8 | **94.7** | **102.8** | 3.758 | 3.736 | 0.022 | 420 |
+| 16 | `rans32_16` | 1 | 91.1 | 63.3 | 3.752 | 3.736 | 0.016 | 18 |
+| 16 | `rans32_16` | 8 | 112.1 | 81.3 | 3.753 | 3.736 | 0.017 | 18 |
+| 32 | `tans8` | 1 | 76.3 | 86.1 | 4.799 | 4.775 | 0.024 | 452 |
+| 32 | `tans8` | 8 | 91.1 | 101.5 | 4.800 | 4.775 | 0.026 | 452 |
+| 32 | `rans32_16` | 1 | 91.7 | 54.7 | 4.790 | 4.775 | 0.015 | 34 |
+| 32 | `rans32_16` | 8 | 107.6 | 73.7 | 4.791 | 4.775 | 0.016 | 34 |
+| 64 | `tans8` | 1 | 70.4 | 88.8 | 5.877 | 5.847 | 0.030 | 516 |
+| 64 | `tans8` | 8 | 85.1 | 99.1 | 5.879 | 5.847 | 0.032 | 516 |
+| 64 | `rans32_16` | 1 | 91.8 | 46.8 | 5.863 | 5.847 | 0.017 | 66 |
+| 64 | `rans32_16` | 8 | 102.6 | 68.1 | 5.865 | 5.847 | 0.018 | 66 |
+| 127 | `tans8` | 1 | 66.6 | 94.1 | 7.001 | 6.984 | 0.017 | 642 |
+| 127 | `tans8` | 8 | 85.6 | **102.8** | 7.003 | 6.984 | 0.018 | 642 |
+| 127 | `rans32` | 1 | 116.2 | 44.5 | 7.000 | 6.984 | 0.016 | 129 |
+| 127 | `rans32` | 8 | 131.2 | 80.7 | 7.002 | 6.984 | 0.018 | 129 |
+
+### 1 M symbols, 4096 distributions (the regime `tans8` is for)
+
+| alphabet | impl | ilv | enc MB/s | dec MB/s | bits/sym | over | table KB |
+|---|---|---|---|---|---|---|---|
+| 32 | `tans8` | 1 | 41.4 | 41.9 | 4.798 | 0.024 | 7 232 |
+| 32 | `tans8` | 8 | 65.3 | **74.4** | 4.800 | 0.026 | 7 232 |
+| 32 | `rans32_16` | 1 | 72.7 | 38.6 | 4.790 | 0.016 | 544 |
+| 32 | `rans32_16` | 8 | 83.2 | 56.6 | 4.791 | 0.017 | 544 |
+| 64 | `tans8` | 1 | 40.5 | 41.3 | 5.876 | 0.031 | 8 256 |
+| 64 | `tans8` | 8 | 62.5 | 71.9 | 5.877 | 0.032 | 8 256 |
+| 64 | `rans32_16` | 1 | 70.3 | 28.1 | 5.862 | 0.017 | 1 056 |
+| 64 | `rans32_16` | 8 | 78.9 | 49.1 | 5.863 | 0.018 | 1 056 |
+
+What it adds:
+
+- **`num_interleaves=8` on `tans8` (fp=7, 256 distributions): 85–95 MB/s encode,
+  99–103 MB/s decode**, against 67–78 / 84–94 at one lane — a 1.19–1.28× encode and
+  1.09–1.22× decode gain. Decode is the number that matters here: at one lane `tans8`
+  decodes **1.33×–2.11× as fast as the fastest rANS at the same precision** (2.11× at
+  `alphabet=127`, where the rANS search is longest), and at eight lanes it still beats
+  the 8-lane rANS decode by **1.26×–1.46×**.
+- **Encode stays behind** (0.57–0.85× of rANS at every alphabet and lane count), which is
+  the same story as the main sweep.
+- **The `tans8` cap is not a handicap in its regime**: more distributions cost both
+  families throughput (more table/cdf rows to touch), and the tANS interleave gain
+  *grows* to **1.55× encode / 1.74× decode at 4096 distributions** — the same
+  cache-miss-overlap effect the main sweep showed at `freq_precision=15`, reached here at
+  a table size `tans8` can still afford (`8 MB` for 4096 distributions, 1.5 kB each,
+  against rANS' `1 MB` — and against ~40 kB per distribution for `tans32`).
+- Compression: `tans8` at `fp=7` carries 0.017–0.032 bit/symbol of overhead against rANS'
+  0.015–0.018 at the same precision. It is the price of the 128-slot spread: it peaks at
+  `alphabet=64` (~0.03) and drops back at 127, where 127 symbols in 128 slots is nearly
+  uniform by construction. The lane count does not change it (the coded size moves by
+  <0.003 bit/symbol between 1 and 8 lanes).
+
+Reproduce with:
+
+```bash
+python scripts/bench_tans_vs_rans.py --precision 7 --alphabet 16 32 64 127 \
+    --impl tans8 tans16 rans32 rans32_16 --json benchmarks/tans8_fp7_cpu.json
+python scripts/bench_tans_vs_rans.py --dists 4096 --precision 7 --alphabet 32 64 \
+    --interleaves 1 8 --impl tans8 rans32_16 \
+    --json benchmarks/tans8_fp7_many_dists_cpu.json
+```
+

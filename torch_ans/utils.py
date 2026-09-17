@@ -210,21 +210,24 @@ _EXPORTED_NATIVE_OPS = frozenset(_build_config.profile_op_names(None))
 # ---------------------------------------------------------------------------
 # stream capacity contract: the caller reserves, the native push compares
 # ---------------------------------------------------------------------------
-#: (per-lane header bytes, stream word bytes) per family - the two sizes the
+#: (per-lane state bytes, stream word bytes) per family - the two sizes the
 #: worst-case formula (torch_ans/stream_capacity.hpp) and the initial length word
 #: of `<family>_init_stream` are built from.
 #:
-#: For a rANS family the header *is* the state. A tANS stream carries a 3-word
-#: header (state, residual bit buffer, bit count - see torch_ans/tans_utils.hpp)
-#: because a fixed-width tANS state cannot absorb the bits it does not emit, so
-#: the entry is 12 for all three tANS families whatever their state width is.
+#: For a rANS family the header *is* the state, `state bytes * num_interleaves`
+#: of it. A tANS stream stores one full int32 word per lane for the state -
+#: whatever the family's own state width is - *plus* one word each for the
+#: residual bit buffer and its bit count, because a fixed-width tANS state cannot
+#: absorb the bits it does not emit (see torch_ans/tans_utils.hpp). Those two
+#: extra words are there once per stream, not once per lane.
+_TANS_HEADER_EXTRA_BYTES = 8
 _STREAM_SIZES = {
     "rans64": (8, 4),      # uint64 state, uint32 stream words
     "rans32": (4, 1),      # uint32 state, uint8 stream words
     "rans32_16": (4, 2),   # uint32 state, uint16 stream words (incl. the warp path)
-    "tans32": (12, 2),     # uint32 state, uint16 stream words
-    "tans16": (12, 1),     # uint16 state, uint8 stream words
-    "tans8": (12, 1),      # uint8 state, uint8 stream words
+    "tans32": (4, 2),      # uint32 state, uint16 stream words
+    "tans16": (4, 1),      # uint16 state, uint8 stream words
+    "tans8": (4, 1),       # uint8 state, uint8 stream words
 }
 
 
@@ -1090,15 +1093,17 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                     `freq_precision`; symbol lookup is a single table access instead
                     of a search. The three tANS families differ only in the state /
                     stream word width (uint32+uint16, uint16+uint8, uint8+uint8) and
-                    share their tables. tANS is CPU-only and single-lane for now:
-                    `num_interleaves` must be 1 and `inverse_cdf_precision` /
-                    `alias_sampling` do not apply (the tANS table is the lookup).
+                    share their tables. tANS is CPU-only and supports
+                    `num_interleaves` 1/2/4/8 (one state per lane on top of the
+                    bit buffer the lanes share, like rANS); `inverse_cdf_precision`
+                    / `alias_sampling` do not apply (the tANS table is the lookup).
         bypass_coding (bool): Enable bypass coding for out-of-range symbols. 
                               This may not be supported in all implementations, or may reduce throughput!
         bypass_precision (int): Precision for bypass coding.
         num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
-        num_interleaves (int): Number of interleaved ANS states per stream (1, 4, or 32).
-                               32 uses the warp-level CUDA interleaved kernels on GPU (rans32_16 only);
+        num_interleaves (int): Number of interleaved ANS states per stream (1, 2, 4, 8, or 32).
+                               32 uses the warp-level CUDA interleaved kernels on GPU (rans32_16 only) and is
+                               not available for the tANS families (they are CPU-only);
                                interleaved streams are bit-compatible between CPU and GPU implementations.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
         inverse_cdf_precision (int or "auto", optional): Enables inverse-CDF symbol lookup
@@ -1351,8 +1356,16 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
             raise RuntimeError(_CUDA_UNAVAILABLE_HINT) from exc
 
     def _stream_sizes(self):
-        """(state bytes, stream word bytes) of this interface's family."""
-        return _STREAM_SIZES[self._base_impl]
+        """(header bytes, stream word bytes) of this family at this lane count.
+
+        The first component is what `<family>_init_stream` leaves in the length
+        word (it counts the header itself, see rans_cpu.cpp / tans_cpu.cpp), so
+        it grows with `num_interleaves` - by one state per lane for rANS and by
+        one int32 state word per lane for tANS.
+        """
+        state_bytes, word_bytes = _STREAM_SIZES[self._base_impl]
+        extra = _TANS_HEADER_EXTRA_BYTES if self._is_tans else 0
+        return state_bytes * self.num_interleaves + extra, word_bytes
 
     def _adopt_stream(self, stream, used_bytes) -> None:
         """Remember `stream` and what it holds, for the capacity contract."""
@@ -1423,9 +1436,9 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         num_parallel_states = num_parallel_states if num_parallel_states is not None else self.num_parallel_states
         num_parallel_states = int(num_parallel_states) if num_parallel_states is not None else 1
         stream = self._init_tensor(self.ans_init_func(num_parallel_states, self.num_interleaves))
-        # A fresh stream needs no adoption read: rans_init_stream leaves the length
-        # word at `state bytes * num_interleaves` (see rans_cpu.cpp).
-        self._adopt_stream(stream, self._stream_sizes()[0] * self.num_interleaves)
+        # A fresh stream needs no adoption read: init_stream leaves the length
+        # word at the header size (see rans_cpu.cpp / tans_cpu.cpp).
+        self._adopt_stream(stream, self._stream_sizes()[0])
         return stream
 
     def _reshape_for_parallel(self, tensor : torch.Tensor, num_parallel_states=None, padding_value=0, **kwargs) -> torch.Tensor:

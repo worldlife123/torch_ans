@@ -92,16 +92,19 @@
   m.impl(PREFIX "_invcdf_pop", \
          TORCH_BOX((&rans_pop<STATE, STREAM, false, true, ILV>)))
 
-// tANS: the family *is* the (state, stream) pair, so there is no interleave or
-// lookup template argument (see tans.hpp). The schema strings are the rANS ones
-// on purpose - identical signatures are what let Python switch impl without
-// touching a call site.
+// tANS: the family *is* the (state, stream) pair and the symbol lookup is its
+// own table, so the only other template argument is the interleave factor (see
+// tans.hpp). The schema strings are the rANS ones on purpose - identical
+// signatures are what let Python switch impl without touching a call site.
 #define TORCH_ANS_TANS_IMPL_INIT(m, PREFIX, STATE, STREAM) \
   m.impl(PREFIX "_init_stream", TORCH_BOX((&tans_init_stream<STATE, STREAM>)))
 
 #define TORCH_ANS_TANS_IMPL_PUSH_POP(m, PREFIX, STATE, STREAM) \
-  m.impl(PREFIX "_push", TORCH_BOX((&tans_push<STATE, STREAM>))); \
-  m.impl(PREFIX "_pop", TORCH_BOX((&tans_pop<STATE, STREAM>)))
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, PREFIX, STATE, STREAM, 1)
+
+#define TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, PREFIX, STATE, STREAM, ILV) \
+  m.impl(PREFIX "_push", TORCH_BOX((&tans_push<STATE, STREAM, ILV>))); \
+  m.impl(PREFIX "_pop", TORCH_BOX((&tans_pop<STATE, STREAM, ILV>)))
 
 // ---------------------------------------------------------------------------
 // registration
@@ -252,23 +255,52 @@ inline void torch_ans_register_schemas(
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // tabled ANS, CPU only, interleave 1: one gate per (state, stream) pair. The
-  // signatures are the rANS ones (see tans.hpp); only the family is new.
+  // tabled ANS, CPU only: one gate per (state, stream) pair, and the interleave
+  // factors behind the gates the rANS families share (no 32-way - that one is
+  // the CUDA warp path). The signatures are the rANS ones (see tans.hpp); only
+  // the family is new.
 #if TORCH_ANS_WITH_TANS32
   // 32-bit state, 16-bit stream words (freq_precision <= 15).
   TORCH_ANS_DEF_INIT(m, "tans32");
   TORCH_ANS_DEF_PUSH_POP(m, "tans32");
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_DEF_PUSH_POP(m, "tans32_i2");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_DEF_PUSH_POP(m, "tans32_i4");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_DEF_PUSH_POP(m, "tans32_i8");
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
   // 16-bit state, 8-bit stream words (freq_precision <= 15); the same tables as
   // tans32, a finer stream granularity.
   TORCH_ANS_DEF_INIT(m, "tans16");
   TORCH_ANS_DEF_PUSH_POP(m, "tans16");
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_DEF_PUSH_POP(m, "tans16_i2");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_DEF_PUSH_POP(m, "tans16_i4");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_DEF_PUSH_POP(m, "tans16_i8");
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   // 8-bit state, 8-bit stream words (freq_precision <= 7): the small-table tier.
   TORCH_ANS_DEF_INIT(m, "tans8");
   TORCH_ANS_DEF_PUSH_POP(m, "tans8");
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_DEF_PUSH_POP(m, "tans8_i2");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_DEF_PUSH_POP(m, "tans8_i4");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_DEF_PUSH_POP(m, "tans8_i8");
+#  endif
 #endif
 }
 
@@ -436,12 +468,39 @@ inline void torch_ans_register_family_impls(
   // message instead of the dispatcher's bare "not implemented for CUDA".
 #if TORCH_ANS_WITH_TANS32
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans32", uint32_t, uint16_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans32_i2", uint32_t, uint16_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans32_i4", uint32_t, uint16_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans32_i8", uint32_t, uint16_t, 8);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans16", uint16_t, uint8_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans16_i2", uint16_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans16_i4", uint16_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans16_i8", uint16_t, uint8_t, 8);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans8", uint8_t, uint8_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans8_i2", uint8_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans8_i4", uint8_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans8_i8", uint8_t, uint8_t, 8);
+#  endif
 #endif
 }
 
@@ -493,6 +552,7 @@ inline void torch_ans_register_cuda_impls(
 #undef TORCH_ANS_IMPL_INVCDF
 #undef TORCH_ANS_TANS_IMPL_INIT
 #undef TORCH_ANS_TANS_IMPL_PUSH_POP
+#undef TORCH_ANS_TANS_IMPL_PUSH_POP_ILV
 
 #else  // TORCH_ANS_STABLE_ABI
 
@@ -539,8 +599,11 @@ inline void torch_ans_register_cuda_impls(
   m.def(PREFIX "_init_stream", &tans_init_stream<STATE, STREAM>, TORCH_ANS_INIT_ARGS)
 
 #define TORCH_ANS_TANS_BIND_PUSH_POP(m, PREFIX, STATE, STREAM) \
-  m.def(PREFIX "_push", &tans_push<STATE, STREAM>, TORCH_ANS_PUSH_ARGS); \
-  m.def(PREFIX "_pop", &tans_pop<STATE, STREAM>, TORCH_ANS_POP_ARGS)
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, PREFIX, STATE, STREAM, 1)
+
+#define TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, PREFIX, STATE, STREAM, ILV) \
+  m.def(PREFIX "_push", &tans_push<STATE, STREAM, ILV>, TORCH_ANS_PUSH_ARGS); \
+  m.def(PREFIX "_pop", &tans_pop<STATE, STREAM, ILV>, TORCH_ANS_POP_ARGS)
 
 inline void torch_ans_bind_all(py::module& m) {
   // ---------------------------------------------------------------- common --
@@ -691,23 +754,50 @@ inline void torch_ans_bind_all(py::module& m) {
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // tabled ANS, CPU only, interleave 1. One gate per (state, stream) pair; no
-  // alias and no inverse-CDF variant (the tANS table *is* the lookup).
+  // tabled ANS, CPU only, interleave 1/2/4/8. One gate per (state, stream) pair;
+  // no alias and no inverse-CDF variant (the tANS table *is* the lookup).
 #if TORCH_ANS_WITH_TANS32
   // 32-bit state, 16-bit stream words (freq_precision <= 15).
   TORCH_ANS_TANS_BIND_INIT(m, "tans32", uint32_t, uint16_t);
   TORCH_ANS_TANS_BIND_PUSH_POP(m, "tans32", uint32_t, uint16_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans32_i2", uint32_t, uint16_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans32_i4", uint32_t, uint16_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans32_i8", uint32_t, uint16_t, 8);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
   // 16-bit state, 8-bit stream words (freq_precision <= 15): the same tables as
   // tans32, a finer stream granularity.
   TORCH_ANS_TANS_BIND_INIT(m, "tans16", uint16_t, uint8_t);
   TORCH_ANS_TANS_BIND_PUSH_POP(m, "tans16", uint16_t, uint8_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans16_i2", uint16_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans16_i4", uint16_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans16_i8", uint16_t, uint8_t, 8);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   // 8-bit state, 8-bit stream words (freq_precision <= 7): the small-table tier.
   TORCH_ANS_TANS_BIND_INIT(m, "tans8", uint8_t, uint8_t);
   TORCH_ANS_TANS_BIND_PUSH_POP(m, "tans8", uint8_t, uint8_t);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans8_i2", uint8_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans8_i4", uint8_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans8_i8", uint8_t, uint8_t, 8);
+#  endif
 #endif
 }
 
@@ -719,5 +809,6 @@ inline void torch_ans_bind_all(py::module& m) {
 #undef TORCH_ANS_BIND_INVCDF
 #undef TORCH_ANS_TANS_BIND_INIT
 #undef TORCH_ANS_TANS_BIND_PUSH_POP
+#undef TORCH_ANS_TANS_BIND_PUSH_POP_ILV
 
 #endif  // TORCH_ANS_STABLE_ABI

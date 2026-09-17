@@ -19,9 +19,11 @@
 // lands in the common operator set.
 //
 // Unlike rANS there is no alias-sampling and no inverse-CDF variant (both are
-// rANS lookups that tANS replaces with its own table), and interleaving is not
-// implemented yet: `tans_init_stream` rejects num_interleaves != 1 rather than
-// silently producing a stream the kernels do not understand.
+// rANS lookups that tANS replaces with its own table). Interleaving *is*
+// implemented (1/2/4/8 lanes, CPU only), and it mirrors the rANS structure: one
+// state per lane, sharing the single bit buffer the fixed-width tANS state
+// cannot replace - see tans_utils.hpp for the header layout and tans_cpu.cpp for
+// the lane order (lane == symbol index % NUM_INTERLEAVES, like rANS).
 //
 // CUDA is not implemented either: the wrappers reject device tensors with an
 // explanation instead of dispatching to a missing kernel.
@@ -56,10 +58,14 @@ ta::Tensor tans_build_tables(const ta::Tensor& cdfs, const ta::Tensor& cdfs_size
 // ---------------------------------------------------------------------------
 // kernels (defined in tans_cpu.cpp)
 // ---------------------------------------------------------------------------
+// `num_interleaves` is a runtime argument of the stream initializer (it does
+// not know table_log either, so it cannot be a template parameter there); the
+// coding kernels have it as `NUM_INTERLEAVES` for the same reason the rANS ones
+// do: the per-lane states must be compile-time indexed to stay in registers.
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
 ta::Tensor tans_init_stream(int64_t size, int64_t num_interleaves=1, int64_t preallocate_size=0);
 
-template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
+template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES=1>
 void tans_push_indexed_cpu(
   ta::Tensor stream,
   const ta::Tensor& symbols,
@@ -71,7 +77,7 @@ void tans_push_indexed_cpu(
   bool bypass_coding,
   int64_t bypass_precision);
 
-template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
+template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES=1>
 ta::Tensor tans_pop_indexed_cpu(
   ta::Tensor stream,
   const ta::Tensor& indexes,
@@ -117,7 +123,7 @@ inline void tans_check_coding_args(int64_t freq_precision, bool bypass_coding,
 
 // One push, with the same trailing `used_bytes` capacity contract as rans_push
 // (see stream_capacity.hpp).
-template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
+template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES=1>
 void tans_push(// tANS stream
   ta::Tensor stream,
   ta::Tensor symbols,
@@ -161,9 +167,11 @@ void tans_push(// tANS stream
   tans_check_coding_args<TANS_STATE_TYPE, TANS_STREAM_TYPE>(
       freq_precision, bypass_coding, bypass_precision, "tans_push");
 
+  // One unflushed stream word per lane is what the worst case has to reserve
+  // (the shared bit buffer holds up to one as well, see stream_capacity.hpp).
   ans_ensure_stream_capacity<TANS_STATE_TYPE, TANS_STREAM_TYPE>(
       stream, num_symbols, freq_precision, bypass_coding, bypass_precision,
-      /*num_interleaves=*/1, used_bytes);
+      /*num_interleaves=*/(int64_t)NUM_INTERLEAVES, used_bytes);
 
   ta::Tensor offsets_tensor;
   if (!offsets.has_value())
@@ -171,7 +179,7 @@ void tans_push(// tANS stream
   else
     offsets_tensor = offsets.value();
 
-  return tans_push_indexed_cpu<TANS_STATE_TYPE, TANS_STREAM_TYPE>(
+  return tans_push_indexed_cpu<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
     ta::as_contiguous(stream), ta::as_contiguous(symbols),
     ta::as_contiguous(indexes.value()), ta::as_contiguous(tables.value()),
     ta::as_contiguous(cdfs_sizes.value()), ta::as_contiguous(offsets_tensor),
@@ -181,7 +189,7 @@ void tans_push(// tANS stream
 // One pop. `inverse_cdf_precision` is part of the shared rans_pop signature and
 // ignored here (tANS looks its symbol up in its own table, so there is no
 // inverse-CDF variant).
-template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
+template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES=1>
 ta::Tensor tans_pop(// tANS stream
   ta::Tensor stream,
   std::optional<ta::Tensor> indexes,
@@ -221,7 +229,7 @@ ta::Tensor tans_pop(// tANS stream
   else
     offsets_tensor = offsets.value();
 
-  return tans_pop_indexed_cpu<TANS_STATE_TYPE, TANS_STREAM_TYPE>(
+  return tans_pop_indexed_cpu<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
     ta::as_contiguous(stream), ta::as_contiguous(indexes.value()),
     ta::as_contiguous(tables.value()), ta::as_contiguous(cdfs_sizes.value()),
     ta::as_contiguous(offsets_tensor),
