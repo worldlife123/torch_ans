@@ -313,3 +313,230 @@ python scripts/bench_tans_vs_rans.py --dists 4096 --precision 7 --alphabet 32 64
     --json benchmarks/tans8_fp7_many_dists_cpu.json
 ```
 
+## tANS on CUDA (unreleased)
+
+Measured 2026-09-18 with the CUDA kernels added in `torch_ans/tans_cuda.cu` (see
+`CHANGELOG.md`): the three tANS families now code device tensors through the same
+operator names and the same stream layout, single-lane (one thread per stream row),
+byte-compatible with the CPU kernels. This section is the device counterpart of the
+tANS sweep above; it answers three questions: how tANS compares to rANS on the GPU,
+what the shared-memory table staging buys, and which launch block size to default to.
+
+### Environment and method
+
+| item | value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2080 Ti (sm_75), driver 580.178.04 |
+| torch | 2.7.1+cu118 (`cbench_pth27` environment; nvcc 11.8 + gcc-10, the only local toolkit that matches a torch build) |
+| workload | 1,048,576 symbols, 1024 streams × 1024 symbols, `bypass_coding=True`, symbols drawn from the distributions |
+| method | high-level API (`TorchANSInterface`), encode + decode, best of 10 reps (20 for the A/B), `torch.cuda.synchronize()` around every timed call, every configuration round-trip checked before it is timed |
+| tANS kernels | `TORCH_ANS_TANS_SMEM_BUDGET` (staging budget, default 16 KiB/block), `TORCH_ANS_TANS_BLOCK_THREADS` (launch block size, unset = derived from the batch) |
+
+`scripts/bench_tans_vs_rans.py --device cuda` runs the same matrix as the CPU sweep.
+tANS is single-lane on CUDA, so `--interleaves` only adds rANS configurations (the
+`rans32_16` warp path, which is the fastest rANS configuration on the device); the
+other combinations are reported as skipped instead of being measured wrong.
+
+### tANS vs rANS, 256 distributions (tables in global memory)
+
+The tables here are 420 KB (`fp=7`) to 3 MB (`fp=15`) per configuration, i.e. far
+beyond any staging budget: `smem=no` on every row of
+`benchmarks/tans_vs_rans_cuda.json`. Throughput in Msymbol/s; `bits/sym` is the coded
+size over the 2^20 symbols (all rows are labelled `-` in the `blk` column, i.e. they use
+the derived block size).
+
+| alphabet | fp | tANS enc/dec | tANS bits/sym | rANS x1 enc/dec | rANS x1 bits/sym | fastest rANS | its enc/dec | its bits/sym | dec vs x1 | dec vs fastest |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 7 | 488 / 788 | 3.873 | 557 / 733 | 3.806 | `rans32_16` x32 | 705 / 1286 | 4.543 | 1.07× | 0.61× |
+| 16 | 10 | 537 / 887 | 3.836 | 545 / 733 | 3.774 | `rans32_16` x32 | 695 / 1280 | 4.525 | 1.21× | 0.69× |
+| 16 | 12 | 503 / 727 | 3.834 | 540 / 735 | 3.772 | `rans32_16` x32 | 679 / 1280 | 4.524 | 0.99× | 0.57× |
+| 16 | 15 | 463 / 632 | 3.834 | 524 / 733 | 3.776 | `rans32_16` x32 | 676 / 1262 | 4.525 | 0.86× | 0.50× |
+| 64 | 7 | 505 / 820 | 5.994 | 501 / 589 | 5.918 | `rans32_16` x32 | 677 / 1103 | 6.589 | 1.39× | 0.74× |
+| 64 | 10 | 505 / 820 | 5.851 | 482 / 597 | 5.787 | `rans32_16` x32 | 644 / 1112 | 6.533 | 1.37× | 0.74× |
+| 64 | 12 | 464 / 683 | 5.843 | 474 / 594 | 5.780 | `rans32_16` x32 | 593 / 1104 | 6.529 | 1.15× | 0.62× |
+| 64 | 15 | 444 / 600 | 5.842 | 475 / 598 | 5.784 | `rans32_16` x32 | 618 / 1114 | 6.531 | 1.00× | 0.54× |
+| 256 | 10 | 447 / 692 | 7.900 | 454 / 449 | 7.831 | `rans32_16` x32 | 569 / 820 | 8.551 | 1.54× | 0.84× |
+| 256 | 12 | 428 / 589 | 7.848 | 435 / 451 | 7.784 | `rans32_16` x32 | 573 / 829 | 8.531 | 1.31× | 0.71× |
+| 256 | 15 | 404 / 529 | 7.841 | 443 / 450 | 7.783 | `rans32_16` x32 | 575 / 875 | 8.531 | 1.18× | 0.60× |
+
+- **Against single-lane rANS at the same `freq_precision`** (the like-for-like comparison
+  - same quantization, same alphabet, only the coder differs) tANS decodes **1.0-1.5×
+  faster from `alphabet 64` up** (1.39× at `fp=7`, 1.54× at alphabet 256 / `fp=10`) and
+  is within ±5% of it on encode (0.85-1.05×) except at `alphabet 16 / fp=15`. At
+  `alphabet 16` the table is small enough that rANS' cheaper per-symbol work wins on
+  decode once the precision makes the search cheap.
+- **Against the fastest rANS configuration on the device** (`rans32_16` with the 32-way
+  warp path) tANS is behind in both directions (0.50-0.84× decode, 0.68-0.78× encode at
+  the same precision). That path is what to use when throughput matters more than the
+  coded size.
+- **The warp path's speed costs ~0.6-0.8 bit/symbol on these rows** (4.543 vs 3.873
+  bits/sym at `alphabet=16, fp=7`; 8.531 vs 7.841 at `alphabet=256, fp=15`): every one of
+  its 32 lanes flushes its own 4-byte state per stream, i.e. 128 B per 1024-symbol row.
+  Longer rows amortize it, 1024 symbols do not.
+- tANS's own coded size matches single-lane rANS (within 0.06-0.07 bits/symbol, the
+  table's quantization at these `freq_precision`s) - so at `alphabet >= 64` it is faster
+  *and* as compact as single-lane rANS.
+
+### Table staging A/B and launch block size
+
+`benchmarks/tans_cuda_staging_off.json` and `benchmarks/tans_cuda_staging_on.json`: the
+same configuration (8 distributions, `fp=7`, alphabet 16, `parallel_states=1024`), i.e. a
+13.1 KB table that fits the 16 KiB budget, measured with the staging disabled
+(`--smem-budget 0`, global memory, `smem=no`) and enabled (`--smem-budget 16384`,
+`smem=yes`), each at three block sizes. Msymbol/s, `tans32`:
+
+| block threads | blocks | global enc | global dec | staged enc | staged dec |
+|---|---|---|---|---|---|
+| 1 | 1024 | 544 | 905 | 252 | 356 |
+| 8 | 128 | 588 | 972 | 595 | 964 |
+| 64 | 16 | 592 | 870 | 567 | 869 |
+
+`tans16`/`tans8` behave the same way (see the JSONs; e.g. `tans8` at 8 threads: 611/1020
+global against 589/956 staged).
+
+- **The staging copy is paid per block**, which is what the first row shows: with one
+  thread per block the 13.1 KB table is copied 1024 times (13 MB of loads) next to ~1 MB
+  of payload, and encode drops to 0.46×. With 8-64 threads per block the copy disappears
+  into the noise and the two paths agree within run-to-run variation (588 vs 595 encode,
+  972 vs 964 decode at 8 threads).
+- **A table smaller than the work per row does gain from staging**: at 4 distributions
+  (6.7 KB) with 64 streams × 16K symbols the staged path measured +3-5% on both directions
+  at 2-8 threads per block and +23% encode at one thread (same script,
+  `--dists 4 --parallel-states 64`; not committed as a JSON because it is the same
+  script with two different `--dists` values).
+- **A table comparable to the payload loses**: at 24 distributions (39.4 KB, still staged
+  under `--smem-budget 49152`) the staged path was 6-20% slower than the global one at
+  every block size (8/32/64), because the per-block copy competes with the coding itself.
+- **Block size**: the optimum tracks "about 128 blocks", i.e. a couple per SM on this
+  device - small batches want one or two threads per block, large ones want wide blocks.
+  A fixed 64-thread default (the first version) put 1024 rows into 16 blocks, i.e. on a
+  quarter of the SMs, and lost ~18% decode against 8 threads per block (measured sweep in
+  the `tans_num_threads_per_block` comment in `tans_cuda.cu`: 256 rows → best 1-8 threads,
+  1024 rows → best 2-8, 4096 rows → best 32-64). The kernel now derives the block size as
+  `ceil(batch / 128)` clamped to `[1, 128]`, which reproduces those optima.
+- Consequence for the default: the staging stays **enabled** (16 KiB budget), because in
+  its regime (a small table, few distributions, a modest block count) it is a wash or a few
+  percent up and never a large loss, and because it costs nothing when it is not triggered -
+  which is the common case, as the 256-distribution table above shows.
+
+### Low distribution counts: the regime the staging can reach
+
+The 256-distribution tables above are 420 KB - 3 MB, so they can never be staged. This
+subsection repeats the comparison where the whole table *does* fit the budget - 8 and 4
+distributions - with the rANS families present as the baseline, so the staging question
+("does `__shared__` pay?") and the coder question ("is tANS faster?") are answered on the
+same rows. Raw results: `benchmarks/tans_vs_rans_cuda_dists8_smem_{on,off}.json`,
+`benchmarks/tans_vs_rans_cuda_dists4_smem_{on,off}.json` and the long-row pair
+`benchmarks/tans_vs_rans_cuda_longrows_smem_{on,off}.json`; all of them 1M symbols,
+`reps=20`, table sizes as listed (staging needs the *whole* table inside the budget, so
+`--smem-budget` is set high enough to reach the listed cases).
+
+**8 distributions, 1024 rows × 1024 symbols, `--smem-budget 32768` vs `0`** (Msymbol/s;
+"staging on/off" is the staged run over the global run, so 1.000 means the two agree - the
+rows that are `staged=no` in *both* runs are the noise floor of that ratio):
+
+| alphabet | fp | table KB | staged | tANS enc/dec | rANS x1 enc/dec | fastest rANS (`rans32_16` x32) | dec vs x1 | dec vs fastest | staging on/off enc | staging on/off dec |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 7 | 13.1 | yes | 543 / 856 | 559 / 743 | 719 / 1261 | 1.15× | 0.68× | 0.967 | 0.922 |
+| 16 | 10 | 97.1 | no | 570 / 908 | 541 / 741 | 675 / 1266 | 1.22× | 0.72× | 1.007 | 0.989 |
+| 16 | 12 | 385.1 | no | 546 / 902 | 521 / 739 | 655 / 1263 | 1.22× | 0.71× | 1.004 | 0.992 |
+| 64 | 7 | 16.1 | yes | 503 / 833 | 479 / 631 | 629 / 1115 | 1.32× | 0.75× | 0.971 | 0.917 |
+| 64 | 10 | 100.1 | no | 516 / 818 | 477 / 640 | 577 / 1102 | 1.28× | 0.74× | 0.977 | 0.978 |
+| 64 | 12 | 388.1 | no | 501 / 827 | 488 / 646 | 595 / 1097 | 1.28× | 0.75× | 0.958 | 0.992 |
+
+**4 distributions, 1024 rows × 1024 symbols, `--smem-budget 49152` vs `0`** (same shape,
+reaching tables up to the 48 KiB per-block limit):
+
+| alphabet | fp | table KB | staged | tANS enc/dec | rANS x1 enc/dec | fastest rANS (`rans32_16` x32) | dec vs x1 | dec vs fastest | staging on/off enc | staging on/off dec |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 7 | 6.3 | yes | 591 / 992 | 587 / 818 | 782 / 1500 | 1.21× | 0.66× | 0.997 | 0.983 |
+| 8 | 8 | 12.3 | yes | 607 / 1072 | 575 / 825 | 762 / 1489 | 1.30× | 0.72× | 0.956 | 0.961 |
+| 8 | 9 | 24.3 | yes | 588 / 991 | 576 / 827 | 738 / 1486 | 1.20× | 0.67× | 0.936 | 0.901 |
+| 8 | 10 | 48.3 | no | 613 / 1082 | 562 / 823 | 713 / 1480 | 1.31× | 0.73× | 0.998 | 1.024 |
+| 16 | 7 | 6.6 | yes | 584 / 1011 | 547 / 758 | 689 / 1304 | 1.33× | 0.78× | 0.984 | 0.982 |
+| 16 | 8 | 12.6 | yes | 566 / 969 | 539 / 760 | 691 / 1306 | 1.28× | 0.74× | 0.972 | 0.955 |
+| 16 | 9 | 24.6 | yes | 537 / 906 | 537 / 765 | 691 / 1316 | 1.18× | 0.69× | 0.915 | 0.904 |
+| 16 | 10 | 48.6 | no | 589 / 982 | 532 / 766 | 669 / 1307 | 1.28× | 0.75× | 1.027 | 1.026 |
+
+**4 distributions, 64 rows × 16384 symbols, `--smem-budget 16384` vs `0`** (few blocks,
+long streams - the regime where a per-block copy is amortized):
+
+| alphabet | fp | table KB | staged | tANS enc/dec | rANS x1 enc/dec | dec vs x1 | staging on/off enc | staging on/off dec |
+|---|---|---|---|---|---|---|---|---|
+| 8 | 7 | 6.3 | yes | 176 / 295 | 136 / 131 | 2.26× | 1.046 | 1.031 |
+| 16 | 7 | 6.6 | yes | 173 / 284 | 136 / 122 | 2.32× | 1.054 | 1.036 |
+
+Findings:
+
+- **tANS keeps its advantage in the small-table regime.** Against single-lane rANS at the
+  same `freq_precision` it decodes **1.15-1.33×** faster at 1024-symbol rows and **2.3×**
+  faster with long rows (fewer, longer streams make the per-symbol cost dominate), while
+  encoding is at parity (0.97-1.06×) and its coded size stays within 0.02-0.04 bit/symbol
+  of rANS. The rANS 32-way warp path is still the fastest configuration in both directions
+  (tANS reaches 0.66-0.78× of it) and costs ~0.6-0.8 bit/symbol more at these row lengths.
+- **With many blocks (1024-symbol rows) the staging is neutral to slightly negative.** The
+  staged rows are 0.92-0.97 of the global ones, i.e. inside or barely outside the band the
+  two *non-staged* rows span (0.96-1.03). The cost is structural: the copy is per block
+  (~128 blocks × 13-16 KB ≈ 1.7-2 MB of extra loads for ~1 MB of payload) and 6-24 KB of
+  shared memory per block lowers occupancy, while L1 already serves a table that size. The
+  deeper the staged table, the worse it gets (0.94/0.90 at 24 KB).
+- **With few blocks and long streams the staging does pay**: 64 streams × 16K symbols
+  staging a 6.6 KB table measured **+4.6-5.4% encode and +3.1-3.6% decode** — there the
+  copy is amortized over 16K symbols per row and each block reuses the table a lot.
+- The feature therefore stays enabled (16 KiB budget) for exactly the configurations its
+  size arithmetic admits — a table small enough to fit is a wash or a few percent up — and
+  the 256-distribution sweeps never trigger it at all. `--smem-budget 0` turns it off when
+  a measurement or a workload prefers the global path.
+
+### Reproduce
+
+```bash
+# the comparison table (256 distributions, table in global memory)
+PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+    --symbols 1048576 --parallel-states 1024 --dists 256 \
+    --alphabet 16 64 256 --precision 7 10 12 15 \
+    --interleaves 1 2 4 8 32 --reps 10 \
+    --json benchmarks/tans_vs_rans_cuda.json
+
+# the staging A/B (13.1 KB table, three block sizes each)
+PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+    --symbols 1048576 --parallel-states 1024 --dists 8 \
+    --alphabet 16 --precision 7 --impl tans32 tans16 tans8 --interleaves 1 \
+    --reps 20 --block-threads 1 8 64 --smem-budget 0 \
+    --json benchmarks/tans_cuda_staging_off.json
+PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+    --symbols 1048576 --parallel-states 1024 --dists 8 \
+    --alphabet 16 --precision 7 --impl tans32 tans16 tans8 --interleaves 1 \
+    --reps 20 --block-threads 1 8 64 --smem-budget 16384 \
+    --json benchmarks/tans_cuda_staging_on.json
+
+# the low-distribution sweep, tANS *and* rANS, staging on/off (tables 6-48 KB)
+for budget in 0 32768; do
+  PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+      --symbols 1048576 --parallel-states 1024 --dists 8 \
+      --alphabet 16 64 --precision 7 10 12 --interleaves 1 2 4 8 32 \
+      --impl tans32 tans16 tans8 rans64 rans32 rans32_16 --reps 20 \
+      --smem-budget $budget \
+      --json benchmarks/tans_vs_rans_cuda_dists8_smem_$([ $budget = 0 ] && echo off || echo on).json
+done
+for budget in 0 49152; do
+  PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+      --symbols 1048576 --parallel-states 1024 --dists 4 \
+      --alphabet 8 16 --precision 7 8 9 10 --interleaves 1 2 4 8 32 \
+      --impl tans32 tans16 tans8 rans64 rans32 rans32_16 --reps 20 \
+      --smem-budget $budget \
+      --json benchmarks/tans_vs_rans_cuda_dists4_smem_$([ $budget = 0 ] && echo off || echo on).json
+done
+for budget in 0 16384; do
+  PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+      --symbols 1048576 --parallel-states 64 --dists 4 \
+      --alphabet 8 16 --precision 7 --interleaves 1 \
+      --impl tans32 tans16 tans8 rans32_16 --reps 20 \
+      --smem-budget $budget \
+      --json benchmarks/tans_vs_rans_cuda_longrows_smem_$([ $budget = 0 ] && echo off || echo on).json
+done
+```
+
+(`PYTHONPATH=$PWD` is what makes the script measure this working tree rather than an
+installed `torch_ans` - see the script's docstring.)
+

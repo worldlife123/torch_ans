@@ -60,8 +60,9 @@ OP_SUFFIX = {1: "", 2: "_i2", 4: "_i4", 8: "_i8", 32: "_i32"}
 #: interleave factors supported per family, and those with alias / inverse-CDF
 #: variants (32-way interleaving is rans32_16-only and has no alias binding).
 #:
-#: tANS is CPU-only, so it has no 32-way variant either (that one is the CUDA
-#: warp path); 1/2/4/8 give it one state per lane on top of the bit buffer the
+#: tANS has no 32-way variant either (that one is the CUDA warp path, and the
+#: interleaved tANS kernels do not exist on the device yet - CUDA tANS is
+#: single-lane); 1/2/4/8 give it one state per lane on top of the bit buffer the
 #: lanes share, exactly like the rANS families. It has neither lookup variant -
 #: the tANS table *is* the lookup - so both tuples are empty.
 SUPPORTED_INTERLEAVES = {

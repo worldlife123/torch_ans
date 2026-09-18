@@ -24,7 +24,7 @@
 //   TORCH_ANS_WITH_INVCDF
 //       inverse-CDF table pop (`inverse_cdf_precision`)
 //   TORCH_ANS_WITH_TANS32 / _TANS16 / _TANS8
-//       tANS families (CPU only; interleave 1 always, 2/4/8 behind the shared
+//       tANS families (interleave 1 always, 2/4/8 behind the shared
 //       TORCH_ANS_WITH_INTERLEAVE_* gates, no 32-way - that one is the CUDA warp
 //       path). The three differ only in the state/stream width, which is also
 //       their freq_precision cap:
@@ -32,7 +32,9 @@
 //       tans8 <uint8, uint8> <= 7. The table builder (tans_build_tables) is
 //       *not* gated: all three share the same int32 tables - see
 //       torch_ans/tans_utils.hpp - so it is part of the common operator set and
-//       is compiled by every build.
+//       is compiled by every build. The gate covers the CPU *and* the CUDA
+//       kernels: single-lane tANS codes CUDA tensors too (tans_cuda.cu), while
+//       the interleaved variants are CPU-only for now.
 //
 // The gate names and the (family, interleave, lookup) combinations they cover
 // are mirrored by the profile helpers in torch_ans/_dynamic_build.py; a gate
@@ -171,5 +173,20 @@
 
 #define TORCH_ANS_INST_TANS_POP(STATE, STREAM, ILV) \
   template ta::Tensor tans_pop_indexed_cpu<STATE, STREAM, ILV>( \
+      ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
+      const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t)
+
+// tANS on CUDA: the same signatures as the CPU ones above (the *launchers* in
+// tans_cuda.cu), instantiated only for the single lane - interleaved tANS is
+// CPU-only for now and `tans_push` / `tans_pop` reject it before reaching a
+// launcher, so no ILV > 1 specialisation is ever referenced.
+#define TORCH_ANS_INST_TANS_PUSH_CUDA(STATE, STREAM, ILV) \
+  template void tans_push_indexed_cuda<STATE, STREAM, ILV>( \
+      ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
+      const ta::Tensor&, const ta::Tensor&, const ta::Tensor&, \
+      int64_t, bool, int64_t)
+
+#define TORCH_ANS_INST_TANS_POP_CUDA(STATE, STREAM, ILV) \
+  template ta::Tensor tans_pop_indexed_cuda<STATE, STREAM, ILV>( \
       ta::Tensor, const ta::Tensor&, const ta::Tensor&, \
       const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t)

@@ -32,13 +32,22 @@
 #include <string>
 #include <vector>
 
-// Marked like rans_utils.hpp's RANS_API: `static` on the host, `__device__`
-// under RANS_CUDA_API, so a future CUDA port reuses this header unchanged.
+// Every helper below is marked with TANS_INLINE: `inline` on the host, the CUDA
+// qualifiers under RANS_CUDA_API, so a CUDA translation unit reuses this header
+// unchanged (the same convention as rans_utils.hpp's RANS_API/RANS_INLINE).
+//
+// One difference from rans_utils.hpp: the qualifier is
+// `__host__ __device__` rather than `__device__`. rans_cuda.cu only sees the
+// kernel core, but tans_cuda.cu includes this header for its kernels *and*
+// compiles `tans_build_tables_row` (the host-only table builder at the bottom) as
+// host code - and that builder calls the small arithmetic helpers below, which
+// with `__device__` would be "calling a __device__ function from a __host__
+// function is not allowed". Every helper here is pure arithmetic or pointer
+// arithmetic, so it is valid on both sides; the host instantiation only exists
+// where a host caller exists (everything else is inlined into the kernels).
 #ifdef RANS_CUDA_API
-#define TANS_API __device__
-#define TANS_INLINE __device__ __forceinline__
+#define TANS_INLINE __host__ __device__ __forceinline__
 #else
-#define TANS_API static
 #define TANS_INLINE inline
 #endif
 
@@ -83,14 +92,14 @@
 #define TANS_NBITS_MASK 0x0000FFFFu  // bits >= 16 are nbBits
 #define TANS_NEW_STATE_MASK 0x0000FFFFu
 
-TANS_API TANS_INLINE int64_t tans_next_state_offset() { return 0; }
-TANS_API TANS_INLINE int64_t tans_decode_offset(int64_t ts) { return ts; }
-TANS_API TANS_INLINE int64_t tans_symbol_offset(int64_t ts) { return 2 * ts; }
-TANS_API TANS_INLINE int64_t tans_symbol_tt_offset(int64_t ts) { return 3 * ts; }
+TANS_INLINE int64_t tans_next_state_offset() { return 0; }
+TANS_INLINE int64_t tans_decode_offset(int64_t ts) { return ts; }
+TANS_INLINE int64_t tans_symbol_offset(int64_t ts) { return 2 * ts; }
+TANS_INLINE int64_t tans_symbol_tt_offset(int64_t ts) { return 3 * ts; }
 
 // Row width of the table tensor for a distribution whose symbolTT must hold
 // `max_symbols` symbols (the widest cdf row of the batch).
-TANS_API TANS_INLINE int64_t tans_table_row_words(int64_t ts, int64_t max_symbols) {
+TANS_INLINE int64_t tans_table_row_words(int64_t ts, int64_t max_symbols) {
   return 3 * ts + 2 * max_symbols;
 }
 
@@ -122,11 +131,11 @@ TANS_API TANS_INLINE int64_t tans_table_row_words(int64_t ts, int64_t max_symbol
 // what the single-lane header used to be spelled as (state/bitbuf/nbits at
 // words 1/2/3, three header words, 12 header bytes) - that is what keeps the
 // serialized byte string of a 1-lane stream unchanged.
-TANS_API TANS_INLINE int64_t tans_state_slot(int64_t lane) { return 1 + lane; }
-TANS_API TANS_INLINE int64_t tans_bitbuf_slot(int64_t num_interleaves) { return 1 + num_interleaves; }
-TANS_API TANS_INLINE int64_t tans_nbits_slot(int64_t num_interleaves) { return 2 + num_interleaves; }
-TANS_API TANS_INLINE int64_t tans_header_words(int64_t num_interleaves) { return num_interleaves + 2; }
-TANS_API TANS_INLINE int64_t tans_header_bytes(int64_t num_interleaves) {
+TANS_INLINE int64_t tans_state_slot(int64_t lane) { return 1 + lane; }
+TANS_INLINE int64_t tans_bitbuf_slot(int64_t num_interleaves) { return 1 + num_interleaves; }
+TANS_INLINE int64_t tans_nbits_slot(int64_t num_interleaves) { return 2 + num_interleaves; }
+TANS_INLINE int64_t tans_header_words(int64_t num_interleaves) { return num_interleaves + 2; }
+TANS_INLINE int64_t tans_header_bytes(int64_t num_interleaves) {
   return 4 * tans_header_words(num_interleaves);
 }
 // The length word counts bytes and the payload cursor is derived from it as
@@ -141,7 +150,7 @@ TANS_API TANS_INLINE int64_t tans_header_bytes(int64_t num_interleaves) {
 // highbit(0) == 0, which makes the `norm == 1` case fall out of the general
 // symbolTT formula (maxBitsOut = table_log - 0 = table_log, minStatePlus =
 // 1 << table_log) exactly as FSE's explicit `case 1:` does.
-TANS_API TANS_INLINE uint32_t tans_highbit32(uint32_t value) {
+TANS_INLINE uint32_t tans_highbit32(uint32_t value) {
   uint32_t bit = 0;
   while (value >>= 1) ++bit;
   return bit;
@@ -149,7 +158,7 @@ TANS_API TANS_INLINE uint32_t tans_highbit32(uint32_t value) {
 
 // FSE_TABLESTEP: the stride of the symbol spread. Coprime with a power of two
 // table size, so the spread visits every slot.
-TANS_API TANS_INLINE uint32_t tans_table_step(uint32_t table_size) {
+TANS_INLINE uint32_t tans_table_step(uint32_t table_size) {
   return (table_size >> 1) + (table_size >> 3) + 3;
 }
 
@@ -237,7 +246,7 @@ struct TansBitReader
 // the decoder sees the sentinel first (last written, first read), then the
 // carries, then the remainder, then the digits - each mirrored, which is why
 // the loops below run in the opposite order to the decoder's.
-TANS_API TANS_INLINE uint32_t tans_max_bypass_digits(uint32_t bypass_precision) {
+TANS_INLINE uint32_t tans_max_bypass_digits(uint32_t bypass_precision) {
   // ceil(32 / bypass_precision): how many digits a 32-bit raw value can need,
   // i.e. the largest n_bypass the encoder can produce. The decoder clamps to it
   // so that a corrupted stream cannot push a shift out of range.
@@ -297,6 +306,69 @@ TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
 }
 
 // ---------------------------------------------------------------------------
+// one symbol, before it reaches the table / after it left it
+// ---------------------------------------------------------------------------
+// The offset subtraction and the bypass (or clamp) decision. It lives here
+// rather than in tans_cpu.cpp because the CUDA kernel needs exactly the same
+// arithmetic: two copies would drift, and a drift shows up as a decoder
+// mismatch rather than a compile error.
+//
+// `value_out` is the symbol that gets coded (the sentinel when the symbol is
+// out of range), `raw_val_out` the zig-zag encoded distance the bypass digits
+// carry, and `bypassed_out` whether those digits have to be written at all.
+// With bypass *off*, an out-of-range symbol is clamped into [0, max_value]
+// rather than indexing the symbolTT row out of bounds (max_value itself is a
+// legal symbol then - it is the last cdf entry - so only values above it are
+// clamped).
+template <typename scalar_t>
+TANS_INLINE void tans_cook_symbol(scalar_t symbol, scalar_t cdf_size, scalar_t offset,
+                                  bool do_bypass, uint32_t* value_out, uint32_t* raw_val_out,
+                                  bool* bypassed_out) {
+  const scalar_t max_value = cdf_size - 2;
+  scalar_t value = symbol - offset;
+  uint32_t raw_val = 0;
+  bool bypassed = false;
+  if (do_bypass) {
+    // Same zig-zag as the rANS bypass (rans_utils.hpp):
+    //   raw = -2 * value - 1     for value < 0
+    //   raw =  2 * (value - max) for value >= max
+    // The distance from the coded range must stay below 2^(bits(symbol) - 2),
+    // i.e. ~2^30 for int32 - beyond that the multiply overflows and the symbol
+    // is silently mis-coded.
+    //
+    // The `value < 0` tests are written as `(int64_t)value < 0` only to keep
+    // nvcc quiet: an unsigned symbol dtype (uint8 is part of the dispatch set)
+    // cannot be negative, so the negative half of the zig-zag is unreachable
+    // for it, and for every dtype the library dispatches on (int8/uint8/int16/
+    // int32/int64) the cast does not change the comparison's result - gcc does
+    // not warn about it, nvcc does.
+    if ((int64_t)value < 0) {
+      raw_val = (uint32_t)(-2 * (int64_t)value - 1);
+      value = max_value;
+      bypassed = true;
+    } else if (value >= max_value) {
+      raw_val = (uint32_t)(2 * ((int64_t)value - max_value));
+      value = max_value;
+      bypassed = true;
+    }
+  } else {
+    if ((int64_t)value < 0) value = 0;
+    else if (value > max_value) value = max_value;
+  }
+  *value_out = (uint32_t)value;
+  *raw_val_out = raw_val;
+  *bypassed_out = bypassed;
+}
+
+// Decoder's mirror of the zig-zag above: the sentinel symbol plus the raw value
+// back to the coded symbol. `max_value` is the sentinel's own value
+// (cdf_size - 2), which is what the "above the range" half adds back.
+TANS_INLINE int64_t tans_uncook_raw_value(uint32_t raw_val, int64_t max_value) {
+  const int64_t value = (int64_t)(raw_val >> 1);
+  return (raw_val & 1u) ? (-value - 1) : (value + max_value);
+}
+
+// ---------------------------------------------------------------------------
 // the two symbol steps
 // ---------------------------------------------------------------------------
 // Encoder: emit the state bits of `symbol` and advance the state. `row` is the
@@ -308,23 +380,23 @@ TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
 // interleaved kernel can issue them per lane instead of per symbol (the loads
 // of `nextState` in particular, which is the dependent load interleaving
 // overlaps) without carrying a second copy of the arithmetic.
-TANS_API TANS_INLINE const int32_t* tans_symbol_tt_row(const int32_t* row, uint32_t ts,
+TANS_INLINE const int32_t* tans_symbol_tt_row(const int32_t* row, uint32_t ts,
                                                        uint32_t symbol) {
   return row + tans_symbol_tt_offset(ts) + 2 * (int64_t)symbol;
 }
 
 // nbBits = maxBitsOut - [state < minStatePlus], computed in the reference's
 // way: the sum is non-negative by construction (see TANS_MAX_TABLELOG).
-TANS_API TANS_INLINE uint32_t tans_encode_nb_bits(uint32_t state, const int32_t* symbol_tt) {
+TANS_INLINE uint32_t tans_encode_nb_bits(uint32_t state, const int32_t* symbol_tt) {
   return (uint32_t)(((int64_t)state + (int64_t)symbol_tt[0]) >> 16);
 }
 
-TANS_API TANS_INLINE int64_t tans_encode_next_index(uint32_t state, const int32_t* symbol_tt,
+TANS_INLINE int64_t tans_encode_next_index(uint32_t state, const int32_t* symbol_tt,
                                                     uint32_t nb_bits) {
   return (int64_t)(state >> nb_bits) + (int64_t)symbol_tt[1];
 }
 
-TANS_API TANS_INLINE uint32_t tans_encode_next_state(const int32_t* row, int64_t next_index) {
+TANS_INLINE uint32_t tans_encode_next_state(const int32_t* row, int64_t next_index) {
   return (uint32_t)row[tans_next_state_offset() + next_index];
 }
 
@@ -343,17 +415,17 @@ TANS_INLINE uint32_t tans_encode_symbol(uint32_t state, const int32_t* row,
 // loads (both planes, indexed by the lane's state) are what the interleaved
 // kernel issues for every lane at once, and only `take()` has to walk the lanes
 // in order.
-TANS_API TANS_INLINE uint32_t tans_decode_word(const int32_t* row, uint32_t ts, uint32_t state) {
+TANS_INLINE uint32_t tans_decode_word(const int32_t* row, uint32_t ts, uint32_t state) {
   return (uint32_t)row[tans_decode_offset(ts) + (int64_t)state];
 }
-TANS_API TANS_INLINE uint32_t tans_decode_symbol_of(const int32_t* row, uint32_t ts,
+TANS_INLINE uint32_t tans_decode_symbol_of(const int32_t* row, uint32_t ts,
                                                     uint32_t state) {
   return (uint32_t)row[tans_symbol_offset(ts) + (int64_t)state];
 }
-TANS_API TANS_INLINE uint32_t tans_decode_nb_bits(uint32_t word) {
+TANS_INLINE uint32_t tans_decode_nb_bits(uint32_t word) {
   return (word >> TANS_NBITS_SHIFT) & 0x1Fu;
 }
-TANS_API TANS_INLINE uint32_t tans_decode_new_state(uint32_t word, uint32_t low_bits) {
+TANS_INLINE uint32_t tans_decode_new_state(uint32_t word, uint32_t low_bits) {
   return (word & TANS_NEW_STATE_MASK) + low_bits;
 }
 

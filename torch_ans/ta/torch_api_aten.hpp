@@ -76,7 +76,15 @@ using DeviceType = at::DeviceType;
 // overwriting it would be a redefinition warning and would silently change the
 // exception type.
 #ifndef STD_TORCH_CHECK
-#define STD_TORCH_CHECK(cond, ...) TORCH_CHECK(cond, __VA_ARGS__)
+// NOTE: every argument is forwarded verbatim (`TORCH_CHECK(__VA_ARGS__)`)
+// instead of naming the condition and appending `__VA_ARGS__`: the usual call is
+// the single-argument `STD_TORCH_CHECK(cond)`, and `TORCH_CHECK(cond, )` with
+// that trailing empty argument only compiles on the newer torch releases (on
+// torch 2.7 the message-building macro cannot take an empty `__VA_ARGS__` and
+// fails with "expected primary-expression before ')' token"). Forwarding is
+// equivalent for the multi-argument form and makes the macro version
+// independent.
+#define STD_TORCH_CHECK(...) TORCH_CHECK(__VA_ARGS__)
 #endif
 
 // ---------------------------------------------------------------------------

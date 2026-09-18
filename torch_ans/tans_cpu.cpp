@@ -153,49 +153,6 @@ ta::Tensor tans_init_stream(int64_t size, int64_t num_interleaves, int64_t preal
 }
 
 // ---------------------------------------------------------------------------
-// one symbol, before it reaches the table
-// ---------------------------------------------------------------------------
-// The offset subtraction and the bypass (or clamp) decision, shared by the
-// single-lane head/tail loops and the batched group loops below so that the two
-// cannot drift.
-template <typename scalar_t>
-inline void tans_cook_symbol(scalar_t symbol, scalar_t cdf_size, scalar_t offset,
-                             bool do_bypass, uint32_t* value_out, uint32_t* raw_val_out,
-                             bool* bypassed_out) {
-  const scalar_t max_value = cdf_size - 2;
-  scalar_t value = symbol - offset;
-  uint32_t raw_val = 0;
-  bool bypassed = false;
-  if (do_bypass) {
-    // Same zig-zag as the rANS bypass (rans_utils.hpp):
-    //   raw = -2 * value - 1     for value < 0
-    //   raw =  2 * (value - max) for value >= max
-    // The distance from the coded range must stay below 2^(bits(symbol) - 2),
-    // i.e. ~2^30 for int32 - beyond that the multiply overflows and the symbol
-    // is silently mis-coded.
-    if (value < 0) {
-      raw_val = (uint32_t)(-2 * (int64_t)value - 1);
-      value = max_value;
-      bypassed = true;
-    } else if (value >= max_value) {
-      raw_val = (uint32_t)(2 * ((int64_t)value - max_value));
-      value = max_value;
-      bypassed = true;
-    }
-  } else {
-    // No bypass coding: an out-of-range symbol has no representation. Clamp it
-    // into [0, max_value] rather than indexing the symbolTT row out of bounds
-    // (with bypass *off* max_value is a legal symbol - it is the last cdf entry
-    // - so only values above it are clamped).
-    if (value < 0) value = 0;
-    else if (value > max_value) value = max_value;
-  }
-  *value_out = (uint32_t)value;
-  *raw_val_out = raw_val;
-  *bypassed_out = bypassed;
-}
-
-// ---------------------------------------------------------------------------
 // push
 // ---------------------------------------------------------------------------
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES>
@@ -490,12 +447,7 @@ ta::Tensor tans_pop_indexed_cpu(ta::Tensor stream, const ta::Tensor& indexes,
             scalar_t value = (scalar_t)out_syms[j];
             if (do_bypass && out_syms[j] == (uint32_t)max_values[j]) {
               const uint32_t raw_val = tans_pop_raw_value<TANS_STREAM_TYPE>(&reader, bpp);
-              value = (scalar_t)(raw_val >> 1);
-              if (raw_val & 1u) {
-                value = -value - 1;
-              } else {
-                value = value + max_values[j];
-              }
+              value = (scalar_t)tans_uncook_raw_value(raw_val, (int64_t)max_values[j]);
             }
             values[j] = value;
           });
@@ -543,12 +495,7 @@ ta::Tensor tans_pop_indexed_cpu(ta::Tensor stream, const ta::Tensor& indexes,
             if (symbol == (uint32_t)max_value) {
               const uint32_t raw_val =
                   tans_pop_raw_value<TANS_STREAM_TYPE>(&reader, bpp);
-              value = (scalar_t)(raw_val >> 1);
-              if (raw_val & 1u) {
-                value = -value - 1;
-              } else {
-                value = value + max_value;
-              }
+              value = (scalar_t)tans_uncook_raw_value(raw_val, (int64_t)max_value);
             }
           }
 

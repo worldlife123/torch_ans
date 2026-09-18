@@ -258,13 +258,13 @@ def get_stable_abi_extension_config():
                 # rans.cpp (the host-only alias table builder) rides along so that
                 # the CPU-registration function - which is only *defined* here -
                 # can never leave an unresolved symbol behind.
-                # tans_cpu.cpp rides along for the same reason as rans_cpu.cpp:
-                # the tANS family is CPU-only, and its operators are registered
-                # for the CUDA dispatch key too so that a device tensor gets the
-                # wrapper's explanation instead of "not implemented for CUDA".
+                # tans_cpu.cpp and tans_cuda.cu ride along for the same reason:
+                # tans_push / tans_pop are one wrapper each that routes on the
+                # tensor device (tans.hpp), and the two dispatch keys register the
+                # very same wrappers.
                 sources=[os.path.join(package_dir, name)
-                         for name in ("rans_cuda.cu", "rans_cpu.cpp", "tans_cpu.cpp",
-                                      "rans.cpp", "lib_cuda.cpp")],
+                         for name in ("rans_cuda.cu", "tans_cuda.cu", "rans_cpu.cpp",
+                                      "tans_cpu.cpp", "rans.cpp", "lib_cuda.cpp")],
                 include_dirs=[package_dir],
                 extra_compile_args={
                     "cxx": ["-O3"] + cuda_defines,

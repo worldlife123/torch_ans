@@ -143,11 +143,11 @@ Use alias coding for fast decoding when memory usage during encoding is not a co
 reference in `3rdparty/ans/tans.cpp`/`tans.hpp` — behind the same three call sites as the
 rANS families, selected with `impl="tans32"` / `"tans16"` / `"tans8"`:
 
-| Variant  | State Bits | Stream Bits | Max Freq Bits | Table slots       | Interleaved States | Symbol Lookup     | Device Support | init_func          | push_func   | pop_func   |
-|----------|------------|-------------|---------------|-------------------|--------------------|-------------------|----------------|--------------------|-------------|------------|
-| tans32   | 32         | 16          | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU only       | tans32_init_stream | tans32_push / tans32_i2_push / ... | tans32_pop / tans32_i2_pop / ... |
-| tans16   | 16         | 8           | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU only       | tans16_init_stream | tans16_push / tans16_i2_push / ... | tans16_pop / tans16_i2_pop / ... |
-| tans8    | 8          | 8           | 7             | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU only       | tans8_init_stream  | tans8_push / tans8_i2_push / ... | tans8_pop / tans8_i2_pop / ... |
+| Variant  | State Bits | Stream Bits | Max Freq Bits | Table slots       | Interleaved States | Symbol Lookup     | Device Support            | init_func          | push_func   | pop_func   |
+|----------|------------|-------------|---------------|-------------------|--------------------|-------------------|---------------------------|--------------------|-------------|------------|
+| tans32   | 32         | 16          | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans32_init_stream | tans32_push / tans32_i2_push / ... | tans32_pop / tans32_i2_pop / ... |
+| tans16   | 16         | 8           | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans16_init_stream | tans16_push / tans16_i2_push / ... | tans16_pop / tans16_i2_pop / ... |
+| tans8    | 8          | 8           | 7             | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans8_init_stream  | tans8_push / tans8_i2_push / ... | tans8_pop / tans8_i2_pop / ... |
 
 The interleaved variants are one state per lane on top of the bit buffer the lanes
 share (see the stream header below), so `num_interleaves=2/4/8` works exactly like
@@ -156,6 +156,33 @@ num_interleaves=4)`. Measured on an i7-class machine with `scripts/bench_tans_vs
 interleaving pays off *more* for tANS than for rANS whenever the table is bigger
 than the cache: up to ~2.6x encode / ~2.2x decode at `freq_precision=15` (8 lanes),
 against ~1.2-1.3x at `freq_precision=7` where the table fits in L2.
+
+On CUDA the same single-lane algorithm runs as `tans_cuda.cu` (one thread per
+stream row, byte-compatible with the CPU kernels), so `TorchANSInterface(impl=
+"tans32", device="cuda")` works out of the box - the table is built on the host
+and moved to the device by `init_params`. The device kernels stage the whole
+lookup table into shared memory when it fits the per-block budget
+(`TORCH_ANS_TANS_SMEM_BUDGET`, 16 KiB by default; `0` disables it), and the
+launch block size is derived from the batch size (`TORCH_ANS_TANS_BLOCK_THREADS`
+overrides it) because one thread codes one row. Measured on an RTX 2080 Ti
+(`scripts/bench_tans_vs_rans.py --device cuda`, 1M symbols, 1024 rows, 256
+distributions, see `benchmark_status.md`): against **single-lane** rANS at the same
+`freq_precision`, single-lane tANS decodes 1.0-1.5x faster at `alphabet >= 64` (up
+to 1.54x at alphabet 256 / `freq_precision=10`) and stays within ±5% on encode;
+the rANS **32-way warp path** is the fastest configuration overall (1.2-2.0x
+faster than tANS on decode, 1.25-1.5x on encode), at the price of ~0.6-0.8
+bit/symbol on 1024-symbol rows - each of its 32 lanes flushes its own state per row.
+
+The shared-memory staging only reaches configurations whose *whole* table fits the
+budget (a handful of distributions at a small `freq_precision`), and there it is a
+wash for short rows (1024 symbols: 0.92-0.97x of the global path, since the copy is
+paid per block and L1 already serves a table that size) and a real gain for long ones
+(64 streams × 16K symbols with a 6.6 KB table: **+4.6-5.4% encode / +3.1-3.6%
+decode**). The 256-distribution sweeps never trigger it. In that same small-table
+regime single-lane tANS decodes 1.15-1.33x faster than single-lane rANS (2.3x with
+long streams), so it is the family to pick when the distributions are few.
+Interleaved tANS is CPU-only for now: a CUDA tensor with `num_interleaves > 1`
+raises with that explanation.
 
 What is different from rANS:
 
@@ -183,11 +210,11 @@ What is different from rANS:
 - **Bypass coding writes the out-of-range value as raw bits** instead of coding it with a
   uniform tANS table as the reference does; both cost exactly `bypass_precision` bits per digit,
   so out-of-range symbols behave like they do in rANS.
-- **Limits.** CPU only for now (a CUDA tensor raises an explicit `CPU-only` error),
-  `num_interleaves` is 1/2/4/8 (no 32-way: that one is the CUDA warp path), and there is no
-  `alias_sampling` / `inverse_cdf_precision` variant — the tANS table *is* the symbol lookup.
-  Every symbol (plus the bypass sentinel) has to own at least one of the `2**freq_precision`
-  table slots, so `alphabet + 1 > 2**freq_precision` cannot be coded.
+- **Limits.** `num_interleaves` is 1/2/4/8 on the CPU and 1 on CUDA (an interleaved tANS
+  interface on a device raises an explicit error; the 32-way CUDA warp path is rANS-only), and
+  there is no `alias_sampling` / `inverse_cdf_precision` variant — the tANS table *is* the symbol
+  lookup. Every symbol (plus the bypass sentinel) has to own at least one of the
+  `2**freq_precision` table slots, so `alphabet + 1 > 2**freq_precision` cannot be coded.
 - **When to use it.** See the measured comparison in `benchmark_status.md`: against the fastest
   rANS family at the same `freq_precision`, tANS decodes ~1.3-2.1x faster at `freq_precision=7-10`
   (one table access instead of a search; `tans8` at its `freq_precision=7` cap is the extreme,
@@ -762,7 +789,7 @@ per torch at first use, exactly as before (`torch < 2.10` always takes that path
 - Docs and examples for high-level API
 - ~~Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)~~ Done for `rans32_16_i32` / `rans32_16_i4`: warp-level 32-way (and 4-way sub-warp) interleaved coding on CUDA, bit-compatible with the CPU interleaved streams (see `torch_ans/rans_warp_cuda.cuh`, technique referenced from [Recoil](https://github.com/lin-toto/recoil))
 - ~~Implement lookup table logic in push/pop steps for possible acceleration~~ Done: inverse-CDF lookup with a tunable (dense/sparse/`"auto"`) `2**q` table on CPU and CUDA, warp-level shared-memory staging on CUDA, and a `"auto"` precision heuristic.
-- ~~Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))~~ Done: `impl="tans32" / "tans16" / "tans8"` (CPU), with the FSE-style spread table built by `tans_build_tables`, a bit buffer in the stream header and the same capacity contract / high-level API as rANS, including the interleaved variants (`num_interleaves` 1/2/4/8, one state per lane) (see [tANS](#tans-table-driven-ans)). Still open: CUDA kernels.
+- ~~Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))~~ Done: `impl="tans32" / "tans16" / "tans8"` on the CPU *and* on CUDA (single lane on the device, bit-compatible with the CPU kernels; the interleaved variants 1/2/4/8 are CPU-only), with the FSE-style spread table built by `tans_build_tables`, a bit buffer in the stream header and the same capacity contract / high-level API as rANS (see [tANS](#tans-table-driven-ans)).
 - Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression
 

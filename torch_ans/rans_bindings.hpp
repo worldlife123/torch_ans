@@ -463,9 +463,11 @@ inline void torch_ans_register_family_impls(
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // The wrappers themselves reject CUDA tensors with an explanation, so they are
-  // registered for the CUDA key as well: that way a device tensor produces our
-  // message instead of the dispatcher's bare "not implemented for CUDA".
+  // The wrappers route on the tensor device themselves (tans.hpp), exactly like
+  // the rANS ones, so the same function pointers are registered for the CUDA
+  // key: a device tensor reaches tans_cuda.cu (single lane), and an interleaved
+  // one gets the wrapper's explanation instead of the dispatcher's bare "not
+  // implemented for CUDA".
 #if TORCH_ANS_WITH_TANS32
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans32", uint32_t, uint16_t);
 #  if TORCH_ANS_WITH_INTERLEAVE_2
@@ -754,8 +756,10 @@ inline void torch_ans_bind_all(py::module& m) {
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // tabled ANS, CPU only, interleave 1/2/4/8. One gate per (state, stream) pair;
-  // no alias and no inverse-CDF variant (the tANS table *is* the lookup).
+  // tabled ANS, interleave 1/2/4/8 on the CPU and single-lane on CUDA (the
+  // interleaved CUDA kernels do not exist yet, see tans.hpp). One gate per
+  // (state, stream) pair; no alias and no inverse-CDF variant (the tANS table
+  // *is* the lookup).
 #if TORCH_ANS_WITH_TANS32
   // 32-bit state, 16-bit stream words (freq_precision <= 15).
   TORCH_ANS_TANS_BIND_INIT(m, "tans32", uint32_t, uint16_t);

@@ -33,6 +33,21 @@ value the single-lane header has always been). The lane of a symbol is its index
 is what the interleaved round-trips below pin down (including the leftover
 head/tail a symbol count that is not a multiple of the lane count produces).
 
+On CUDA the same single-lane algorithm runs as ``tans_cuda.cu`` (the interleaved
+kernels do not exist yet: the wrapper says so, and so does
+``TorchANSInterface``). The tests at the bottom pin the two properties that
+matter there:
+
+* **bit compatibility** - for the same table and the same input the device
+  produces the byte string the CPU produces, so a stream coded on one device
+  decodes on the other. That is the only way to catch a kernel that decodes
+  correctly while writing a different (longer, or differently ordered) bit
+  sequence;
+* **table staging** - the table is staged into shared memory when the whole
+  table fits ``TORCH_ANS_TANS_SMEM_BUDGET`` (16 KiB by default), and stays in
+  global memory otherwise. The budget is read at launch, so the tests force each
+  side and compare: staging has to be a pure optimisation.
+
 Every test needs a native build that provides the family. A prebuilt extension
 from before tANS existed makes them skip; otherwise the runtime build compiles a
 module for the profile on first use (~30 s, then cached in the torch extension
@@ -59,13 +74,18 @@ _MODULES = {}
 _UNRESOLVED = {}
 
 
-def _tans_module(family, num_interleaves=1):
+def _tans_module(family, num_interleaves=1, require_cuda=False):
     """The native module that provides `family`; skips when there is none.
 
     A single-lane test gets the (cheap) incremental profile build of its family.
     An interleaved one needs several interleave factors at once, and a profile
     build contains exactly one - so those go through the full build, which is
     compiled once and then serves every (family, num_interleaves) pair below.
+
+    With `require_cuda` the module has to be able to code CUDA tensors (an
+    already loaded CPU-only build is not reused, see utils._native_module), and
+    a machine whose toolchain cannot produce one skips instead of failing - the
+    CUDA kernels are opt-in (`WITH_CUDA=1`), so a GPU alone is not enough.
     """
     if num_interleaves == 1:
         key, profile = family, build_config.BuildProfile(family=family)
@@ -73,12 +93,15 @@ def _tans_module(family, num_interleaves=1):
     else:
         key, profile = "full", None
         incremental = False
+    if require_cuda:
+        key = "cuda:" + key
     if key in _UNRESOLVED:
         pytest.skip(_UNRESOLVED[key])
     module = _MODULES.get(key)
     if module is None:
         try:
-            module = utils._native_module(profile, incremental_compile=incremental)
+            module = utils._native_module(profile, incremental_compile=incremental,
+                                          require_cuda=require_cuda)
         except Exception as exc:  # no prebuilt extension and the build failed
             _UNRESOLVED[key] = ("the %s family could not be resolved, so no "
                                 "native build provides it: %s" % (key, exc))
@@ -89,6 +112,39 @@ def _tans_module(family, num_interleaves=1):
                             "(a prebuilt torch_ans/_C from before it existed?)"
                             % _op_name(family, num_interleaves, "push"))
         pytest.skip(_UNRESOLVED[key])
+    return module
+
+
+def _tans_cuda_module(family, num_interleaves=1):
+    """`_tans_module` for the CUDA kernels, skipping when they cannot be built."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build a CUDA tensor")
+    return _tans_module(family, num_interleaves, require_cuda=True)
+
+
+def _cuda_interleaved_module(family, num_interleaves):
+    """A CUDA module that also provides the (CPU-only) interleaved operators.
+
+    Deliberately *not* `_tans_cuda_module(family, num_interleaves)`: that one
+    falls back to the full build for the interleaved factors (see above), and the
+    single check below does not need every family x interleave combination
+    compiled just to be rejected by the wrapper.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build a CUDA tensor")
+    key = "cuda:profile:%s:i%d" % (family, num_interleaves)
+    if key in _UNRESOLVED:
+        pytest.skip(_UNRESOLVED[key])
+    module = _MODULES.get(key)
+    if module is None:
+        profile = build_config.BuildProfile(family=family, interleave=num_interleaves)
+        try:
+            module = utils._native_module(profile, require_cuda=True)
+        except Exception as exc:
+            _UNRESOLVED[key] = ("no CUDA build provides the interleaved %s "
+                                "operators: %s" % (family, exc))
+            pytest.skip(_UNRESOLVED[key])
+        _MODULES[key] = module
     return module
 
 
@@ -608,17 +664,203 @@ def test_unsupported_interleave_factors_are_rejected():
             module.tans32_init_stream(2, unsupported, 0)
 
 
-def test_a_cuda_stream_is_reported_not_silently_mis_coded():
-    """tANS is CPU-only for now: device tensors must produce a clear message."""
+# ---------------------------------------------------------------------------
+# CUDA: the same algorithm over the device's memory (tans_cuda.cu)
+# ---------------------------------------------------------------------------
+# The device kernels are the single-lane CPU path over device memory, so the
+# strongest property a test can pin is that the two produce the same bytes - see
+# the module docstring. `_roundtrip_on` is the CPU helper of the tests above with
+# a device argument, so both sides code exactly the same input.
+
+def _roundtrip_on(module, family, tables, cdfs_sizes, offsets, symbols, indexes,
+                  freq_precision, bypass_coding, device):
+    """push + pop on `device`; returns (byte strings, decoded, stream)."""
+    push = getattr(module, family + "_push")
+    pop = getattr(module, family + "_pop")
+    stream = getattr(module, family + "_init_stream")(symbols.size(0), 1,
+                                                     0).to(device)
+    push(stream, symbols.to(device), indexes.to(device), tables.to(device),
+         cdfs_sizes.to(device), offsets.to(device), 8, freq_precision,
+         bypass_coding, 4)
+    # (the byte strings are the coded payload; the operator copies the stream to
+    # the host itself, so it works for either device)
+    byte_strings = module.rans_stream_to_byte_strings(stream)
+    decoded = pop(stream, indexes.to(device), tables.to(device),
+                  cdfs_sizes.to(device), offsets.to(device), 8, freq_precision,
+                  bypass_coding, 4)
+    return byte_strings, decoded, stream
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("alphabet,bypass", [
+    (2, True), (8, True), (8, False), (17, False), (256, True),
+])
+@pytest.mark.parametrize("num_dists", [3, 16])
+def test_cuda_codes_the_same_bytes_as_the_cpu(family, cap, alphabet, bypass,
+                                              num_dists):
+    """Bit compatibility: one table, two devices, one byte string.
+
+    The CPU and the CUDA kernel have to write the same payload - comparing the
+    decoded symbols alone would not notice a kernel that decodes its own
+    (different) stream correctly.
+    """
+    if alphabet + (2 if bypass else 1) > (1 << cap):
+        pytest.skip("the alphabet does not fit the table size")
+    cpu_module = _tans_module(family)
+    cuda_module = _tans_cuda_module(family)
+    fp = min(cap, 10)
+    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp,
+                                     bypass_coding=bypass, num_dists=num_dists)
+    tables = cpu_module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    # bypass=False clamps out-of-range symbols instead of coding them, and the
+    # offsets of a distribution may not push it out of [0, max_value]: with
+    # bypass on, real (and different) offsets per distribution are fair game.
+    offsets = (torch.tensor([0, 5, -3][:num_dists] * (num_dists // 3 + 1),
+                            dtype=torch.int32)[:num_dists] if bypass
+               else torch.zeros(num_dists, dtype=torch.int32))
+    generator = torch.Generator().manual_seed(3)
+    indexes = torch.randint(0, num_dists, (2, 257), dtype=torch.int32,
+                            generator=generator)
+    if bypass:
+        symbols = torch.randint(-40, alphabet + 40, (2, 257), dtype=torch.int32,
+                                generator=generator)
+    else:
+        symbols = torch.randint(0, alphabet, (2, 257), dtype=torch.int32,
+                                generator=generator)
+
+    cpu_bytes, cpu_decoded, _ = _roundtrip_on(
+        cpu_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        bypass, "cpu")
+    gpu_bytes, gpu_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        bypass, "cuda")
+
+    assert torch.equal(cpu_decoded, symbols)
+    assert torch.equal(gpu_decoded.cpu(), symbols)
+    assert [bytes(b) for b in gpu_bytes] == [bytes(b) for b in cpu_bytes]
+    # ... which means the GPU's stream decodes with the CPU kernel too
+    restored = cpu_module.rans_byte_strings_to_stream(gpu_bytes)
+    decoded = getattr(cpu_module, family + "_pop")(
+        restored, indexes, tables, cdfs_sizes, offsets, 8, fp, bypass, 4)
+    assert torch.equal(decoded, symbols)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_dists,fits_shared", [(2, True), (64, False)])
+def test_the_shared_table_staging_agrees_with_global_memory(
+        family, cap, num_dists, fits_shared, monkeypatch):
+    """Staging the table into shared memory must not change a single byte.
+
+    `TORCH_ANS_TANS_SMEM_BUDGET` is read per launch (tans_cuda.cu), so the two
+    branches can be forced from Python: 0 keeps the table in global memory, and
+    a budget above the table size stages it. The `fits_shared` parameter is the
+    arithmetic the launcher does (`num_dists * row_words * 4 <= budget`); the
+    table of the second case is ~64x the first one, i.e. the two cases really do
+    exercise the two branches.
+    """
+    cuda_module = _tans_cuda_module(family)
+    cpu_module = _tans_module(family)
+    fp, alphabet = min(cap, 7), 8
+    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp, True,
+                                     num_dists=num_dists)
+    tables = cpu_module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.zeros(num_dists, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(17)
+    indexes = torch.randint(0, num_dists, (3, 128), dtype=torch.int32,
+                            generator=generator)
+    symbols = torch.randint(-8, alphabet + 8, (3, 128), dtype=torch.int32,
+                            generator=generator)
+
+    # the launcher's own staging arithmetic, mirrored (see tans_table_staging):
+    # 3 * 2**fp int32 planes per direction plus 2 words per cdf entry
+    row_words = 3 * (1 << fp) + 2 * (alphabet + 1)
+    table_bytes = num_dists * row_words * 4
+    staged_budget = table_bytes + 4096 if fits_shared else table_bytes // 2
+    assert (table_bytes <= staged_budget) is fits_shared
+
+    monkeypatch.setenv("TORCH_ANS_TANS_SMEM_BUDGET", "0")
+    global_bytes, global_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        True, "cuda")
+
+    monkeypatch.setenv("TORCH_ANS_TANS_SMEM_BUDGET", str(staged_budget))
+    staged_bytes, staged_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        True, "cuda")
+
+    assert torch.equal(global_decoded.cpu(), symbols)
+    assert torch.equal(staged_decoded.cpu(), symbols)
+    assert [bytes(b) for b in staged_bytes] == [bytes(b) for b in global_bytes]
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+def test_interleaved_tans_on_a_cuda_stream_is_reported(family, cap):
+    """The interleaved kernels do not exist on the device yet: say so.
+
+    The operators are bound on both dispatch keys (an interleaved tANS stream is
+    a CPU stream), so a device tensor has to produce the wrapper's explanation
+    instead of a silent mis-code or the dispatcher's bare error.
+    """
+    module = _cuda_interleaved_module(family, 2)
+    cpu_module = _tans_module(family)
+    fp, alphabet = min(cap, 8), 8
+    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp, True, num_dists=3)
+    tables = cpu_module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.zeros(3, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(19)
+    indexes = torch.randint(0, 3, (1, 32), dtype=torch.int32, generator=generator)
+    symbols = torch.randint(-8, alphabet + 8, (1, 32), dtype=torch.int32,
+                            generator=generator)
+
+    stream = getattr(module, family + "_init_stream")(1, 2, 0).cuda()
+    with pytest.raises((RuntimeError, ValueError), match="CPU-only"):
+        getattr(module, family + "_i2_push")(
+            stream, symbols.cuda(), indexes.cuda(), tables.cuda(),
+            cdfs_sizes.cuda(), offsets.cuda(), 8, fp, True, 4)
+    with pytest.raises((RuntimeError, ValueError), match="CPU-only"):
+        getattr(module, family + "_i2_pop")(
+            stream, indexes.cuda(), tables.cuda(), cdfs_sizes.cuda(),
+            offsets.cuda(), 8, fp, True, 4)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+def test_interleaved_tans_on_a_cuda_device_is_rejected_up_front(family, cap):
+    """`TorchANSInterface` rejects the combination before resolving a build.
+
+    The check lives in the constructor (utils.py) and needs no native build at
+    all, which is why this one also runs where the CUDA kernels cannot be
+    compiled.
+    """
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU to build a CUDA tensor")
-    module = _tans_module("tans32")
-    cdfs, sizes = _distribution(module, 8, 10)
-    tables = module.tans_build_tables(cdfs, sizes, 10)
-    stream = module.tans32_init_stream(1, 1, 0).cuda()
-    symbols = torch.zeros((1, 4), dtype=torch.int32, device="cuda")
-    indexes = torch.zeros((1, 4), dtype=torch.int32, device="cuda")
-    offsets = torch.zeros(3, dtype=torch.int32, device="cuda")
-    with pytest.raises((RuntimeError, ValueError), match="CPU-only"):
-        module.tans32_push(stream, symbols, indexes, tables.cuda(), sizes.cuda(),
-                           offsets, 8, 10, True, 4)
+    with pytest.raises(NotImplementedError, match="interleaved tANS"):
+        TorchANSInterface(impl=family, num_interleaves=2,
+                          freq_precision=min(cap, 10), device="cuda")
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+def test_high_level_api_on_a_cuda_device(family, cap):
+    """`TorchANSInterface(device="cuda")` drives single-lane tANS end to end."""
+    _tans_cuda_module(family)  # skip when no CUDA build provides the family
+    freq_precision = min(cap, 10)
+    interface = TorchANSInterface(impl=family, num_interleaves=1,
+                                  freq_precision=freq_precision, device="cuda")
+    alphabet, num_dists = 8, 4
+    generator = torch.Generator().manual_seed(5)
+    freqs = torch.randint(1, 50, (num_dists, alphabet), generator=generator).to(torch.int32)
+    num_freqs = torch.full((num_dists,), alphabet, dtype=torch.int32)
+    offsets = torch.zeros(num_dists, dtype=torch.int32)
+    # the table is built on the host and moved to the device by init_params
+    interface.init_params(freqs.cuda(), num_freqs.cuda(), offsets.cuda())
+    assert interface.cdfs.is_cuda
+
+    symbols = torch.randint(0, alphabet, (2, 128), dtype=torch.int32,
+                            generator=generator).cuda()
+    indexes = torch.randint(0, num_dists, (2, 128), dtype=torch.int32,
+                            generator=generator).cuda()
+    encoded = interface.encode_with_indexes(symbols, indexes)
+    assert torch.equal(interface.decode_with_indexes(encoded, indexes), symbols)
+
+    # the set_stream/decode_stream path (bytes -> stream -> device)
+    interface.set_stream(encoded)
+    assert torch.equal(interface.decode_stream(indexes), symbols)

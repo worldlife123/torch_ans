@@ -11,6 +11,8 @@ and this script measures it:
     python scripts/bench_tans_vs_rans.py
     python scripts/bench_tans_vs_rans.py --json benchmarks/tans_vs_rans_cpu.json
     python scripts/bench_tans_vs_rans.py --alphabet 64 --precision 10 12
+    python scripts/bench_tans_vs_rans.py --device cuda \
+        --json benchmarks/tans_vs_rans_cuda.json
 
 What it reports per configuration:
 
@@ -19,20 +21,48 @@ What it reports per configuration:
   coarser distribution, so "faster" can mean "worse compression" and the two
   numbers must be read together;
 * the per-distribution state the impl carries (`table KB`), i.e. the memory
-  tANS trades for its table lookups.
+  tANS trades for its table lookups;
+* whether the tANS kernels staged that table into shared memory (`smem`), see
+  below - the `--smem-budget` / `--block-threads` knobs are what makes the
+  staging an A/B instead of a compile-time constant.
 
 Configurations a family cannot code are skipped with the reason printed rather
 than silently measured wrong: tANS needs every symbol (plus the bypass sentinel)
 to own at least one of its `2**freq_precision` slots, and `tans8` stops at
 `freq_precision=7` (its state has to hold `[2**L, 2**(L+1))`).
 
+On CUDA (`--device cuda`) the same matrix runs on the device kernels, with the
+differences the two implementations have there:
+
+* tANS is **single-lane** on CUDA (the interleaved kernels exist on the CPU
+  only), and rANS interleaving above one lane is the rans32_16 warp path - so
+  the interleave gain is a CPU story on the tANS side and the CUDA table is
+  about the families;
+* the table staging is decided per launch
+  (`num_dists * row_words * 4 <= TORCH_ANS_TANS_SMEM_BUDGET`, 16 KiB by default,
+  see torch_ans/tans_cuda.cu), so a small `--dists` and a small `--precision`
+  are what turn it on: `--smem-budget 0` disables it and `--smem-budget` above
+  the table size forces it, and `--block-threads` sets the launch block size
+  (one thread codes one stream row, so it also decides how many blocks there
+  are);
+* every timed call synchronizes (`torch.cuda.synchronize`), because the
+  byte-string conversion of the high-level API already copies the stream back to
+  the host and the number has to include that.
+
 Like `scripts/bench_interleaves_cpu.py` this measures the high-level API, so the
 per-call overhead (tensor conversion, stream <-> bytes, the byte-string merge)
 is included; `--threads 1` (the default) isolates the out-of-order effect of
 interleaving from ATen-level parallelism.
+
+NOTE: run as `python scripts/bench_tans_vs_rans.py`, the script directory becomes
+`sys.path[0]` and `torch_ans` is imported from site-packages - i.e. from the
+*installed* package, which silently shadows the working tree when it is older.
+Prefix `PYTHONPATH=$PWD` to measure the sources (that is how the committed
+`benchmarks/*.json` were produced).
 """
 import argparse
 import json
+import os
 import platform
 import time
 
@@ -40,18 +70,37 @@ import torch
 
 from torch_ans.utils import TorchANSInterface
 
-#: family -> (state, stream) description, freq_precision cap, interleave factors
+#: family -> (state, stream) description, freq_precision cap, interleave factors.
+#: 32-way is rans32_16-only and CUDA-only in practice (the warp path); it is
+#: listed here so `--interleaves ... 32` can measure it.
 FAMILIES = {
     "tans32": ("uint32 state / uint16 stream", 15, (1, 2, 4, 8)),
     "tans16": ("uint16 state / uint8 stream", 15, (1, 2, 4, 8)),
     "tans8": ("uint8 state / uint8 stream", 7, (1, 2, 4, 8)),
     "rans64": ("uint64 state / uint32 stream", 31, (1, 2, 4, 8)),
     "rans32": ("uint32 state / uint8 stream", 23, (1, 2, 4, 8)),
-    "rans32_16": ("uint32 state / uint16 stream", 15, (1, 2, 4, 8)),
+    "rans32_16": ("uint32 state / uint16 stream", 15, (1, 2, 4, 8, 32)),
 }
 
 DEFAULT_PRECISIONS = (7, 10, 12, 15)
 DEFAULT_ALPHABETS = (64, 256)
+
+#: Mirrors TANS_SMEM_BUDGET_DEFAULT in torch_ans/tans_cuda.cu: the default the
+#: kernel uses when TORCH_ANS_TANS_SMEM_BUDGET is unset, needed here to report
+#: whether a table would be staged.
+DEFAULT_SMEM_BUDGET = 16 * 1024
+
+#: Substrings that mean "this (family, device, interleave) combination is not
+#: implemented" rather than "the measurement failed". The matrix deliberately
+#: spans combinations that exist on one device only, so those are reported as
+#: skipped instead of aborting the run - but anything else propagates.
+UNSUPPORTED_MARKERS = (
+    "Unsupported num_interleaves",
+    "CPU-only",
+    "only supported for the rans32_16",
+    "not compiled with GPU support",
+    "not available for impl",
+)
 
 
 def build_data(num_symbols, num_distributions, alphabet_size, precision, seed=0,
@@ -127,11 +176,26 @@ def build_data(num_symbols, num_distributions, alphabet_size, precision, seed=0,
     return symbols, indexes, base, num_freqs, offsets, entropy
 
 
-def config_is_codable(family, alphabet, precision, bypass):
-    """(ok, reason) - whether `family` can code this parameter set."""
-    _, cap, _ = FAMILIES[family]
+def config_is_codable(family, alphabet, precision, bypass, device="cpu",
+                      num_interleaves=1):
+    """(ok, reason) - whether `family` can code this parameter set on `device`."""
+    _, cap, interleaves = FAMILIES[family]
     if precision > cap:
         return False, f"freq_precision {precision} > the {cap} cap of {family}"
+    if num_interleaves not in interleaves:
+        return False, (f"num_interleaves {num_interleaves} is not a {family} "
+                       f"configuration (supported: {interleaves})")
+    if device != "cpu":
+        # tANS has device kernels for the single lane only, and the rANS
+        # interleaved CUDA kernels are the rans32_16 warp path (tans.hpp /
+        # rans_cuda.cu). Both are second lines of defence: the interface raises
+        # first, this keeps the run from paying for a build.
+        if family.startswith("tans") and num_interleaves > 1:
+            return False, (f"interleaved tANS is CPU-only for now, so {family} "
+                           f"x{num_interleaves} has no {device} kernels")
+        if not family.startswith("tans") and num_interleaves > 1 and family != "rans32_16":
+            return False, (f"CUDA interleaved rANS is only supported for "
+                           f"rans32_16, not {family}")
     if family.startswith("tans"):
         # the spread has to give every symbol (plus the bypass sentinel) a slot
         needed = alphabet + (1 if bypass else 0)
@@ -141,46 +205,91 @@ def config_is_codable(family, alphabet, precision, bypass):
     return True, ""
 
 
-def bench_one(impl, num_interleaves, symbols, indexes, freqs, num_freqs, offsets,
-              num_parallel_states, reps, precision, bypass):
-    coder = TorchANSInterface(
-        impl=impl,
-        bypass_coding=bypass,
-        bypass_precision=4,
-        freq_precision=precision,
-        num_parallel_states=num_parallel_states,
-        num_interleaves=num_interleaves,
-        mode="encdec",
-        dtype=torch.int32,
-        device="cpu",
-    )
-    coder.init_params(freqs, num_freqs, offsets)
+def _is_unsupported(exc):
+    """Whether `exc` reports an unimplemented configuration (see the markers)."""
+    message = str(exc)
+    return any(marker in message for marker in UNSUPPORTED_MARKERS)
 
-    # warmup + correctness check: a configuration that does not round-trip is
-    # worthless as a throughput number
-    encoded = coder.encode_with_indexes(symbols, indexes)
-    decoded = coder.decode_with_indexes(encoded, indexes)
+
+def _smem_budget():
+    """The staging budget the kernels will read (see DEFAULT_SMEM_BUDGET)."""
+    return int(os.environ.get("TORCH_ANS_TANS_SMEM_BUDGET", DEFAULT_SMEM_BUDGET))
+
+
+def bench_one(impl, num_interleaves, symbols, indexes, freqs, num_freqs, offsets,
+              num_parallel_states, reps, precision, bypass, device="cpu"):
+    """Times one configuration; (result, reason) with result None when skipped.
+
+    A configuration the implementation does not support is reported rather than
+    raised (`_is_unsupported`): the matrix spans combinations that only exist on
+    one device. Anything else - in particular a round-trip mismatch - raises.
+    """
+
+    def on_device(tensor):
+        return tensor if device == "cpu" else tensor.to(device)
+
+    def synchronize():
+        # Every timed call is a high-level encode/decode, which already copies
+        # the stream to the host for the byte-string conversion; the sync is
+        # what makes the wall-clock number cover the kernel as well.
+        if device != "cpu":
+            torch.cuda.synchronize()
+
+    symbols, indexes = on_device(symbols), on_device(indexes)
+    try:
+        coder = TorchANSInterface(
+            impl=impl,
+            bypass_coding=bypass,
+            bypass_precision=4,
+            freq_precision=precision,
+            num_parallel_states=num_parallel_states,
+            num_interleaves=num_interleaves,
+            mode="encdec",
+            dtype=torch.int32,
+            device=device,
+        )
+        coder.init_params(on_device(freqs), on_device(num_freqs),
+                          on_device(offsets))
+        # warmup + correctness check: a configuration that does not round-trip is
+        # worthless as a throughput number
+        encoded = coder.encode_with_indexes(symbols, indexes)
+        decoded = coder.decode_with_indexes(encoded, indexes)
+    except Exception as exc:  # noqa: BLE001 - classified right here
+        if _is_unsupported(exc):
+            return None, f"{type(exc).__name__}: {exc}"
+        raise
     if not torch.equal(decoded.to(symbols.dtype), symbols):
         raise AssertionError(f"roundtrip mismatch for {impl} x{num_interleaves} "
-                             f"(precision={precision})")
+                             f"(precision={precision}, device={device})")
 
     times_enc, times_dec = [], []
     for _ in range(reps):
+        synchronize()
         t0 = time.perf_counter()
         encoded = coder.encode_with_indexes(symbols, indexes)
+        synchronize()
         t1 = time.perf_counter()
         coder.decode_with_indexes(encoded, indexes)
+        synchronize()
         t2 = time.perf_counter()
         times_enc.append(t1 - t0)
         times_dec.append(t2 - t1)
     # the per-distribution state the impl carries: for tANS this *is* the table
+    # the kernels look up, and the staging decision is the whole-table test
+    # tans_cuda.cu::tans_table_staging performs (`None` for the families that
+    # have no table to stage).
     table_bytes = coder.cdfs.numel() * coder.cdfs.element_size()
+    staged = None
+    if impl.startswith("tans"):
+        budget = _smem_budget()
+        staged = bool(budget > 0 and table_bytes <= budget)
     return {
         "enc_s": min(times_enc),
         "dec_s": min(times_dec),
         "coded_bytes": len(encoded),
         "table_bytes": table_bytes,
-    }
+        "staged": staged,
+    }, ""
 
 
 def main():
@@ -197,10 +306,25 @@ def main():
     p.add_argument("--threads", type=int, default=1,
                    help="torch intra-op threads; 1 isolates the OoO effect of "
                         "interleaving from ATen-level parallelism")
+    p.add_argument("--device", default="cpu", choices=("cpu", "cuda"),
+                   help="where to code; the CUDA kernels are single-lane for "
+                        "tANS and the warp path for rans32_16")
     p.add_argument("--no-bypass", action="store_true")
     p.add_argument("--uniform-symbols", action="store_true",
                    help="draw the symbols uniformly instead of from the "
                         "distributions (then bits/symbol is not meaningful)")
+    p.add_argument("--smem-budget", type=int, default=None,
+                   help="TORCH_ANS_TANS_SMEM_BUDGET for the tANS CUDA kernels "
+                        "(bytes per block; 0 disables the table staging, a value "
+                        "above the table size forces it). Unset leaves the "
+                        "kernel default (16 KiB) in place.")
+    p.add_argument("--block-threads", type=int, nargs="+", default=[None],
+                   help="TORCH_ANS_TANS_BLOCK_THREADS for the tANS CUDA kernels "
+                        "(threads per block; each thread codes one stream row, so "
+                        "this also sets the number of blocks). Several values sweep "
+                        "the whole matrix at each of them, which is what the "
+                        "`blk` column of the table shows. Omitting the flag keeps "
+                        "the compiled-in default (64).")
     p.add_argument("--json", default=None, help="write the raw results here")
     args = p.parse_args()
 
@@ -208,15 +332,28 @@ def main():
     bypass = not args.no_bypass
     num_symbols = args.symbols
 
-    print(f"tANS vs rANS (CPU): {num_symbols} symbols, {args.dists} distributions, "
-          f"parallel_states={args.parallel_states}, torch_threads={args.threads}, "
-          f"bypass={bypass}, reps={args.reps} (best of)")
-    print(f"machine: {platform.machine()} / torch {torch.__version__}, "
-          f"python {platform.python_version()}")
+    # The two tANS CUDA knobs are environment variables because that is where
+    # the kernels read them (per launch, so an A/B does not need a rebuild).
+    if args.smem_budget is not None:
+        os.environ["TORCH_ANS_TANS_SMEM_BUDGET"] = str(args.smem_budget)
+
+    device_name = torch.cuda.get_device_name() if args.device != "cpu" else "CPU"
+    print(f"tANS vs rANS ({args.device}): {num_symbols} symbols, "
+          f"{args.dists} distributions, parallel_states={args.parallel_states}, "
+          f"torch_threads={args.threads}, bypass={bypass}, reps={args.reps} "
+          f"(best of)")
+    print(f"machine: {platform.machine()} / {device_name} / torch "
+          f"{torch.__version__}, python {platform.python_version()}")
+    if args.device != "cpu":
+        print(f"tANS kernel knobs: smem budget {_smem_budget()} bytes/block "
+              f"(TORCH_ANS_TANS_SMEM_BUDGET), block threads "
+              f"{args.block_threads} (TORCH_ANS_TANS_BLOCK_THREADS, None = the "
+              f"compiled-in default)")
     print()
 
     results = []
     skipped = []
+    skipped_seen = set()
     for alphabet in args.alphabet:
         for precision in args.precision:
             if alphabet + (1 if bypass else 0) > (1 << precision):
@@ -231,53 +368,85 @@ def main():
                 num_symbols, args.dists, alphabet, precision,
                 from_pmf=not args.uniform_symbols)
             raw_mb = num_symbols / 1e6
-            for impl in args.impl:
-                if impl not in FAMILIES:
-                    raise SystemExit(f"unknown impl {impl}")
-                _, _, interleaves = FAMILIES[impl]
-                for num_interleaves in args.interleaves:
-                    if num_interleaves not in interleaves:
-                        continue
-                    codable, reason = config_is_codable(impl, alphabet, precision, bypass)
-                    if not codable:
-                        skipped.append((impl, num_interleaves, alphabet, precision, reason))
-                        continue
-                    measured = bench_one(
-                        impl, num_interleaves, symbols, indexes, freqs, num_freqs,
-                        offsets, args.parallel_states, args.reps, precision, bypass)
-                    results.append({
-                        "impl": impl,
-                        "interleaves": num_interleaves,
-                        "alphabet": alphabet,
-                        "freq_precision": precision,
-                        "bypass": bypass,
-                        "symbols": num_symbols,
-                        "distributions": args.dists,
-                        "entropy": entropy,
-                        **measured,
-                    })
+            for block_threads in args.block_threads:
+                # A sweep is for the *launch* knob only: the block size does not
+                # change what a stream looks like (the streams are compared below
+                # through their round-trip), so repeating the matrix at each of
+                # them is a pure A/B of the launch configuration.
+                if block_threads is None:
+                    os.environ.pop("TORCH_ANS_TANS_BLOCK_THREADS", None)
+                else:
+                    os.environ["TORCH_ANS_TANS_BLOCK_THREADS"] = str(block_threads)
+                for impl in args.impl:
+                    if impl not in FAMILIES:
+                        raise SystemExit(f"unknown impl {impl}")
+                    _, _, interleaves = FAMILIES[impl]
+                    for num_interleaves in args.interleaves:
+                        if num_interleaves not in interleaves:
+                            continue
+                        config_key = (impl, num_interleaves, alphabet, precision)
+                        codable, reason = config_is_codable(
+                            impl, alphabet, precision, bypass, device=args.device,
+                            num_interleaves=num_interleaves)
+                        if not codable:
+                            if config_key not in skipped_seen:
+                                skipped_seen.add(config_key)
+                                skipped.append((*config_key, reason))
+                            continue
+                        measured, reason = bench_one(
+                            impl, num_interleaves, symbols, indexes, freqs, num_freqs,
+                            offsets, args.parallel_states, args.reps, precision,
+                            bypass, device=args.device)
+                        if measured is None:
+                            # The device rejected it (an operator set compiled
+                            # without the family, say); report, do not crash.
+                            if config_key not in skipped_seen:
+                                skipped_seen.add(config_key)
+                                skipped.append((*config_key, reason))
+                            continue
+                        results.append({
+                            "impl": impl,
+                            "interleaves": num_interleaves,
+                            "alphabet": alphabet,
+                            "freq_precision": precision,
+                            "bypass": bypass,
+                            "symbols": num_symbols,
+                            "distributions": args.dists,
+                            "entropy": entropy,
+                            "device": args.device,
+                            "block_threads": block_threads,
+                            **measured,
+                        })
 
     header = (f"{'impl':<10} {'ilv':>3} {'fp':>3} {'alpha':>5} {'enc MB/s':>10} "
               f"{'dec MB/s':>10} {'enc us':>9} {'dec us':>9} {'bits/sym':>9} "
-              f"{'H':>6} {'over':>6} {'table KB':>9}")
+              f"{'H':>6} {'over':>6} {'table KB':>9} {'smem':>5} {'blk':>4}")
     print(header)
     print("-" * len(header))
+    # The summary sections at the bottom compare *the first* block size; a sweep
+    # shows up as repeated rows (and is what the `blk` column is for).
+    first_block_threads = args.block_threads[0]
     by_key = {}
     for row in results:
         enc_mbs = raw_mb / row["enc_s"]
         dec_mbs = raw_mb / row["dec_s"]
         bits_per_symbol = 8.0 * row["coded_bytes"] / num_symbols
         overhead = bits_per_symbol - row["entropy"]
+        staged = row["staged"]
+        smem = "-" if staged is None else ("yes" if staged else "no")
+        blk = "-" if row["block_threads"] is None else str(row["block_threads"])
         print(f"{row['impl']:<10} {row['interleaves']:>3} {row['freq_precision']:>3} "
               f"{row['alphabet']:>5} {enc_mbs:>10.1f} {dec_mbs:>10.1f} "
               f"{row['enc_s'] * 1e6:>9.1f} {row['dec_s'] * 1e6:>9.1f} "
               f"{bits_per_symbol:>9.3f} {row['entropy']:>6.3f} {overhead:>6.3f} "
-              f"{row['table_bytes'] / 1024.0:>9.1f}")
-        by_key[(row["impl"], row["interleaves"], row["alphabet"],
-                row["freq_precision"])] = (enc_mbs, dec_mbs)
+              f"{row['table_bytes'] / 1024.0:>9.1f} {smem:>5} {blk:>4}")
+        if row["block_threads"] == first_block_threads:
+            by_key[(row["impl"], row["interleaves"], row["alphabet"],
+                    row["freq_precision"])] = (enc_mbs, dec_mbs)
 
     if skipped:
-        print(f"\nskipped {len(skipped)} configuration(s) a family cannot code:")
+        print(f"\nskipped {len(skipped)} configuration(s) not codable on "
+              f"{args.device}:")
         for impl, ilv, alphabet, precision, reason in skipped[:20]:
             print(f"  {impl} x{ilv} alphabet={alphabet} fp={precision}: {reason}")
 
@@ -331,7 +500,10 @@ def main():
             json.dump({
                 "machine": {
                     "machine": platform.machine(),
+                    "device": args.device,
+                    "device_name": device_name,
                     "torch": torch.__version__,
+                    "torch_cuda": torch.version.cuda,
                     "python": platform.python_version(),
                     "threads": args.threads,
                 },
@@ -341,6 +513,14 @@ def main():
                     "parallel_states": args.parallel_states,
                     "reps": args.reps,
                     "bypass": bypass,
+                    # the two tANS CUDA launch knobs, as the kernels will read
+                    # them; None means "the value compiled into the kernels" for
+                    # the block size (the budget has a fixed default, see
+                    # DEFAULT_SMEM_BUDGET)
+                    "tans_smem_budget": (args.smem_budget
+                                         if args.smem_budget is not None
+                                         else _smem_budget()),
+                    "tans_block_threads": args.block_threads,
                 },
                 "results": results,
                 "skipped": [
