@@ -25,7 +25,7 @@
 // exclude this file by name, and the guard below keeps a stray inclusion
 // harmless either way.
 #include "rans.hpp"
-#include "rans_bindings.hpp"
+#include "ans_bindings.hpp"
 
 #if defined(TORCH_ANS_STABLE_ABI) && TA_WITH_CUDA
 // TA_WITH_CUDA is set by ta/torch_api.hpp from WITH_CUDA/WITH_HIP; the stable

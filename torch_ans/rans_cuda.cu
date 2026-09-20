@@ -17,7 +17,7 @@
 #define RANS_CUDA_API
 
 #include "rans_utils.hpp"
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 #include "rans_warp_cuda.cuh"
 
 // NOTE: using 256 threads per block causes significant slowdown,
@@ -556,7 +556,7 @@ ta::Tensor rans_build_inverse_cdf_cuda(const ta::Tensor& cdfs, int64_t freq_prec
 
 
 // ---------------------------------------------------------------------------
-// Instantiations required by the bindings in rans_bindings.hpp.
+// Instantiations required by the bindings in ans_bindings.hpp.
 //
 // Whenever WITH_CUDA/WITH_HIP is defined, the rans.hpp wrappers reference the
 // CUDA template for every bound combination, so the .cu translation unit must
@@ -564,7 +564,7 @@ ta::Tensor rans_build_inverse_cdf_cuda(const ta::Tensor& cdfs, int64_t freq_prec
 // symbol, which makes the whole module fail to import. The blocks mirror both
 // the pybind bindings and the stable-ABI registration lists (the CUDA flavour of
 // the prebuilt wheel is this TU + lib_cuda.cpp) and the gates in
-// rans_build_config.hpp; all four have to stay in step.
+// ans_build_config.hpp; all four have to stay in step.
 // ---------------------------------------------------------------------------
 
 #define TORCH_ANS_CUDA_INST_ILV(STATE, STREAM, ILV) \

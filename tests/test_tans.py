@@ -25,7 +25,7 @@ while ``tans8`` (uint8 + uint8) stops at 7 (its state has to hold
 distribution instead of ``2**15``, at a coarser probability resolution.
 
 Like the rANS families every tANS family is also available interleaved
-(``num_interleaves`` 1/2/4/8, CPU only): each lane owns one state while the bit
+(``num_interleaves`` 1/2/4/8, plus 32): each lane owns one state while the bit
 buffer stays shared, so the header is ``num_interleaves`` state words plus the
 two bit-buffer words (``4 * (num_interleaves + 2)`` bytes, 12 at one lane - the
 value the single-lane header has always been). The lane of a symbol is its index
@@ -33,16 +33,18 @@ value the single-lane header has always been). The lane of a symbol is its index
 is what the interleaved round-trips below pin down (including the leftover
 head/tail a symbol count that is not a multiple of the lane count produces).
 
-On CUDA the same single-lane algorithm runs as ``tans_cuda.cu`` (the interleaved
-kernels do not exist yet: the wrapper says so, and so does
-``TorchANSInterface``). The tests at the bottom pin the two properties that
-matter there:
+On CUDA the interleaved variants are the warp-level kernels in
+``tans_warp_cuda.cuh``: one lane *group* of ``num_interleaves`` threads codes one
+stream row, the per-lane table work is issued in parallel and the shared bit
+layer is committed in lane order by every lane (a broadcast field plus the same
+arithmetic in all of them, so no lane can diverge from the writer). 32 is the
+full-warp group. The tests at the bottom pin the properties that matter there:
 
 * **bit compatibility** - for the same table and the same input the device
   produces the byte string the CPU produces, so a stream coded on one device
-  decodes on the other. That is the only way to catch a kernel that decodes
-  correctly while writing a different (longer, or differently ordered) bit
-  sequence;
+  decodes on the other, in both directions. That is the only way to catch a
+  kernel that decodes correctly while writing a different (longer, or
+  differently ordered) bit sequence;
 * **table staging** - the table is staged into shared memory when the whole
   table fits ``TORCH_ANS_TANS_SMEM_BUDGET`` (16 KiB by default), and stays in
   global memory otherwise. The budget is read at launch, so the tests force each
@@ -62,7 +64,7 @@ from torch_ans import _dynamic_build as build_config
 from torch_ans import utils
 from torch_ans.utils import TorchANSInterface
 
-#: (family, freq_precision cap) - see rans_build_config.hpp / tans_utils.hpp
+#: (family, freq_precision cap) - see ans_build_config.hpp / tans_utils.hpp
 FAMILIES = (("tans32", 15), ("tans16", 15), ("tans8", 7))
 
 #: one module (or one failure) per key, so a build happens once per session.
@@ -77,22 +79,19 @@ _UNRESOLVED = {}
 def _tans_module(family, num_interleaves=1, require_cuda=False):
     """The native module that provides `family`; skips when there is none.
 
-    A single-lane test gets the (cheap) incremental profile build of its family.
-    An interleaved one needs several interleave factors at once, and a profile
-    build contains exactly one - so those go through the full build, which is
-    compiled once and then serves every (family, num_interleaves) pair below.
+    Every (family, interleave) pair is a profile the incremental build knows how
+    to compile on its own (`BuildProfile(family, interleave)` contains exactly
+    one interleave factor), so a single-lane test and an interleaved one both get
+    the cheap profile build of their own combination - compiled once per key and
+    cached in the torch extension directory for the session.
 
     With `require_cuda` the module has to be able to code CUDA tensors (an
     already loaded CPU-only build is not reused, see utils._native_module), and
     a machine whose toolchain cannot produce one skips instead of failing - the
     CUDA kernels are opt-in (`WITH_CUDA=1`), so a GPU alone is not enough.
     """
-    if num_interleaves == 1:
-        key, profile = family, build_config.BuildProfile(family=family)
-        incremental = None
-    else:
-        key, profile = "full", None
-        incremental = False
+    key = family if num_interleaves == 1 else "%s:i%d" % (family, num_interleaves)
+    profile = build_config.BuildProfile(family=family, interleave=num_interleaves)
     if require_cuda:
         key = "cuda:" + key
     if key in _UNRESOLVED:
@@ -100,8 +99,7 @@ def _tans_module(family, num_interleaves=1, require_cuda=False):
     module = _MODULES.get(key)
     if module is None:
         try:
-            module = utils._native_module(profile, incremental_compile=incremental,
-                                          require_cuda=require_cuda)
+            module = utils._native_module(profile, require_cuda=require_cuda)
         except Exception as exc:  # no prebuilt extension and the build failed
             _UNRESOLVED[key] = ("the %s family could not be resolved, so no "
                                 "native build provides it: %s" % (key, exc))
@@ -120,32 +118,6 @@ def _tans_cuda_module(family, num_interleaves=1):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU to build a CUDA tensor")
     return _tans_module(family, num_interleaves, require_cuda=True)
-
-
-def _cuda_interleaved_module(family, num_interleaves):
-    """A CUDA module that also provides the (CPU-only) interleaved operators.
-
-    Deliberately *not* `_tans_cuda_module(family, num_interleaves)`: that one
-    falls back to the full build for the interleaved factors (see above), and the
-    single check below does not need every family x interleave combination
-    compiled just to be rejected by the wrapper.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU to build a CUDA tensor")
-    key = "cuda:profile:%s:i%d" % (family, num_interleaves)
-    if key in _UNRESOLVED:
-        pytest.skip(_UNRESOLVED[key])
-    module = _MODULES.get(key)
-    if module is None:
-        profile = build_config.BuildProfile(family=family, interleave=num_interleaves)
-        try:
-            module = utils._native_module(profile, require_cuda=True)
-        except Exception as exc:
-            _UNRESOLVED[key] = ("no CUDA build provides the interleaved %s "
-                                "operators: %s" % (family, exc))
-            pytest.skip(_UNRESOLVED[key])
-        _MODULES[key] = module
-    return module
 
 
 def _distribution(module, alphabet, freq_precision, bypass_coding=True, num_dists=3,
@@ -277,7 +249,7 @@ def test_push_pop_roundtrips(family, cap, alphabet, bypass):
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 @pytest.mark.parametrize("alphabet,bypass", [(2, True), (8, True), (8, False)])
 @pytest.mark.parametrize("num_symbols", [1, 7, 257])
 def test_interleaved_push_pop_roundtrips(family, cap, num_interleaves, alphabet,
@@ -297,7 +269,7 @@ def test_interleaved_push_pop_roundtrips(family, cap, num_interleaves, alphabet,
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_interleaved_bypass_codes_symbols_outside_the_alphabet(family, cap,
                                                                num_interleaves):
     """The sentinel path, with the bypass digits shared between the lanes."""
@@ -321,7 +293,7 @@ def test_interleaved_bypass_codes_symbols_outside_the_alphabet(family, cap,
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_interleaved_padding_indexes_are_skipped(family, cap, num_interleaves):
     """The batched API pads with index -1; those lanes must stay untouched."""
     module = _tans_module(family, num_interleaves)
@@ -345,7 +317,7 @@ def test_interleaved_padding_indexes_are_skipped(family, cap, num_interleaves):
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_interleaved_two_pushes_share_one_stream(family, cap, num_interleaves):
     """A second push continues where the first stopped, and a pop rewinds."""
     module = _tans_module(family, num_interleaves)
@@ -374,7 +346,7 @@ def test_interleaved_two_pushes_share_one_stream(family, cap, num_interleaves):
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_interleaved_byte_string_roundtrip(family, cap, num_interleaves):
     """The header is part of the byte string, so it has to survive it."""
     module = _tans_module(family, num_interleaves)
@@ -403,7 +375,7 @@ def test_interleaved_byte_string_roundtrip(family, cap, num_interleaves):
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_interleaved_high_level_api(family, cap, num_interleaves):
     """`TorchANSInterface` drives interleaved tANS like interleaved rANS."""
     _tans_module(family, num_interleaves)  # see test_high_level_api
@@ -614,10 +586,10 @@ def test_the_family_caps_freq_precision(family, cap):
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
 def test_unsupported_options_are_rejected(family, cap):
-    """tANS has no 32-way variant, no alias table and no inverse-CDF variant."""
-    # 32-way is the CUDA warp path, and the tANS families are CPU-only
-    with pytest.raises(NotImplementedError, match="num_interleaves=32"):
-        TorchANSInterface(impl=family, num_interleaves=32)
+    """tANS has no alias table and no inverse-CDF variant, and 16 lanes is not
+    an interleave factor any family has (1/2/4/8 and 32 are the ones bound)."""
+    with pytest.raises(NotImplementedError, match="num_interleaves=16"):
+        TorchANSInterface(impl=family, num_interleaves=16)
     with pytest.raises(NotImplementedError, match="alias sampling"):
         TorchANSInterface(impl=family, num_interleaves=1, alias_sampling=True)
     with pytest.raises(NotImplementedError, match="inverse CDF"):
@@ -644,7 +616,7 @@ def test_table_log_above_the_fixed_point_limit_is_rejected():
         module.tans_build_tables(cdfs, sizes, 16)
 
 
-@pytest.mark.parametrize("num_interleaves", [2, 4, 8])
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
 def test_an_interleaved_stream_carries_one_state_per_lane(num_interleaves):
     """The header is `num_interleaves` state words + the shared bit buffer."""
     module = _tans_module("tans32")
@@ -657,28 +629,36 @@ def test_an_interleaved_stream_carries_one_state_per_lane(num_interleaves):
 
 
 def test_unsupported_interleave_factors_are_rejected():
-    """1/2/4/8 are the bound ones; anything else must say so."""
+    """1/2/4/8 and 32 are the bound ones; anything else must say so.
+
+    32 is the full-warp group: the CUDA interleaved kernels use it as one warp
+    per row, and the CPU kernels implement it from the same lane loop - so the
+    stream itself is a plain interleaved one and the initializer has to accept it.
+    """
     module = _tans_module("tans32")
-    for unsupported in (0, 3, 16, 32):
+    for unsupported in (0, 3, 16, 64):
         with pytest.raises((ValueError, RuntimeError), match="num_interleaves"):
             module.tans32_init_stream(2, unsupported, 0)
+    stream = module.tans32_init_stream(2, 32, 0)
+    assert int(stream[:, 0].unique().item()) == 4 * (32 + 2)
 
 
 # ---------------------------------------------------------------------------
 # CUDA: the same algorithm over the device's memory (tans_cuda.cu)
 # ---------------------------------------------------------------------------
-# The device kernels are the single-lane CPU path over device memory, so the
-# strongest property a test can pin is that the two produce the same bytes - see
-# the module docstring. `_roundtrip_on` is the CPU helper of the tests above with
-# a device argument, so both sides code exactly the same input.
+# The device kernels are the CPU path over device memory - one thread per row at
+# one lane, one lane group per row above it - so the strongest property a test can
+# pin is that the two produce the same bytes; see the module docstring.
+# `_roundtrip_on` is the CPU helper of the tests above with a device argument, so
+# both sides code exactly the same input.
 
 def _roundtrip_on(module, family, tables, cdfs_sizes, offsets, symbols, indexes,
-                  freq_precision, bypass_coding, device):
+                  freq_precision, bypass_coding, device, num_interleaves=1):
     """push + pop on `device`; returns (byte strings, decoded, stream)."""
-    push = getattr(module, family + "_push")
-    pop = getattr(module, family + "_pop")
-    stream = getattr(module, family + "_init_stream")(symbols.size(0), 1,
-                                                     0).to(device)
+    push = getattr(module, _op_name(family, num_interleaves, "push"))
+    pop = getattr(module, _op_name(family, num_interleaves, "pop"))
+    stream = getattr(module, family + "_init_stream")(symbols.size(0),
+                                                     num_interleaves, 0).to(device)
     push(stream, symbols.to(device), indexes.to(device), tables.to(device),
          cdfs_sizes.to(device), offsets.to(device), 8, freq_precision,
          bypass_coding, 4)
@@ -793,49 +773,149 @@ def test_the_shared_table_staging_agrees_with_global_memory(
     assert [bytes(b) for b in staged_bytes] == [bytes(b) for b in global_bytes]
 
 
-@pytest.mark.parametrize("family,cap", FAMILIES)
-def test_interleaved_tans_on_a_cuda_stream_is_reported(family, cap):
-    """The interleaved kernels do not exist on the device yet: say so.
+# --- interleaved tANS on the device: the warp-level kernels ----------------
+# One lane group of `num_interleaves` threads codes one stream row. The tests
+# below pin the same properties the single-lane ones do (the device writes the
+# CPU's bytes, staging is a pure optimisation) plus the two the warp kernels add:
+# the lane order inside the shared bit layer, and a batch/lane shape that does
+# not fill a block.
 
-    The operators are bound on both dispatch keys (an interleaved tANS stream is
-    a CPU stream), so a device tensor has to produce the wrapper's explanation
-    instead of a silent mis-code or the dispatcher's bare error.
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
+@pytest.mark.parametrize("alphabet,bypass", [(2, True), (8, True), (8, False)])
+def test_interleaved_cuda_codes_the_same_bytes_as_the_cpu(family, cap,
+                                                          num_interleaves,
+                                                          alphabet, bypass):
+    """Bit compatibility: one table, two devices, one byte string.
+
+    257 symbols is not a multiple of any interleave factor, so the leftover head
+    (push) and tail (pop) are covered as well as the full groups - and 32 is the
+    full-warp group, which is the only place the extreme lane order (lane 31
+    first on the way out, lane 0 first on the way in) is pinned against the CPU's.
     """
-    module = _cuda_interleaved_module(family, 2)
-    cpu_module = _tans_module(family)
-    fp, alphabet = min(cap, 8), 8
-    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp, True, num_dists=3)
+    if alphabet + (2 if bypass else 1) > (1 << cap):
+        pytest.skip("the alphabet does not fit the table size")
+    cpu_module = _tans_module(family, num_interleaves)
+    cuda_module = _tans_module(family, num_interleaves, require_cuda=True)
+    fp = min(cap, 10)
+    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp,
+                                     bypass_coding=bypass, num_dists=3)
     tables = cpu_module.tans_build_tables(cdfs, cdfs_sizes, fp)
-    offsets = torch.zeros(3, dtype=torch.int32)
-    generator = torch.Generator().manual_seed(19)
-    indexes = torch.randint(0, 3, (1, 32), dtype=torch.int32, generator=generator)
-    symbols = torch.randint(-8, alphabet + 8, (1, 32), dtype=torch.int32,
+    # with bypass off, out-of-range symbols are clamped, so an offset could push
+    # a symbol outside the coded range without a raw value to carry it
+    offsets = (torch.tensor([0, 5, -3], dtype=torch.int32) if bypass
+               else torch.zeros(3, dtype=torch.int32))
+    generator = torch.Generator().manual_seed(23)
+    indexes = torch.randint(0, 3, (2, 257), dtype=torch.int32, generator=generator)
+    if bypass:
+        symbols = torch.randint(-40, alphabet + 40, (2, 257), dtype=torch.int32,
+                                generator=generator)
+    else:
+        symbols = torch.randint(0, alphabet, (2, 257), dtype=torch.int32,
+                                generator=generator)
+
+    cpu_bytes, cpu_decoded, _ = _roundtrip_on(
+        cpu_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        bypass, "cpu", num_interleaves)
+    gpu_bytes, gpu_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        bypass, "cuda", num_interleaves)
+
+    assert torch.equal(cpu_decoded, symbols)
+    assert torch.equal(gpu_decoded.cpu(), symbols)
+    assert [bytes(b) for b in gpu_bytes] == [bytes(b) for b in cpu_bytes]
+
+    # ... which means each device decodes the other one's streams
+    restored = cpu_module.rans_byte_strings_to_stream(gpu_bytes)
+    decoded = getattr(cpu_module, _op_name(family, num_interleaves, "pop"))(
+        restored, indexes, tables, cdfs_sizes, offsets, 8, fp, bypass, 4)
+    assert torch.equal(decoded, symbols)
+
+    restored = cuda_module.rans_byte_strings_to_stream(cpu_bytes).cuda()
+    decoded = getattr(cuda_module, _op_name(family, num_interleaves, "pop"))(
+        restored, indexes.cuda(), tables.cuda(), cdfs_sizes.cuda(), offsets.cuda(),
+        8, fp, bypass, 4)
+    assert torch.equal(decoded.cpu(), symbols)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 8, 32])
+@pytest.mark.parametrize("batch,num_symbols", [(1, 1), (3, 7), (11, 33), (2, 1024)])
+def test_interleaved_cuda_batch_and_row_shapes(family, cap, num_interleaves,
+                                               batch, num_symbols):
+    """Rows, lane groups and blocks are three different things - cover all three.
+
+    `num_symbols` below the lane count leaves lanes without a single symbol (they
+    still write their state and the shared bit buffer back), the batch sizes are
+    not multiples of a block's group count so whole groups exit early, and the
+    long row is what grows the payload past the initial header.
+    """
+    module = _tans_module(family, num_interleaves, require_cuda=True)
+    fp, alphabet = min(cap, 8), 8
+    cdfs, cdfs_sizes = _distribution(module, alphabet, fp, True, num_dists=3)
+    tables = module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.tensor([0, 5, -3], dtype=torch.int32)
+    generator = torch.Generator().manual_seed(29)
+    indexes = torch.randint(0, 3, (batch, num_symbols), dtype=torch.int32,
+                            generator=generator)
+    symbols = torch.randint(-8, alphabet + 8, (batch, num_symbols),
+                            dtype=torch.int32, generator=generator)
+
+    _, decoded, stream = _roundtrip_on(
+        module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp, True,
+        "cuda", num_interleaves)
+    assert torch.equal(decoded.cpu(), symbols)
+    # the header (one state word per lane plus the bit buffer) is always there,
+    # and the length word never claims more than the row holds
+    assert int(stream[:, 0].min()) >= 4 * (num_interleaves + 2)
+    assert int(stream[:, 0].max()) <= stream.size(1) * stream.element_size()
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [4, 32])
+@pytest.mark.parametrize("num_dists,fits_shared", [(2, True), (64, False)])
+def test_interleaved_cuda_table_staging_agrees_with_global_memory(
+        family, cap, num_interleaves, num_dists, fits_shared, monkeypatch):
+    """The warp kernels stage the table the same way the single-lane ones do.
+
+    Same force-and-compare as `test_the_shared_table_staging_agrees_with_global_memory`
+    (`TORCH_ANS_TANS_SMEM_BUDGET` is read per launch): every lane of a group
+    looks the table up in the same memory, so staging may not change one byte -
+    or one decoded symbol - of the interleaved path either.
+    """
+    cuda_module = _tans_module(family, num_interleaves, require_cuda=True)
+    cpu_module = _tans_module(family, num_interleaves)
+    fp, alphabet = min(cap, 7), 8
+    cdfs, cdfs_sizes = _distribution(cpu_module, alphabet, fp, True,
+                                     num_dists=num_dists)
+    tables = cpu_module.tans_build_tables(cdfs, cdfs_sizes, fp)
+    offsets = torch.zeros(num_dists, dtype=torch.int32)
+    generator = torch.Generator().manual_seed(31)
+    indexes = torch.randint(0, num_dists, (3, 128), dtype=torch.int32,
+                            generator=generator)
+    symbols = torch.randint(-8, alphabet + 8, (3, 128), dtype=torch.int32,
                             generator=generator)
 
-    stream = getattr(module, family + "_init_stream")(1, 2, 0).cuda()
-    with pytest.raises((RuntimeError, ValueError), match="CPU-only"):
-        getattr(module, family + "_i2_push")(
-            stream, symbols.cuda(), indexes.cuda(), tables.cuda(),
-            cdfs_sizes.cuda(), offsets.cuda(), 8, fp, True, 4)
-    with pytest.raises((RuntimeError, ValueError), match="CPU-only"):
-        getattr(module, family + "_i2_pop")(
-            stream, indexes.cuda(), tables.cuda(), cdfs_sizes.cuda(),
-            offsets.cuda(), 8, fp, True, 4)
+    # the launcher's own staging arithmetic, mirrored (see tans_table_staging):
+    # 3 * 2**fp int32 planes per direction plus 2 words per cdf entry
+    row_words = 3 * (1 << fp) + 2 * (alphabet + 1)
+    table_bytes = num_dists * row_words * 4
+    staged_budget = table_bytes + 4096 if fits_shared else table_bytes // 2
+    assert (table_bytes <= staged_budget) is fits_shared
 
+    monkeypatch.setenv("TORCH_ANS_TANS_SMEM_BUDGET", "0")
+    global_bytes, global_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        True, "cuda", num_interleaves)
 
-@pytest.mark.parametrize("family,cap", FAMILIES)
-def test_interleaved_tans_on_a_cuda_device_is_rejected_up_front(family, cap):
-    """`TorchANSInterface` rejects the combination before resolving a build.
+    monkeypatch.setenv("TORCH_ANS_TANS_SMEM_BUDGET", str(staged_budget))
+    staged_bytes, staged_decoded, _ = _roundtrip_on(
+        cuda_module, family, tables, cdfs_sizes, offsets, symbols, indexes, fp,
+        True, "cuda", num_interleaves)
 
-    The check lives in the constructor (utils.py) and needs no native build at
-    all, which is why this one also runs where the CUDA kernels cannot be
-    compiled.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("needs a GPU to build a CUDA tensor")
-    with pytest.raises(NotImplementedError, match="interleaved tANS"):
-        TorchANSInterface(impl=family, num_interleaves=2,
-                          freq_precision=min(cap, 10), device="cuda")
+    assert torch.equal(global_decoded.cpu(), symbols)
+    assert torch.equal(staged_decoded.cpu(), symbols)
+    assert [bytes(b) for b in staged_bytes] == [bytes(b) for b in global_bytes]
 
 
 @pytest.mark.parametrize("family,cap", FAMILIES)
@@ -857,6 +937,42 @@ def test_high_level_api_on_a_cuda_device(family, cap):
     symbols = torch.randint(0, alphabet, (2, 128), dtype=torch.int32,
                             generator=generator).cuda()
     indexes = torch.randint(0, num_dists, (2, 128), dtype=torch.int32,
+                            generator=generator).cuda()
+    encoded = interface.encode_with_indexes(symbols, indexes)
+    assert torch.equal(interface.decode_with_indexes(encoded, indexes), symbols)
+
+    # the set_stream/decode_stream path (bytes -> stream -> device)
+    interface.set_stream(encoded)
+    assert torch.equal(interface.decode_stream(indexes), symbols)
+
+
+@pytest.mark.parametrize("family,cap", FAMILIES)
+@pytest.mark.parametrize("num_interleaves", [2, 4, 8, 32])
+def test_interleaved_high_level_api_on_a_cuda_device(family, cap, num_interleaves):
+    """`TorchANSInterface(device="cuda", num_interleaves=N)` end to end.
+
+    The long row is deliberate: the interface owns the stream capacity
+    (`utils._stream_budget` mirrors `ans_ensure_stream_capacity` in C++), and the
+    header of a 32-lane tANS stream is 136 bytes - states plus the shared bit
+    buffer plus the length word - which is the case that arithmetic is easiest to
+    get wrong for. The symbols are drawn around the alphabet so the bypass
+    (sentinel) path is part of it.
+    """
+    _tans_cuda_module(family, num_interleaves)  # skip when no CUDA build provides it
+    freq_precision = min(cap, 10)
+    interface = TorchANSInterface(impl=family, num_interleaves=num_interleaves,
+                                  freq_precision=freq_precision, device="cuda")
+    alphabet, num_dists = 8, 4
+    generator = torch.Generator().manual_seed(5)
+    freqs = torch.randint(1, 50, (num_dists, alphabet), generator=generator).to(torch.int32)
+    num_freqs = torch.full((num_dists,), alphabet, dtype=torch.int32)
+    offsets = torch.zeros(num_dists, dtype=torch.int32)
+    interface.init_params(freqs.cuda(), num_freqs.cuda(), offsets.cuda())
+    assert interface.cdfs.is_cuda
+
+    symbols = torch.randint(-8, alphabet + 8, (3, 4096), dtype=torch.int32,
+                            generator=generator).cuda()
+    indexes = torch.randint(0, num_dists, (3, 4096), dtype=torch.int32,
                             generator=generator).cuda()
     encoded = interface.encode_with_indexes(symbols, indexes)
     assert torch.equal(interface.decode_with_indexes(encoded, indexes), symbols)

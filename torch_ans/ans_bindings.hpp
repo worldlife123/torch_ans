@@ -6,7 +6,7 @@
 //     ATen build (install-time or runtime JIT). This supersedes the
 //     TORCH_EXTENSION_RANS_BINDINGS macro that used to live in rans.hpp, and it
 //     is a regular (inline) function rather than a macro because the bound
-//     operator set is gated by the feature macros in rans_build_config.hpp: the
+//     operator set is gated by the feature macros in ans_build_config.hpp: the
 //     gates are plain #if blocks, which a macro body cannot contain. See
 //     torch_ans/_dynamic_build.py for how the Python side selects a subset.
 //
@@ -28,7 +28,7 @@
 // ABI has no schema type for it, Python implements it (torch_ans/_stable_C.py).
 
 #include "rans.hpp"
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 #include "tans.hpp"
 
 #ifdef TORCH_ANS_STABLE_ABI
@@ -208,8 +208,10 @@ inline void torch_ans_register_schemas(
 #endif
 
   // ------------------------------------------------------------ rans32_16 --
-  // 32-bit state, 16-bit stream words (freq_precision <= 15). The only family
-  // with a 32-way interleaved variant; 32-way is CUDA-only in practice.
+  // 32-bit state, 16-bit stream words (freq_precision <= 15). The only rANS
+  // family with a 32-way interleaved variant (the three tANS families have one
+  // too); 32-way is CUDA-only in practice, and the CPU kernels implement it
+  // either way.
 #if TORCH_ANS_WITH_RANS32_16
   TORCH_ANS_DEF_INIT(m, "rans32_16");
   TORCH_ANS_DEF_PUSH_POP(m, "rans32_16");
@@ -255,10 +257,11 @@ inline void torch_ans_register_schemas(
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // tabled ANS, CPU only: one gate per (state, stream) pair, and the interleave
-  // factors behind the gates the rANS families share (no 32-way - that one is
-  // the CUDA warp path). The signatures are the rANS ones (see tans.hpp); only
-  // the family is new.
+  // tabled ANS: one gate per (state, stream) pair, and the interleave factors
+  // behind the gates the rANS families share - 1/2/4/8 on both devices, plus 32,
+  // which is the full-warp group of the CUDA interleaved kernels and, like the
+  // rANS 32-way, has CPU kernels too. The signatures are the rANS ones (see
+  // tans.hpp); only the family is new.
 #if TORCH_ANS_WITH_TANS32
   // 32-bit state, 16-bit stream words (freq_precision <= 15).
   TORCH_ANS_DEF_INIT(m, "tans32");
@@ -271,6 +274,9 @@ inline void torch_ans_register_schemas(
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_DEF_PUSH_POP(m, "tans32_i8");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_DEF_PUSH_POP(m, "tans32_i32");
 #  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
@@ -287,6 +293,9 @@ inline void torch_ans_register_schemas(
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_DEF_PUSH_POP(m, "tans16_i8");
 #  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_DEF_PUSH_POP(m, "tans16_i32");
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   // 8-bit state, 8-bit stream words (freq_precision <= 7): the small-table tier.
@@ -300,6 +309,9 @@ inline void torch_ans_register_schemas(
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_DEF_PUSH_POP(m, "tans8_i8");
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_DEF_PUSH_POP(m, "tans8_i32");
 #  endif
 #endif
 }
@@ -465,9 +477,9 @@ inline void torch_ans_register_family_impls(
   // ----------------------------------------------------------------- tANS --
   // The wrappers route on the tensor device themselves (tans.hpp), exactly like
   // the rANS ones, so the same function pointers are registered for the CUDA
-  // key: a device tensor reaches tans_cuda.cu (single lane), and an interleaved
-  // one gets the wrapper's explanation instead of the dispatcher's bare "not
-  // implemented for CUDA".
+  // key: a device tensor reaches tans_cuda.cu (single lane, or the warp-level
+  // interleaved kernels for num_interleaves > 1), and neither device needs a
+  // "not implemented for CUDA" fallback any more.
 #if TORCH_ANS_WITH_TANS32
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans32", uint32_t, uint16_t);
 #  if TORCH_ANS_WITH_INTERLEAVE_2
@@ -478,6 +490,9 @@ inline void torch_ans_register_family_impls(
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans32_i8", uint32_t, uint16_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans32_i32", uint32_t, uint16_t, 32);
 #  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
@@ -491,6 +506,9 @@ inline void torch_ans_register_family_impls(
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans16_i8", uint16_t, uint8_t, 8);
 #  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans16_i32", uint16_t, uint8_t, 32);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   TORCH_ANS_TANS_IMPL_PUSH_POP(m, "tans8", uint8_t, uint8_t);
@@ -502,6 +520,9 @@ inline void torch_ans_register_family_impls(
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans8_i8", uint8_t, uint8_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_IMPL_PUSH_POP_ILV(m, "tans8_i32", uint8_t, uint8_t, 32);
 #  endif
 #endif
 }
@@ -756,10 +777,9 @@ inline void torch_ans_bind_all(py::module& m) {
 #endif
 
   // ----------------------------------------------------------------- tANS --
-  // tabled ANS, interleave 1/2/4/8 on the CPU and single-lane on CUDA (the
-  // interleaved CUDA kernels do not exist yet, see tans.hpp). One gate per
-  // (state, stream) pair; no alias and no inverse-CDF variant (the tANS table
-  // *is* the lookup).
+  // tabled ANS, interleave 1/2/4/8 (plus 32, the CUDA full-warp group) on both
+  // devices - see tans.hpp. One gate per (state, stream) pair; no alias and no
+  // inverse-CDF variant (the tANS table *is* the lookup).
 #if TORCH_ANS_WITH_TANS32
   // 32-bit state, 16-bit stream words (freq_precision <= 15).
   TORCH_ANS_TANS_BIND_INIT(m, "tans32", uint32_t, uint16_t);
@@ -772,6 +792,9 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans32_i8", uint32_t, uint16_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans32_i32", uint32_t, uint16_t, 32);
 #  endif
 #endif
 #if TORCH_ANS_WITH_TANS16
@@ -788,6 +811,9 @@ inline void torch_ans_bind_all(py::module& m) {
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans16_i8", uint16_t, uint8_t, 8);
 #  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans16_i32", uint16_t, uint8_t, 32);
+#  endif
 #endif
 #if TORCH_ANS_WITH_TANS8
   // 8-bit state, 8-bit stream words (freq_precision <= 7): the small-table tier.
@@ -801,6 +827,9 @@ inline void torch_ans_bind_all(py::module& m) {
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
   TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans8_i8", uint8_t, uint8_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+  TORCH_ANS_TANS_BIND_PUSH_POP_ILV(m, "tans8_i32", uint8_t, uint8_t, 32);
 #  endif
 #endif
 }

@@ -8,13 +8,19 @@
 // operator names, the signatures and the Python call sites stay identical on
 // CPU and CUDA.
 //
-// Single lane only: a tANS stream holds one state and one bit buffer, and the
-// interleaved variants stay CPU-only for now (the wrapper rejects them with an
-// explanation). Every stream row is therefore one independent serial task, and
-// one thread codes one row - the same "one thread per stream" organisation the
-// non-interleaved rANS kernels use, and the reason the CUDA kernels are
-// bit-compatible with the CPU ones (the loop bodies below are the single-lane
-// CPU path verbatim).
+// Two kernel families, routed here by `tans_push_indexed_cuda` /
+// `tans_pop_indexed_cuda` on NUM_INTERLEAVES:
+//   * 1 lane: one thread codes one whole stream row (the "one thread per stream"
+//     organisation the non-interleaved rANS kernels use). A tANS stream holds
+//     one state and one bit buffer, so a row is one independent serial task -
+//     and the loop bodies below are the single-lane CPU path verbatim, which is
+//     why the CPU and the CUDA kernels are bit-compatible;
+//   * 2/4/8/32 lanes: one lane *group* codes one row cooperatively, the warp
+//     level interleaved kernels in tans_warp_cuda.cuh - same payload bytes, the
+//     per-lane table work in parallel and the shared bit layer committed in lane
+//     order.
+// Both are bit-compatible with the CPU interleaved kernels, so a stream coded by
+// either can be decoded by any of them.
 //
 // Table staging: the tANS table *is* the symbol lookup, and each symbol reads
 // it at a state- or symbol-dependent offset, so it is the main memory-latency
@@ -43,122 +49,23 @@
 // enable compiling tans_utils.hpp for kernel call
 #define RANS_CUDA_API
 
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 #include "tans.hpp"
 #include "tans_utils.hpp"
 
-// ---------------------------------------------------------------------------
-// launch configuration
-// ---------------------------------------------------------------------------
-// One thread codes one stream row, so the block size trades two things:
-//   * `blocks = ceil(batch / threads)` - how many SMs get work. A large block
-//     leaves most of the device idle for a modest batch: the first version
-//     defaulted to 64 threads, which codes 1024 rows in 16 blocks and measured
-//     ~18% slower (decode) than 8 threads per block;
-//   * the shared-memory staging, which is paid *per block*: a 13 KiB table
-//     copied by 1-thread blocks means one copy per row (1024 of them) next to
-//     ~4 KiB of payload per row, which is why staging wants fewer, larger
-//     blocks while the global path wants more, smaller ones.
-// `tans_num_threads_per_block` derives the block size from the batch size; its
-// comment carries the measured table behind the formula.
-// TORCH_ANS_TANS_BLOCK_THREADS overrides it so a sweep needs no rebuild.
-
-//: Number of blocks a launch aims at (see tans_num_threads_per_block).
-#ifndef TANS_BLOCKS_TARGET
-#define TANS_BLOCKS_TARGET 128
-#endif
-
-//: Upper bound of the derived block size (a batch large enough to fill the
-//: device wants a small number of wide blocks, not 1024-thread ones).
-#ifndef TANS_MAX_THREADS_PER_BLOCK
-#define TANS_MAX_THREADS_PER_BLOCK 128
-#endif
-
-// Shared-memory staging budget, in bytes per block. The default is 1/4 of the
-// per-SM shared memory of the target architectures, i.e. the largest budget
-// that keeps four blocks resident per SM (the same value and reasoning as A9 in
-// rans_warp_cuda.cuh). `TORCH_ANS_TANS_SMEM_BUDGET` overrides it; 0 disables
-// staging entirely, which is what an A/B measurement of the feature wants. Keep
-// it at or below the device's per-block shared memory limit (48 KiB without an
-// opt-in on sm_75), since nothing below sets the function attribute.
-#ifndef TANS_SMEM_BUDGET_DEFAULT
-#define TANS_SMEM_BUDGET_DEFAULT (16 * 1024)
-#endif
-
-namespace {
-
-int tans_num_threads_per_block(int64_t batch_size) {
-  const char* env = std::getenv("TORCH_ANS_TANS_BLOCK_THREADS");
-  if (env != nullptr) {
-    const long value = std::atol(env);
-    // A non-positive or absurd value would make the launch fail; fall back to
-    // the default instead of turning a measurement knob into a crash.
-    if (value > 0 && value <= 1024) return (int)value;
-  }
-  // Measured on RTX 2080 Ti (tans32, 8 distributions, fp 7, alphabet 16, 1M
-  // symbols, table in *global* memory - scripts/bench_tans_vs_rans.py
-  // --smem-budget 0), encode MB/s per threads-per-block:
-  //   batch    1     2     4     8    16    32    64   128   256
-  //    256   381   372   357   424   412   399   395   347   283
-  //   1024   557   603   599   596   588   574   563   575   539
-  //   4096   395   449   472   472   477   483   485   478   466
-  // The optimum sits around 128 blocks at every batch size - fewer SMs used
-  // above it, more per-block staging cost below it - so the block size is the
-  // batch over that target. Small batches therefore get 1-2 threads (where the
-  // staging also measured best) and a device-filling batch gets wide blocks.
-  const int64_t threads = (batch_size + TANS_BLOCKS_TARGET - 1) / TANS_BLOCKS_TARGET;
-  if (threads < 1) return 1;
-  if (threads > TANS_MAX_THREADS_PER_BLOCK) return TANS_MAX_THREADS_PER_BLOCK;
-  return (int)threads;
-}
-
-int64_t tans_smem_budget_bytes() {
-  const char* env = std::getenv("TORCH_ANS_TANS_SMEM_BUDGET");
-  if (env != nullptr) return std::atoll(env);
-  return TANS_SMEM_BUDGET_DEFAULT;
-}
-
-// Whether the whole table of `tables` (`num_dists x row_words` int32 words) is
-// staged into shared memory, and how many bytes that needs. `words == 0` means
-// "no staging" - the global-memory kernel is launched with no dynamic shared
-// memory at all.
-struct TansTableStaging {
-  int64_t words;
-  size_t bytes;
-};
-
-inline TansTableStaging tans_table_staging(const ta::Tensor& tables) {
-  const int64_t words = tables.size(0) * tables.size(1);
-  const int64_t budget = tans_smem_budget_bytes();
-  if (budget > 0 && words * (int64_t)sizeof(int32_t) <= budget) {
-    return TansTableStaging{words, (size_t)words * sizeof(int32_t)};
-  }
-  return TansTableStaging{0, 0};
-}
-
-// The pointer every table lookup goes through. With USE_SHARED_TABLE the whole
-// table is copied into the block's shared memory first (one pass over
-// `smem_words` words, the threads of the block in stride) and every thread then
-// returns the shared pointer; without it this is the global pointer and compiles
-// to nothing. Both kernels call it *before* their `b >= size0` early return,
-// because the barrier inside has to be reached by every thread of the block.
-template <bool USE_SHARED_TABLE>
-inline __device__ const int32_t* tans_stage_table(const int32_t* __restrict__ tables_data,
-                                                  int32_t* smem, int64_t smem_words) {
-  if constexpr (USE_SHARED_TABLE) {
-    for (int64_t k = (int64_t)threadIdx.x; k < smem_words; k += (int64_t)blockDim.x) {
-      smem[k] = tables_data[k];
-    }
-    __syncthreads();
-    return smem;
-  } else {
-    (void)smem;
-    (void)smem_words;
-    return tables_data;
-  }
-}
-
-}  // namespace
+// The warp-level interleaved kernels, and the launch configuration / table
+// staging plumbing they share with the single-lane kernels below. It lives in
+// that header rather than here because the warp kernels need the very same
+// staging helper and its templates are parsed before this file's body:
+//   * `tans_warp_num_threads_per_block` / `TANS_WARP_BLOCK_THREADS_DEFAULT`
+//     (TORCH_ANS_TANS_WARP_BLOCK_THREADS) - the group-per-row launch shape;
+//   * `tans_num_threads_per_block` / `TANS_BLOCKS_TARGET` /
+//     `TANS_MAX_THREADS_PER_BLOCK` (TORCH_ANS_TANS_BLOCK_THREADS) - the
+//     one-thread-per-row shape the comment there carries the measurements for;
+//   * `tans_table_staging` / `TANS_SMEM_BUDGET_DEFAULT`
+//     (TORCH_ANS_TANS_SMEM_BUDGET) and `tans_stage_table` - whole-table-or-
+//     nothing shared-memory staging, used by both families.
+#include "tans_warp_cuda.cuh"
 
 // ---------------------------------------------------------------------------
 // push
@@ -179,15 +86,18 @@ __global__ void tans_push_indexed_cuda_kernel(
   const int64_t num_dists,
   const int64_t smem_table_words)
 {
-  // Single lane: the interleaved variants stay CPU-only for now (see the file
-  // header), and the wrapper never routes them here.
+  // This is the one-thread-per-row path; the interleaved variants are the
+  // warp-level kernels in tans_warp_cuda.cuh, which the launcher below routes to
+  // *before* building a launch (the `if constexpr` there is what keeps this
+  // specialisation from being instantiated for NUM_INTERLEAVES > 1).
   static_assert(NUM_INTERLEAVES == 1,
-                "the tANS CUDA kernels are single-lane; interleaved tANS is CPU-only for now");
+                "tans_push_indexed_cuda_kernel codes a single lane; num_interleaves > 1 "
+                "is handled by the warp-level kernels in tans_warp_cuda.cuh");
   constexpr int64_t NUM_STATES = (int64_t)NUM_INTERLEAVES;
   constexpr int64_t LANE = 0;
 
   extern __shared__ char tans_smem_raw[];
-  const int32_t* const tables = tans_stage_table<USE_SHARED_TABLE>(
+  const int32_t* const tables = tans_warp::tans_stage_table<USE_SHARED_TABLE>(
       tables_data, reinterpret_cast<int32_t*>(tans_smem_raw), smem_table_words);
 
   const int64_t b = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
@@ -270,13 +180,16 @@ __global__ void tans_pop_indexed_cuda_kernel(
   const int64_t num_dists,
   const int64_t smem_table_words)
 {
+  // See tans_push_indexed_cuda_kernel: single lane here, the warp-level kernels
+  // in tans_warp_cuda.cuh handle num_interleaves > 1.
   static_assert(NUM_INTERLEAVES == 1,
-                "the tANS CUDA kernels are single-lane; interleaved tANS is CPU-only for now");
+                "tans_pop_indexed_cuda_kernel codes a single lane; num_interleaves > 1 "
+                "is handled by the warp-level kernels in tans_warp_cuda.cuh");
   constexpr int64_t NUM_STATES = (int64_t)NUM_INTERLEAVES;
   constexpr int64_t LANE = 0;
 
   extern __shared__ char tans_smem_raw[];
-  const int32_t* const tables = tans_stage_table<USE_SHARED_TABLE>(
+  const int32_t* const tables = tans_warp::tans_stage_table<USE_SHARED_TABLE>(
       tables_data, reinterpret_cast<int32_t*>(tans_smem_raw), smem_table_words);
 
   const int64_t b = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
@@ -387,40 +300,52 @@ void tans_push_indexed_cuda(
   // launch with a foreign device's stream fails with "invalid resource handle".
   const ta::DeviceGuard device_guard(ta::device_index(stream));
 
-  TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "tans_push_indexed_cuda", [&] {
-    const int64_t batch_size = stream.size(0);
-    const TansTableStaging staging = tans_table_staging(tables);
-    const int num_threads_per_block = tans_num_threads_per_block(batch_size);
-    const int num_blocks = (int)((batch_size + num_threads_per_block - 1) /
-                                 num_threads_per_block);
-    const cudaStream_t cuda_stream = ta::current_stream(stream);
+  if constexpr (NUM_INTERLEAVES > 1) {
+    // num_interleaves > 1 is the warp-level path: one lane group codes one row
+    // and produces the same payload bytes as the CPU interleaved kernel (see
+    // tans_warp_cuda.cuh). The `if constexpr` is also what keeps the ILV == 1
+    // specialisation of that launcher - and the "> 1" static_assert it carries -
+    // from being instantiated.
+    return tans_warp::tans_warp_push_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE,
+                                                  NUM_INTERLEAVES>(
+        stream, symbols, indexes, tables, cdfs_sizes, offsets, freq_precision,
+        bypass_coding, bypass_precision);
+  } else {
+    TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "tans_push_indexed_cuda", [&] {
+      const int64_t batch_size = stream.size(0);
+      const tans_warp::TansTableStaging staging = tans_warp::tans_table_staging(tables);
+      const int num_threads_per_block = tans_warp::tans_num_threads_per_block(batch_size);
+      const int num_blocks = (int)((batch_size + num_threads_per_block - 1) /
+                                   num_threads_per_block);
+      const cudaStream_t cuda_stream = ta::current_stream(stream);
 
-    const int32_t* const tables_data = ta::const_data_ptr<int32_t>(tables);
-    const int64_t tables_row_stride = tables.stride(0);
-    const int64_t num_dists = tables.size(0);
+      const int32_t* const tables_data = ta::const_data_ptr<int32_t>(tables);
+      const int64_t tables_row_stride = tables.stride(0);
+      const int64_t num_dists = tables.size(0);
 
-    // Two instantiations so that the staged path costs nothing when it is not
-    // used (the staging decision is a runtime one - the table size is only known
-    // with the tensors - but the per-symbol code must not carry the select).
-    if (staging.words > 0) {
-      tans_push_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, true, NUM_INTERLEAVES>
-          <<<num_blocks, num_threads_per_block, staging.bytes, cuda_stream>>>(
-              ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
-              ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
-              ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
-              (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
-              staging.words);
-    } else {
-      tans_push_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, false, NUM_INTERLEAVES>
-          <<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
-              ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
-              ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
-              ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
-              (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
-              0);
-    }
-    TA_CUDA_CHECK(cudaGetLastError());
-  });
+      // Two instantiations so that the staged path costs nothing when it is not
+      // used (the staging decision is a runtime one - the table size is only known
+      // with the tensors - but the per-symbol code must not carry the select).
+      if (staging.words > 0) {
+        tans_push_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, true, NUM_INTERLEAVES>
+            <<<num_blocks, num_threads_per_block, staging.bytes, cuda_stream>>>(
+                ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
+                ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
+                ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
+                (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
+                staging.words);
+      } else {
+        tans_push_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, false, NUM_INTERLEAVES>
+            <<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
+                ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
+                ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
+                ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
+                (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
+                0);
+      }
+      TA_CUDA_CHECK(cudaGetLastError());
+    });
+  }
 }
 
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES>
@@ -452,67 +377,118 @@ ta::Tensor tans_pop_indexed_cuda(
   // See tans_push_indexed_cuda: the launch target has to be the current device.
   const ta::DeviceGuard device_guard(ta::device_index(stream));
 
-  TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "tans_pop_indexed_cuda", [&] {
-    const int64_t batch_size = stream.size(0);
-    const TansTableStaging staging = tans_table_staging(tables);
-    const int num_threads_per_block = tans_num_threads_per_block(batch_size);
-    const int num_blocks = (int)((batch_size + num_threads_per_block - 1) /
-                                 num_threads_per_block);
-    const cudaStream_t cuda_stream = ta::current_stream(stream);
+  if constexpr (NUM_INTERLEAVES > 1) {
+    // See tans_push_indexed_cuda: num_interleaves > 1 is the warp-level path.
+    return tans_warp::tans_warp_pop_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE,
+                                                 NUM_INTERLEAVES>(
+        stream, indexes, tables, cdfs_sizes, offsets, freq_precision, bypass_coding,
+        bypass_precision);
+  } else {
+    TA_DISPATCH_INTEGRAL(indexes.scalar_type(), "tans_pop_indexed_cuda", [&] {
+      const int64_t batch_size = stream.size(0);
+      const tans_warp::TansTableStaging staging = tans_warp::tans_table_staging(tables);
+      const int num_threads_per_block = tans_warp::tans_num_threads_per_block(batch_size);
+      const int num_blocks = (int)((batch_size + num_threads_per_block - 1) /
+                                   num_threads_per_block);
+      const cudaStream_t cuda_stream = ta::current_stream(stream);
 
-    symbols = ta::zeros_like(indexes);
+      symbols = ta::zeros_like(indexes);
 
-    const int32_t* const tables_data = ta::const_data_ptr<int32_t>(tables);
-    const int64_t tables_row_stride = tables.stride(0);
-    const int64_t num_dists = tables.size(0);
+      const int32_t* const tables_data = ta::const_data_ptr<int32_t>(tables);
+      const int64_t tables_row_stride = tables.stride(0);
+      const int64_t num_dists = tables.size(0);
 
-    if (staging.words > 0) {
-      tans_pop_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, true, NUM_INTERLEAVES>
-          <<<num_blocks, num_threads_per_block, staging.bytes, cuda_stream>>>(
-              ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
-              ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
-              ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
-              (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
-              staging.words);
-    } else {
-      tans_pop_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, false, NUM_INTERLEAVES>
-          <<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
-              ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
-              ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
-              ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
-              (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
-              0);
-    }
-    TA_CUDA_CHECK(cudaGetLastError());
-  });
+      if (staging.words > 0) {
+        tans_pop_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, true, NUM_INTERLEAVES>
+            <<<num_blocks, num_threads_per_block, staging.bytes, cuda_stream>>>(
+                ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
+                ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
+                ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
+                (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
+                staging.words);
+      } else {
+        tans_pop_indexed_cuda_kernel<TANS_STATE_TYPE, TANS_STREAM_TYPE, scalar_t, false, NUM_INTERLEAVES>
+            <<<num_blocks, num_threads_per_block, 0, cuda_stream>>>(
+                ta::view2<int32_t>(stream), ta::view2<scalar_t>(symbols),
+                ta::view2<scalar_t>(indexes), tables_data, tables_row_stride,
+                ta::view1<scalar_t>(cdfs_sizes), ta::view1<scalar_t>(offsets),
+                (int)freq_precision, bypass_coding, (int)bypass_precision, num_dists,
+                0);
+      }
+      TA_CUDA_CHECK(cudaGetLastError());
+    });
+  }
 
   return symbols;
 }
 
 // ---------------------------------------------------------------------------
-// Instantiations required by the bindings in rans_bindings.hpp.
+// Instantiations required by the bindings in ans_bindings.hpp.
 // ---------------------------------------------------------------------------
 // The wrappers in tans.hpp only see the declarations above, so every bound
 // family needs an explicit instantiation definition here - the same reason as
 // the rANS blocks above and the tANS CPU blocks in tans_cpu.cpp (see
-// rans_build_config.hpp). Only the single-lane variant is instantiated: the
-// interleaved tANS kernels do not exist yet and `tans_push` / `tans_pop` reject
-// them with an explanation before reaching a CUDA launcher (the `if constexpr`
-// there is what keeps the ILV > 1 specialisations from being referenced).
-#define TORCH_ANS_TANS_CUDA_INST_FAMILY(STATE, STREAM) \
-  TORCH_ANS_INST_TANS_PUSH_CUDA(STATE, STREAM, 1); \
-  TORCH_ANS_INST_TANS_POP_CUDA(STATE, STREAM, 1)
+// ans_build_config.hpp). The interleave factors stay behind the shared
+// TORCH_ANS_WITH_INTERLEAVE_* gates, so an incremental build compiles only the
+// requested subset, exactly like the CPU side.
+//
+// The warp-level kernels need no instantiation macro of their own: for
+// NUM_INTERLEAVES > 1 the body of `tans_push_indexed_cuda` /
+// `tans_pop_indexed_cuda` returns `tans_warp::tans_warp_*_indexed_cuda<...>`,
+// whose definition is in the header included above - instantiating the caller
+// instantiates the callee. A missing interleave instantiation would otherwise
+// be an undefined symbol at link time (which is how ans_build_config.hpp
+// describes the failure mode).
+#define TORCH_ANS_TANS_CUDA_INST_ILV(STATE, STREAM, ILV) \
+  TORCH_ANS_INST_TANS_PUSH_CUDA(STATE, STREAM, ILV); \
+  TORCH_ANS_INST_TANS_POP_CUDA(STATE, STREAM, ILV)
 
 #if TORCH_ANS_WITH_TANS32
-TORCH_ANS_TANS_CUDA_INST_FAMILY(uint32_t, uint16_t);
+TORCH_ANS_TANS_CUDA_INST_ILV(uint32_t, uint16_t, 1);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+TORCH_ANS_TANS_CUDA_INST_ILV(uint32_t, uint16_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+TORCH_ANS_TANS_CUDA_INST_ILV(uint32_t, uint16_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+TORCH_ANS_TANS_CUDA_INST_ILV(uint32_t, uint16_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+TORCH_ANS_TANS_CUDA_INST_ILV(uint32_t, uint16_t, 32);
+#  endif
 #endif
 
 #if TORCH_ANS_WITH_TANS16
-TORCH_ANS_TANS_CUDA_INST_FAMILY(uint16_t, uint8_t);
+TORCH_ANS_TANS_CUDA_INST_ILV(uint16_t, uint8_t, 1);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+TORCH_ANS_TANS_CUDA_INST_ILV(uint16_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+TORCH_ANS_TANS_CUDA_INST_ILV(uint16_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+TORCH_ANS_TANS_CUDA_INST_ILV(uint16_t, uint8_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+TORCH_ANS_TANS_CUDA_INST_ILV(uint16_t, uint8_t, 32);
+#  endif
 #endif
 
 #if TORCH_ANS_WITH_TANS8
-TORCH_ANS_TANS_CUDA_INST_FAMILY(uint8_t, uint8_t);
+TORCH_ANS_TANS_CUDA_INST_ILV(uint8_t, uint8_t, 1);
+#  if TORCH_ANS_WITH_INTERLEAVE_2
+TORCH_ANS_TANS_CUDA_INST_ILV(uint8_t, uint8_t, 2);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_4
+TORCH_ANS_TANS_CUDA_INST_ILV(uint8_t, uint8_t, 4);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_8
+TORCH_ANS_TANS_CUDA_INST_ILV(uint8_t, uint8_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+TORCH_ANS_TANS_CUDA_INST_ILV(uint8_t, uint8_t, 32);
+#  endif
 #endif
 
-#undef TORCH_ANS_TANS_CUDA_INST_FAMILY
+#undef TORCH_ANS_TANS_CUDA_INST_ILV

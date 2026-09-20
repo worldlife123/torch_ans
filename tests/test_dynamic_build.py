@@ -109,7 +109,7 @@ def test_cuda_build_defines_with_cuda_for_nvcc(monkeypatch):
 def test_incremental_defines_reach_cxx_and_nvcc(monkeypatch):
     # The TORCH_ANS_WITH_* gates of an incremental build must be seen by the
     # CUDA sources too (rans_cuda.cu uses the same gates), and a full build must
-    # pass none of them so every gate in rans_build_config.hpp stays at 1.
+    # pass none of them so every gate in ans_build_config.hpp stays at 1.
     pytest.importorskip("torch")
     import torch_ans._dynamic_build as db
 

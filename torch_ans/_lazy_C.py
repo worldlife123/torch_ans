@@ -15,7 +15,7 @@ This module is the *shim* half of `torch_ans._C`:
 Nothing is compiled until an attribute is accessed (which builds the *full*
 module, the historical behaviour) or :func:`ensure_module` is called with a
 build profile, which compiles only the operators that profile needs (see
-torch_ans/_dynamic_build.py and rans_build_config.hpp).
+torch_ans/_dynamic_build.py and ans_build_config.hpp).
 
 Any already loaded module that exports everything a request asks for is reused,
 so the full build satisfies every profile and creating a second interface with

@@ -183,7 +183,7 @@ def _invcdf_op_names(family, num_interleaves):
 
 
 # (impl family, num_interleaves) -> operator names, mirroring the gated
-# bindings in torch_ans/rans_bindings.hpp. The keys double as the validation of
+# bindings in torch_ans/ans_bindings.hpp. The keys double as the validation of
 # what each impl supports. The names are historical: the tables cover every
 # family, rANS and tANS alike.
 RANS_IMPL_OP_NAMES = {
@@ -1093,21 +1093,24 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
                     `freq_precision`; symbol lookup is a single table access instead
                     of a search. The three tANS families differ only in the state /
                     stream word width (uint32+uint16, uint16+uint8, uint8+uint8) and
-                    share their tables. tANS codes on the CPU and on CUDA: the CPU
-                    kernels support `num_interleaves` 1/2/4/8 (one state per lane on
-                    top of the bit buffer the lanes share, like rANS), the CUDA ones
-                    are single-lane (an interleaved tANS interface on a CUDA device
-                    raises). The table itself is always built on the host and moved
-                    to the coding device; `inverse_cdf_precision` /
-                    `alias_sampling` do not apply (the tANS table is the lookup).
+                    share their tables. tANS codes on the CPU and on CUDA, with
+                    `num_interleaves` 1/2/4/8 (one state per lane on top of the bit
+                    buffer the lanes share, like rANS) and 32 - the full-warp group of
+                    the CUDA interleaved kernels, which the CPU kernels implement too.
+                    Both devices produce the same interleaved payload, so a stream can
+                    be coded on one and decoded on the other. The table itself is
+                    always built on the host and moved to the coding device;
+                    `inverse_cdf_precision` / `alias_sampling` do not apply (the tANS
+                    table is the lookup).
         bypass_coding (bool): Enable bypass coding for out-of-range symbols. 
                               This may not be supported in all implementations, or may reduce throughput!
         bypass_precision (int): Precision for bypass coding.
         num_parallel_states (int, optional): Number of parallel ANS states. Or leave it None to use batch size of the input tensor as parallel states.
         num_interleaves (int): Number of interleaved ANS states per stream (1, 2, 4, 8, or 32).
-                               32 uses the warp-level CUDA interleaved kernels on GPU (rans32_16 only) and is
-                               not available for the tANS families (single-lane on CUDA, CPU-only interleaved);
-                               interleaved streams are bit-compatible between CPU and GPU implementations.
+                               32 uses the warp-level CUDA interleaved kernels where those exist
+                               (rans32_16, and every tANS family); each such stream is a full warp
+                               group on the device, and interleaved streams are bit-compatible
+                               between the CPU and the GPU implementations.
         num_bytes_code_length (int): Number of bytes allocated for code length in serialization.
         inverse_cdf_precision (int or "auto", optional): Enables inverse-CDF symbol lookup
                                                with a table of 2**inverse_cdf_precision
@@ -1201,7 +1204,7 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self.freq_precision = min(self.freq_precision, precision_cap)
 
         # The supported (impl family, num_interleaves) combinations mirror the
-        # gated bindings in torch_ans/rans_bindings.hpp. Validating them before
+        # gated bindings in torch_ans/ans_bindings.hpp. Validating them before
         # the native module is resolved keeps an unsupported configuration from
         # triggering a build of a module that cannot provide it.
         impl_key = (base_impl, self.num_interleaves)
@@ -1251,16 +1254,10 @@ class TorchANSInterface(TorchEntropyCoderBaseInterface):
         self._incremental_compile = incremental_compile
         self._configured_invcdf_decode = use_invcdf_decode
 
-        # The CUDA tANS kernels are single-lane, so an interleaved tANS interface
-        # on a GPU device would only fail at the first push. The C++ wrapper has
-        # the same check as the second line of defence; this one runs before the
-        # native module is resolved, i.e. before a build that could not help.
-        if self._is_tans and self.num_interleaves > 1 and _requests_cuda(self.device):
-            raise NotImplementedError(
-                f"interleaved tANS ({self.impl}, num_interleaves="
-                f"{self.num_interleaves}) is CPU-only for now; use num_interleaves=1 "
-                f"on CUDA, keep the interface on the CPU, or use impl=\"rans32_16\" "
-                f"with num_interleaves=32")
+        # tANS interleaving is implemented on both devices (1/2/4/8, and 32 for
+        # the CUDA full-warp group), and the two write the same payload bytes, so
+        # an interleaved tANS interface needs no device check here any more: the
+        # wrapper routes to tans_cpu.cpp or to tans_cuda.cu's warp kernels.
 
         # Stream-capacity contract: this interface owns the capacity of the streams
         # it codes, so the native push does not have to read the stream's length

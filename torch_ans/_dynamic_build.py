@@ -21,18 +21,18 @@ from typing import Dict, List, Optional, Tuple
 # Incremental build profiles
 #
 # A profile is the operator subset a single TorchANSInterface instance needs.
-# It maps to (a) the preprocessor gates in torch_ans/rans_build_config.hpp
+# It maps to (a) the preprocessor gates in torch_ans/ans_build_config.hpp
 # (profile_defines), (b) the JIT module name/build directory
 # (profile_module_name) and (c) the operators the built module must export,
 # which is also what a pre-existing module is checked against before it is
 # reused (profile_op_names). The three must agree with the gated bindings in
-# torch_ans/rans_bindings.hpp.
+# torch_ans/ans_bindings.hpp.
 # ---------------------------------------------------------------------------
 
 #: Environment variable that turns incremental compilation off (``0``/``false``).
 INCREMENTAL_ENV_VAR = "TORCH_ANS_INCREMENTAL_COMPILE"
 
-#: family -> the macro that enables it, see rans_build_config.hpp
+#: family -> the macro that enables it, see ans_build_config.hpp
 FAMILY_MACROS = {
     "rans64": "TORCH_ANS_WITH_RANS64",
     "rans32": "TORCH_ANS_WITH_RANS32",
@@ -58,20 +58,22 @@ FAMILY_TAGS = {
 OP_SUFFIX = {1: "", 2: "_i2", 4: "_i4", 8: "_i8", 32: "_i32"}
 
 #: interleave factors supported per family, and those with alias / inverse-CDF
-#: variants (32-way interleaving is rans32_16-only and has no alias binding).
+#: variants (32-way has no alias binding).
 #:
-#: tANS has no 32-way variant either (that one is the CUDA warp path, and the
-#: interleaved tANS kernels do not exist on the device yet - CUDA tANS is
-#: single-lane); 1/2/4/8 give it one state per lane on top of the bit buffer the
-#: lanes share, exactly like the rANS families. It has neither lookup variant -
-#: the tANS table *is* the lookup - so both tuples are empty.
+#: 32-way is the full-warp group of the CUDA warp kernels: rans32_16 (whose
+#: ballot/prefix scheme relies on its uint32/uint16 configuration) and now the
+#: three tANS families, whose warp kernels accept it like 2/4/8 (tans_warp_cuda.cuh)
+#: - and, like the rANS one, it has CPU kernels too, so the gated operator set is
+#: the same on both devices. 1/2/4/8 give tANS one state per lane on top of the
+#: bit buffer the lanes share, exactly like the rANS families. tANS has neither
+#: lookup variant - the tANS table *is* the lookup - so both tuples are empty.
 SUPPORTED_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),
     "rans32": (1, 2, 4, 8),
     "rans32_16": (1, 2, 4, 8, 32),
-    "tans32": (1, 2, 4, 8),
-    "tans16": (1, 2, 4, 8),
-    "tans8": (1, 2, 4, 8),
+    "tans32": (1, 2, 4, 8, 32),
+    "tans16": (1, 2, 4, 8, 32),
+    "tans8": (1, 2, 4, 8, 32),
 }
 ALIAS_INTERLEAVES = {
     "rans64": (1, 2, 4, 8),
@@ -101,7 +103,7 @@ COMMON_OPS = (
     "rans_build_inverse_cdf",
     # tANS: both directions of the table in one host-side op, shared by all three
     # tANS families (the table only depends on the cdf and table_log), so it is
-    # part of every build - see rans_build_config.hpp.
+    # part of every build - see ans_build_config.hpp.
     "tans_build_tables",
 )
 
@@ -151,7 +153,7 @@ def profile_defines(profile: Optional[BuildProfile]) -> Dict[str, int]:
     """Preprocessor defines that select the operators of ``profile``.
 
     ``None`` is the full build and needs no defines: without
-    ``TORCH_ANS_INCREMENTAL_BUILD`` every gate in rans_build_config.hpp
+    ``TORCH_ANS_INCREMENTAL_BUILD`` every gate in ans_build_config.hpp
     defaults to 1.
     """
     if profile is None:

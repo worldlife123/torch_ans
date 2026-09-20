@@ -20,16 +20,18 @@
 //
 // Unlike rANS there is no alias-sampling and no inverse-CDF variant (both are
 // rANS lookups that tANS replaces with its own table). Interleaving *is*
-// implemented (1/2/4/8 lanes), and it mirrors the rANS structure: one state per
-// lane, sharing the single bit buffer the fixed-width tANS state cannot replace
-// - see tans_utils.hpp for the header layout and tans_cpu.cpp for the lane order
-// (lane == symbol index % NUM_INTERLEAVES, like rANS).
+// implemented (1/2/4/8 lanes, and 32 for the CUDA warp path), and it mirrors the
+// rANS structure: one state per lane, sharing the single bit buffer the
+// fixed-width tANS state cannot replace - see tans_utils.hpp for the header
+// layout and tans_cpu.cpp for the lane order (lane == symbol index %
+// NUM_INTERLEAVES, like rANS).
 //
 // The wrappers below are the only dispatch point between the devices, exactly
 // like rans_push / rans_pop: a CPU stream goes to tans_cpu.cpp, a CUDA one to
-// tans_cuda.cu (single-lane only - the interleaved variants are still CPU-only
-// and say so). Both directions produce the same bytes for the same
-// (table, table_log), so a stream can be coded on either device.
+// tans_cuda.cu - which routes 1 interleave to its one-thread-per-row kernel and
+// 2/4/8/32 to the warp-level interleaved kernels in tans_warp_cuda.cuh. All of
+// them produce the same bytes for the same (table, table_log, num_interleaves),
+// so a stream can be coded on either device and in either binary.
 
 #include "ta/torch_api.hpp"
 
@@ -41,7 +43,7 @@
 #include <tuple>
 #include <vector>
 
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 #include "stream_capacity.hpp"
 #include "tans_utils.hpp"
 
@@ -97,8 +99,9 @@ ta::Tensor tans_pop_indexed_cpu(
 // ---------------------------------------------------------------------------
 // Same signatures as the CPU ones on purpose: the two are one algorithm over
 // two memories, and the wrappers below pick between them by tensor device only.
-// The single `NUM_INTERLEAVES=1` specialisation is instantiated there - an
-// interleaved tANS operand never reaches the device.
+// Every supported interleave factor is instantiated there: 1 codes a row with
+// one thread, 2/4/8/32 with one lane group per row (tans_warp_cuda.cuh), both
+// writing the CPU interleaved payload byte for byte.
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE, size_t NUM_INTERLEAVES=1>
 void tans_push_indexed_cuda(
   ta::Tensor stream,
@@ -212,30 +215,21 @@ void tans_push(// tANS stream
 
   if (ta::is_cuda(stream)) {
 #if TA_WITH_CUDA
-    // The interleaved tANS kernels are still CPU-only; this is the one place
-    // that knows it, and `if constexpr` is what keeps the ILV > 1 specialisations
-    // from being referenced (tans_cuda.cu instantiates the single lane only -
-    // a plain `if` would be an undefined symbol at link time).
-    if constexpr (NUM_INTERLEAVES > 1) {
-      STD_TORCH_CHECK(false,
-                      "tans_push: interleaved tANS is CPU-only for now (num_interleaves=",
-                      (int64_t)NUM_INTERLEAVES, "); move the tensors to the CPU, use "
-                      "num_interleaves=1 on CUDA, or use impl=\"rans32_16\" with "
-                      "num_interleaves=32, whose warp-level CUDA kernels are "
-                      "implemented.");
-    } else {
-      // The tensors must live on the device `stream` lives on; `.cuda()` used to
-      // mean "the current device", which is the same thing here because use_cuda
-      // is derived from stream itself (see rans_push).
-      const ta::Device device = ta::device_of(stream);
-      return tans_push_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
-        ta::as_contiguous(ta::to(stream, device)), ta::as_contiguous(ta::to(symbols, device)),
-        ta::as_contiguous(ta::to(indexes.value(), device)),
-        ta::as_contiguous(ta::to(tables.value(), device)),
-        ta::as_contiguous(ta::to(cdfs_sizes.value(), device)),
-        ta::as_contiguous(ta::to(offsets_tensor, device)),
-        freq_precision, bypass_coding, bypass_precision);
-    }
+    // The tensors must live on the device `stream` lives on; `.cuda()` used to
+    // mean "the current device", which is the same thing here because use_cuda
+    // is derived from stream itself (see rans_push).
+    // num_interleaves > 1 needs no branch here: the launcher routes it to the
+    // warp-level kernels (tans_warp_cuda.cuh), which write the same payload as
+    // the CPU interleaved path - and it is the launcher's `if constexpr` that
+    // keeps an uninstantiated interleave factor from being referenced.
+    const ta::Device device = ta::device_of(stream);
+    return tans_push_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
+      ta::as_contiguous(ta::to(stream, device)), ta::as_contiguous(ta::to(symbols, device)),
+      ta::as_contiguous(ta::to(indexes.value(), device)),
+      ta::as_contiguous(ta::to(tables.value(), device)),
+      ta::as_contiguous(ta::to(cdfs_sizes.value(), device)),
+      ta::as_contiguous(ta::to(offsets_tensor, device)),
+      freq_precision, bypass_coding, bypass_precision);
 #else
     STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif
@@ -289,25 +283,16 @@ ta::Tensor tans_pop(// tANS stream
 
   if (ta::is_cuda(stream)) {
 #if TA_WITH_CUDA
-    // See tans_push: the interleaved kernels do not exist on CUDA, and the
-    // `if constexpr` keeps their specialisations out of the link.
-    if constexpr (NUM_INTERLEAVES > 1) {
-      STD_TORCH_CHECK(false,
-                      "tans_pop: interleaved tANS is CPU-only for now (num_interleaves=",
-                      (int64_t)NUM_INTERLEAVES, "); move the stream to the CPU, use "
-                      "num_interleaves=1 on CUDA, or use impl=\"rans32_16\" with "
-                      "num_interleaves=32, whose warp-level CUDA kernels are "
-                      "implemented.");
-    } else {
-      const ta::Device device = ta::device_of(stream);
-      return tans_pop_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
-        ta::as_contiguous(ta::to(stream, device)),
-        ta::as_contiguous(ta::to(indexes.value(), device)),
-        ta::as_contiguous(ta::to(tables.value(), device)),
-        ta::as_contiguous(ta::to(cdfs_sizes.value(), device)),
-        ta::as_contiguous(ta::to(offsets_tensor, device)),
-        freq_precision, bypass_coding, bypass_precision);
-    }
+    // See tans_push: the interleaved path is the warp-level kernel the launcher
+    // routes to, and it is bit-compatible with the CPU's.
+    const ta::Device device = ta::device_of(stream);
+    return tans_pop_indexed_cuda<TANS_STATE_TYPE, TANS_STREAM_TYPE, NUM_INTERLEAVES>(
+      ta::as_contiguous(ta::to(stream, device)),
+      ta::as_contiguous(ta::to(indexes.value(), device)),
+      ta::as_contiguous(ta::to(tables.value(), device)),
+      ta::as_contiguous(ta::to(cdfs_sizes.value(), device)),
+      ta::as_contiguous(ta::to(offsets_tensor, device)),
+      freq_precision, bypass_coding, bypass_precision);
 #else
     STD_TORCH_CHECK(false, "torch_ans is not compiled with GPU support!");
 #endif

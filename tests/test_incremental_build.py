@@ -99,9 +99,9 @@ def test_profiles_have_distinct_module_names():
 
 
 def test_profile_gates_exist_in_the_cpp_header():
-    # The Python side and rans_build_config.hpp must not drift apart: a gate
+    # The Python side and ans_build_config.hpp must not drift apart: a gate
     # the header does not know about would silently disable nothing.
-    header = os.path.join(os.path.dirname(utils.__file__), "rans_build_config.hpp")
+    header = os.path.join(os.path.dirname(utils.__file__), "ans_build_config.hpp")
     with open(header) as handle:
         text = handle.read()
     used = set()

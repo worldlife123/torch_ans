@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "rans_utils.hpp"
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 
 // The worst-case stream growth every push shares (rANS and tANS alike); it used
 // to be inline in rans_push below.
@@ -353,6 +353,6 @@ inline ta::Tensor rans_build_inverse_cdf(const ta::Tensor& cdfs, int64_t freq_pr
 
 
 // NOTE: the pybind11 bindings used to be defined here as the
-// TORCH_EXTENSION_RANS_BINDINGS(m) macro. They moved to rans_bindings.hpp,
+// TORCH_EXTENSION_RANS_BINDINGS(m) macro. They moved to ans_bindings.hpp,
 // where they are a regular function and the operator set can be gated by the
-// feature macros in rans_build_config.hpp (a macro body cannot contain #if).
+// feature macros in ans_build_config.hpp (a macro body cannot contain #if).

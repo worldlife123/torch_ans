@@ -24,17 +24,18 @@
 //   TORCH_ANS_WITH_INVCDF
 //       inverse-CDF table pop (`inverse_cdf_precision`)
 //   TORCH_ANS_WITH_TANS32 / _TANS16 / _TANS8
-//       tANS families (interleave 1 always, 2/4/8 behind the shared
-//       TORCH_ANS_WITH_INTERLEAVE_* gates, no 32-way - that one is the CUDA warp
-//       path). The three differ only in the state/stream width, which is also
-//       their freq_precision cap:
+//       tANS families (interleave 1 always, 2/4/8/32 behind the shared
+//       TORCH_ANS_WITH_INTERLEAVE_* gates - 32 is the full-warp group of the CUDA
+//       warp kernels, and it has CPU kernels too, like the rANS 32-way). The
+//       three differ only in the state/stream width, which is also their
+//       freq_precision cap:
 //       tans32 <uint32, uint16> <= 15, tans16 <uint16, uint8> <= 15,
 //       tans8 <uint8, uint8> <= 7. The table builder (tans_build_tables) is
 //       *not* gated: all three share the same int32 tables - see
 //       torch_ans/tans_utils.hpp - so it is part of the common operator set and
 //       is compiled by every build. The gate covers the CPU *and* the CUDA
-//       kernels: single-lane tANS codes CUDA tensors too (tans_cuda.cu), while
-//       the interleaved variants are CPU-only for now.
+//       kernels: one thread codes a row at one lane, a lane group at several
+//       (tans_warp_cuda.cuh).
 //
 // The gate names and the (family, interleave, lookup) combinations they cover
 // are mirrored by the profile helpers in torch_ans/_dynamic_build.py; a gate
@@ -122,7 +123,7 @@
 // Explicit instantiation helpers.
 //
 // The push/pop/init implementations are defined in rans_cpu.cpp / rans_cuda.cu
-// while the pybind wrappers (rans_bindings.hpp) only see their declarations,
+// while the pybind wrappers (ans_bindings.hpp) only see their declarations,
 // so every bound combination needs an explicit instantiation in the
 // translation unit that defines it. This used to be implied by the
 // TORCH_LIBRARY_IMPL blocks taking the address of each specialization. Those
@@ -177,9 +178,11 @@
       const ta::Tensor&, const ta::Tensor&, int64_t, bool, int64_t)
 
 // tANS on CUDA: the same signatures as the CPU ones above (the *launchers* in
-// tans_cuda.cu), instantiated only for the single lane - interleaved tANS is
-// CPU-only for now and `tans_push` / `tans_pop` reject it before reaching a
-// launcher, so no ILV > 1 specialisation is ever referenced.
+// tans_cuda.cu), instantiated per interleave factor behind the same shared
+// TORCH_ANS_WITH_INTERLEAVE_* gates the CPU side uses. The launchers route
+// NUM_INTERLEAVES > 1 to the warp-level kernels in tans_warp_cuda.cuh, whose
+// definitions are visible there - so instantiating the caller instantiates the
+// callee and no separate instantiation macro is needed for them.
 #define TORCH_ANS_INST_TANS_PUSH_CUDA(STATE, STREAM, ILV) \
   template void tans_push_indexed_cuda<STATE, STREAM, ILV>( \
       ta::Tensor, const ta::Tensor&, const ta::Tensor&, \

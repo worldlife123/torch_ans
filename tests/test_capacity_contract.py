@@ -26,18 +26,21 @@ SEQ = 32
 NUM_DISTS = 4
 ALPHABET = 16
 
-#: (family, interleaves) pairs whose CPU push is always compiled; the 32-way
-#: variant is CUDA-only in practice and is covered by the CUDA test below.
+#: (family, interleaves) pairs whose CPU push is always compiled; the rANS 32-way
+#: variant is CUDA-only in practice and is covered by the CUDA test below, while
+#: the tANS 32-way one has CPU kernels (it is the full-warp group of the CUDA
+#: interleaved kernels) and is pinned here.
 #: The tANS families share the *arithmetic* (see stream_capacity.hpp), but their
 #: stream header is `num_interleaves` state words plus the shared bit buffer
 #: instead of just the states, so their initial length word grows differently -
 #: they are worth pinning against Python's `_stream_budget`, at more than one
-#: lane count.
+#: lane count. 32 is the widest header (136 bytes before a single symbol) and the
+#: one where the "one unflushed word per lane" slack term is largest.
 FAMILIES = [("rans64", 1), ("rans64", 4), ("rans32", 1),
             ("rans32_16", 1), ("rans32_16", 4),
             ("tans32", 1), ("tans16", 1), ("tans8", 1),
             ("tans32", 4), ("tans16", 4), ("tans8", 4),
-            ("tans32", 8)]
+            ("tans32", 8), ("tans32", 32), ("tans8", 32)]
 
 
 def _setup(impl="rans64", num_interleaves=1, freq_precision=12, device="cpu", **kwargs):

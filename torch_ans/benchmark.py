@@ -10,9 +10,10 @@ from torch_ans.utils import TorchANSInterface
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 DEFAULT_DEVICES = ["cpu", "cuda"]
 DEFAULT_MODES = ["push", "pop", "both"]
-# (impl, num_interleaves) pairs that torch_ans can build. Interleaved CUDA
-# coding is rans32_16-only and maps to the warp-level kernels (rans_warp_cuda.cuh);
-# the CPU supports the same interleavings via rans_cpu.cpp.
+# (impl, num_interleaves) pairs that torch_ans can build. Interleaved CUDA coding
+# maps to the warp-level kernels (rans_warp_cuda.cuh for rans32_16, and
+# tans_warp_cuda.cuh for the tANS families); the CPU supports the same
+# interleavings via rans_cpu.cpp / tans_cpu.cpp.
 DEFAULT_INTERLEAVES = [1, 4, 32]
 
 

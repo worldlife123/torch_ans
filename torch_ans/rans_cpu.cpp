@@ -10,7 +10,7 @@
 
 #include "rans.hpp"
 #include "rans_utils.hpp"
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 
 template <typename RANS_STATE_TYPE, typename RANS_STREAM_TYPE, size_t RANS_STATE_VALID_BITS>
 ta::Tensor rans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size) 
@@ -718,11 +718,11 @@ ta::Tensor rans_build_inverse_cdf_cpu(const ta::Tensor& cdfs, int64_t freq_preci
 
 
 // ---------------------------------------------------------------------------
-// Instantiations required by the pybind bindings in rans_bindings.hpp.
+// Instantiations required by the pybind bindings in ans_bindings.hpp.
 //
 // The wrappers in rans.hpp only see the declarations of the functions above,
 // so every bound combination needs an explicit instantiation definition here
-// (see rans_build_config.hpp for why these are not just address-takings any
+// (see ans_build_config.hpp for why these are not just address-takings any
 // more). The blocks are gated exactly like the bindings themselves, so an
 // incremental build emits only the requested subset.
 // ---------------------------------------------------------------------------

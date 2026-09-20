@@ -333,9 +333,11 @@ what the shared-memory table staging buys, and which launch block size to defaul
 | tANS kernels | `TORCH_ANS_TANS_SMEM_BUDGET` (staging budget, default 16 KiB/block), `TORCH_ANS_TANS_BLOCK_THREADS` (launch block size, unset = derived from the batch) |
 
 `scripts/bench_tans_vs_rans.py --device cuda` runs the same matrix as the CPU sweep.
-tANS is single-lane on CUDA, so `--interleaves` only adds rANS configurations (the
-`rans32_16` warp path, which is the fastest rANS configuration on the device); the
-other combinations are reported as skipped instead of being measured wrong.
+tANS was single-lane on CUDA when this section was measured, so `--interleaves` only
+added rANS configurations (the `rans32_16` warp path, which is the fastest rANS
+configuration on the device) and the tANS ones were reported as skipped. The interleaved
+tANS kernels have since been added - script and measurements in *Interleaved tANS on
+CUDA* below - so a rerun of the commands in *Reproduce* would measure them here too.
 
 ### tANS vs rANS, 256 distributions (tables in global memory)
 
@@ -539,4 +541,242 @@ done
 
 (`PYTHONPATH=$PWD` is what makes the script measure this working tree rather than an
 installed `torch_ans` - see the script's docstring.)
+
+## Interleaved tANS on CUDA (unreleased)
+
+Measured 2026-09-19 with the warp-level kernels in `torch_ans/tans_warp_cuda.cuh` (see
+`CHANGELOG.md`): `num_interleaves` 2/4/8/32 on the device, one *lane group* per stream
+row, byte-identical to the CPU interleaved kernels (`tests/test_tans.py` compares the
+coded payloads at every interleave factor and cross-decodes). This section answers what
+interleaving buys over one lane, what it does *not* buy against the rANS warp path, and
+what the batch size and the table staging change.
+
+### Environment and method
+
+| item | value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 2080 Ti (sm_75) |
+| torch | 2.4.1+cu118 (`cbench2` environment; nvcc 11.8 via `CUDA_HOME=/usr/local/cuda-11.8`) |
+| workload | 4,194,304 symbols, 64 distributions, `bypass_coding=True`, symbols drawn from the distributions, `parallel_states` ∈ {8, 512, 4096} (i.e. 524288 / 8192 / 1024 symbols per row) |
+| method | high-level API (`TorchANSInterface`), encode + decode, best of 5, `torch.cuda.synchronize()` around every timed call, every configuration round-trip checked before it is timed |
+| tANS knobs | `TORCH_ANS_TANS_SMEM_BUDGET` (staging budget, 16 KiB default - not reached by the 64-distribution tables), `TORCH_ANS_TANS_WARP_BLOCK_THREADS` (unset = derived from the batch and the lane count) |
+| raw results | `benchmarks/tans_interleaved_cuda.json` (this section), `benchmarks/tans_interleaved_cuda_smem_{off,on}.json`, `benchmarks/tans_interleaved_cuda_optimized.json` (the reworked kernels, section below) |
+
+(The older `benchmarks/tans_vs_rans_cuda*.json` files list every `tans* x2/4/8/32` row under
+`skipped` with the reason "interleaved tANS is CPU-only for now" — that was true when they were
+measured, and they are left as they were produced; the numbers in this section replace those
+rows.)
+
+Throughput is Msymbol/s of *symbols* coded (as everywhere in this file); `bits/sym` is in
+the JSONs and is what the row length and the header size show up in: a 32-lane tANS row
+carries a 136-byte header (one state word per lane plus the shared bit buffer), so at
+1024 symbols per row it is ~1.1 bits/symbol of the coded size on its own.
+
+### Interleave gain vs one lane (`tans32`; 64 distributions, table in global memory)
+
+| fp | batch | symbols/row | x1 enc/dec | x2 | x4 | x8 | x32 |
+|---|---|---|---|---|---|---|---|
+| 7 | 8 | 524288 | 19 / 28 | 22 / 35 | 30 / 41 | 30 / 41 | 18 / 21 |
+| 7 | 512 | 8192 | 525 / 855 | 576 / 995 | 677 / 1104 | 705 / 1112 | 634 / 908 |
+| 7 | 4096 | 1024 | 752 / 1122 | 773 / 1167 | 794 / 1183 | 789 / 1167 | 650 / 692 |
+| 10 | 8 | 524288 | 18 / 25 | 21 / 34 | 29 / 41 | 30 / 41 | 19 / 21 |
+| 10 | 512 | 8192 | 511 / 851 | 564 / 999 | 637 / 1092 | 626 / 1121 | 572 / 889 |
+| 10 | 4096 | 1024 | 655 / 1033 | 676 / 1102 | 726 / 1175 | 685 / 1163 | 601 / 676 |
+| 12 | 8 | 524288 | 18 / 25 | 21 / 33 | 29 / 41 | 30 / 40 | 19 / 20 |
+| 12 | 512 | 8192 | 493 / 845 | 538 / 1016 | 610 / 1076 | 628 / 1080 | 553 / 884 |
+| 12 | 4096 | 1024 | 682 / 1095 | 705 / 1146 | 692 / 1167 | 678 / 1165 | 573 / 676 |
+
+`tans16` and `tans8` track `tans32` within a few percent at the same `freq_precision`
+(their state/stream width changes the header and the number of renorm words, not the
+per-symbol table work); at `fp=7` they are, encode / decode (Msymbol/s): `tans16` 19/26,
+21/31, 27/37, 27/34, 18/19 at batch 8; 520/843 → 688/1086 (x4) at batch 512; 702/1101 →
+755/1165 (x8) at batch 4096, and `tans8` within ~2% of `tans16`.
+
+Findings:
+
+- **The gain is largest exactly where one thread per row cannot fill the device.** At 8
+  stream rows, 4 lanes turn 19/28 Msymbol/s into 30/41 (**+54%/+47%**) and 8 lanes into
+  30/41 (**+58%/+44%**); the row is 524288 symbols long, i.e. the machine has 8 serial
+  dependent chains and nothing else to run. Interleaving turns each row into 4-8
+  independent chains within the same warp.
+- **It shrinks as the batch grows** (512 rows: +29%/+29% at 4 lanes, +34%/+30% at 8; 4096
+  rows: ~+6%/+5% at 4-8 lanes), because the device is already busy: there the win is the
+  memory-level parallelism and the coalesced `symbols`/`indexes` loads (consecutive lanes
+  read consecutive elements; the one-thread-per-row kernel reads a row's symbols with
+  row-sized strides), not the extra warps.
+- **32 lanes used to be the wrong choice for tANS - and that was a kernel problem, not a
+  law of nature.** The bit layer is a single sequence the group commits in lane order, so
+  the 32-lane group performed 32 sequential appends per 32 symbols (the per-symbol serial
+  cost of one lane) *and* blew the register budget (229 registers/thread, one 256-thread
+  block per SM). Both are fixed now: see
+  [the 32-lane regression and what fixed it](#the-32-lane-regression-and-what-fixed-it).
+  What stays is the 136-byte header per row at 32 lanes, which is what the `bits/sym`
+  column shows (6.96 vs 5.99 bits/symbol - the coded *size* is ~16% bigger, which is why
+  32 lanes is still not the answer for short rows even after the rework).
+  `tests/test_tans.py` covers 32 lanes at every factor, and it is the only factor whose
+  lane order (lane 31 first on the way out, lane 0 on the way in) differs from the
+  sub-warp ones.
+
+### The 32-lane regression and what fixed it
+
+Measured 2026-09-20 on the same machine and workload, after reworking
+`torch_ans/tans_warp_cuda.cuh` (`benchmarks/tans_interleaved_cuda_optimized.json`;
+`benchmarks/tans_interleaved_cuda.json` is the "before"). µs per 4,194,304 symbols,
+`tans32`, `fp=7`, `bypass_coding=True`:
+
+| batch | direction | x1 before → after | x4 | x8 | x32 |
+|---|---|---|---|---|---|
+| 8 | encode | 219855 → 211094 | 141970 → 126738 | 139446 → 118074 | **228356 → 88000 (2.59×)** |
+| 8 | decode | 148188 → 150503 | 101189 → 88324 | 103180 → 54119 | **203334 → 17548 (11.6×)** |
+| 512 | encode | 7985 → 7763 | 6194 → 5863 | 5952 → 5691 | 6616 → **4963 (1.33×)** |
+| 512 | decode | 4905 → 4919 | 3798 → 3350 | 3771 → 2676 | 4619 → **2126 (2.17×)** |
+| 4096 | encode | 5581 → 5623 | 5285 → 5293 | 5314 → 5258 | 6456 → 6875 (0.94×) |
+| 4096 | decode | 3738 → 3760 | 3547 → 3423 | 3593 → 3407 | 6064 → **3521 (1.72×)** |
+
+Four things were wrong, in the order they mattered:
+
+1. **Registers: the 32-lane pop kernel used 229 registers/thread.**
+   `cuobjdump -res-usage` on the built extension: 8 lanes cost 80-86, 32 lanes 229-232 -
+   i.e. one 256-thread block per SM, 25% occupancy for a kernel that lives on memory
+   latency. The fully unrolled `constexpr_for` serial section was the cause; emitting it
+   as a rolled loop (`tans_warp_roll_serial`, ≥16 lanes) brings it to 42-44 registers and
+   the occupancy back to 100%. That alone was most of the decode regression.
+2. **The shared bit layer was a 64-bit window updated by every lane, N times per group.**
+   At rest the window holds < `STREAM_BITS` bits and one digit is ≤ 15 bits, so ≤ 31 bits
+   are ever live (`TansWarpBitWriter`/`TansWarpBitReader`): a 64-bit shift is a pair of
+   instructions, and it ran N times per symbol group in every lane.
+3. **Two broadcasts per lane where one carries everything.** `tans_warp_pack_lane` puts the
+   low 15 bits of the state (all an append can use: `nb_bits ≤ 15`), `nb_bits`, the
+   validity and the bypass flag in one word, so the serial section costs one `__shfl_sync`
+   per lane instead of two (push) - and the decode fast path none.
+4. **The decode walk itself.** A lane's bits are a function of the prefix sum of the lanes'
+   `nbBits`, so `TansWarpBitWindow` lets every lane *read* its own bits directly (≤2 words
+   for `tans32`, ≤3 for `tans16`/`tans8`) instead of replaying the whole group's takes -
+   the counterpart of rANS' ballot+popc ordering. Groups with a bypass run still walk
+   (their digit count is only discoverable while decoding), and so do 2-lane groups, where
+   there is no chain worth breaking (`tans_warp_parallel_read`).
+
+Push keeps its lane walk, and that is deliberate: the bits have to be *written*, and a
+stream word mixes the bits of several lanes, so no lane owns a word the way it owns a
+read - which is exactly why rANS can get away with ballot+popc (one lane, one whole word).
+The 0.94× at 4096 rows is the coded size, not the walk: 32 lanes write 6.96 bits/symbol
+against 5.99 at one lane.
+
+Also in the same pass, and included in the numbers above: the decoded symbol leaves the
+serial section (one coalescing store per lane instead of N predicated single-lane stores)
+and the head/tail symbols (`num_symbols % N`) are looked up by the owning lane only, which
+removes N-1 redundant table walks per leftover symbol.
+
+**Caveat on the numbers:** this GPU sits at 300 MHz when idle and boosts to 2100 MHz under
+load, so a short run can be ~2.5× slower than a long one. Every table above is one run of
+`best of 5` inside a full matrix run; rANS (untouched) reproduces the old file within 1-3%
+in it, and every 32-lane delta above was reproduced in at least two separate runs.
+
+### Would a per-lane bit buffer be worth it? (evaluated, not implemented)
+
+The remaining structural idea is to give every lane its own bit buffer (its own residual
+and its own payload cursor) instead of one shared one. That is the change which would make
+the lanes fully independent - push included, since each lane would then own whole words and
+could place them the way rANS does with ballot+popc - and it is the only remaining way to
+remove the lane walk entirely.
+
+Cost side, and why it is not being done:
+
+- **It is a format change.** Every interleaved stream's byte string changes, so the
+  CPU↔CUDA byte-string tests and any stream written by an earlier build stop decoding. The
+  header layout (`tans_state_slot` / `tans_bitbuf_slot` / `tans_nbits_slot` in
+  `tans_utils.hpp`) would grow from `4*(N+2)` bytes per row to roughly `4*(2N+2)`, and
+  `tans_cpu.cpp`, `tans_cuda.cu`, `tans_warp_cuda.cuh`, `torch_ans/utils.py`
+  (`_STREAM_SIZES` / `_stream_budget`) and `tests/test_capacity_contract.py` all move with
+  it.
+- **It does not compress better.** N residual buffers each hold up to `STREAM_BITS-1` bits
+  that never reach the payload: at 32 lanes that is up to 60 bytes per row at the end of a
+  stream, i.e. ~0.5 bit/symbol at 1024-symbol rows - on top of the ~1.1 bits/symbol the
+  136-byte header already costs. The shared buffer has one residual, not N.
+- **The upside is now small.** After the rework the walk is not what binds: 32 lanes is the
+  fastest factor at 8 and 512 rows, and at 4096 rows its encode (0.94×) is explained by the
+  coded size, not by the serial section. Expect ≤10-20% on large-batch encode for a format
+  break. Revisit only if a workload wants more than 32 lanes, or if encode at a
+  device-filling batch becomes the target.
+
+### tANS against the rANS warp path (the two device interleaved kernels head to head)
+
+| fp | batch | `tans32` x32 | `rans32_16` x32 | best tANS | its ilv | best tANS / rANS |
+|---|---|---|---|---|---|---|
+| 7 | 8 | 18 / 21 | 227 / 209 | 30 / 41 | x4 | 0.13 / 0.20 |
+| 7 | 512 | 634 / 908 | 1039 / 1986 | 705 / 1112 | x8 | 0.68 / 0.56 |
+| 7 | 4096 | 650 / 692 | 774 / 1213 | 794 / 1183 | x4 | 1.03 / 0.97 |
+| 10 | 8 | 19 / 21 | 226 / 212 | 30 / 41 | x8 | 0.13 / 0.19 |
+| 10 | 512 | 572 / 889 | 925 / 1828 | 626 / 1121 | x8 | 0.68 / 0.61 |
+| 10 | 4096 | 601 / 676 | 665 / 1091 | 726 / 1175 | x4 | 1.09 / 1.08 |
+| 12 | 8 | 19 / 20 | 221 / 210 | 30 / 40 | x8 | 0.13 / 0.19 |
+| 12 | 512 | 553 / 884 | 924 / 1936 | 628 / 1080 | x8 | 0.68 / 0.56 |
+| 12 | 4096 | 573 / 676 | 701 / 1218 | 692 / 1167 | x4 | 0.99 / 0.96 |
+
+- **The rANS warp path is 5-12× faster at a tiny batch, and up to 1.8× at a realistic
+  one.** The reason is structural, not a tuning miss: an interleaved rANS row owns 32
+  independent *words streams* (each lane renormalizes its own words, placed by
+  `__ballot_sync`), so 32 lanes give 32 parallel chains per row; a tANS row shares one bit
+  buffer, so its lanes still funnel through one serial bit sequence - 4-8 lanes is where
+  its table lookups are parallel enough to matter and the serialisation is still cheap.
+- **At 4096 rows the two are within a few percent** (0.96-1.09×), i.e. once the device is
+  saturated the coders are limited by the same thing: tANS spends its per-symbol budget on
+  one table access, rANS on the division/search and its per-lane word flush. On short rows
+  rANS pays ~0.6-0.8 bit/symbol more (32 flushes per row of 4 bytes), which the
+  `bits/sym` column of the JSONs shows.
+- Practical advice: pick `impl="rans32_16", num_interleaves=32` when a rANS-compatible
+  `freq_precision <= 15` is acceptable; pick a tANS family when the table is cheap
+  (small `freq_precision`, few distributions) or when the coded size on short rows
+  matters, and use `num_interleaves=4` or `8` there - it is also the configuration the CPU
+  path benefits from, so the same interface setting is good on both devices.
+
+### Table staging (4 distributions, `fp=7`, alphabet 64: an 8.0 KB table, `--smem-budget 0` vs `131072`)
+
+| impl | ilv | batch | global enc/dec | staged enc/dec | staged/global |
+|---|---|---|---|---|---|
+| `tans32` | 1 | 512 | 455 / 843 | 465 / 850 | 1.02 / 1.01 |
+| `tans32` | 1 | 4096 | 739 / 1124 | 761 / 1105 | 1.03 / 0.98 |
+| `tans32` | 4 | 512 | 630 / 969 | 637 / 972 | 1.01 / 1.00 |
+| `tans32` | 4 | 4096 | 763 / 1192 | 786 / 1202 | 1.03 / 1.01 |
+| `tans32` | 32 | 512 | 508 / 739 | 521 / 765 | 1.03 / 1.04 |
+| `tans32` | 32 | 4096 | 578 / 589 | 611 / 694 | 1.06 / 1.18 |
+| `rans32_16` | 32 | 512 | 972 / 1912 | 1009 / 1985 | 1.04 / 1.04 |
+| `rans32_16` | 32 | 4096 | 722 / 1247 | 738 / 1241 | 1.02 / 1.00 |
+
+- **Staging the whole table is a small win here and never a large loss** (+1-6% encode,
+  +0-18% decode) - the same conclusion the single-lane sweeps above reached, and the warp
+  kernels share the decision (`tans_table_staging` / `tans_stage_table`). The largest gains
+  are at the widest group and the longest rows (32 lanes, 1024-symbol rows: +6%/+18%),
+  i.e. where every lane of a group looks the table up in the same memory and the copy is
+  amortized over the most symbols; the 64-distribution tables of the tables above are far
+  beyond the budget and never stage.
+- The rANS rows move by the same few percent, which is what makes this a staging
+  measurement rather than a coder one: the CDF rows of `rans32_16` are staged by the same
+  budget (A9 in `rans_warp_cuda.cuh`).
+
+### Reproduce
+
+```bash
+# the interleave x quantization-bucket x batch matrix (the tables above)
+PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+    --impl tans32 tans16 tans8 rans32_16 --precision 7 10 12 --alphabet 64 \
+    --dists 64 --symbols 4194304 --interleaves 1 2 4 8 32 \
+    --parallel-states 8 512 4096 --reps 5 \
+    --json benchmarks/tans_interleaved_cuda.json
+
+# the staging A/B for the interleaved kernels (4 distributions, fp=7)
+for budget in 0 131072; do
+  PYTHONPATH=$PWD python scripts/bench_tans_vs_rans.py --device cuda \
+      --impl tans32 rans32_16 --precision 7 --alphabet 64 --dists 4 \
+      --symbols 4194304 --interleaves 1 4 32 --parallel-states 512 4096 --reps 5 \
+      --smem-budget $budget \
+      --json benchmarks/tans_interleaved_cuda_smem_$([ $budget = 0 ] && echo off || echo on).json
+done
+```
+
+The CUDA build these numbers come from is `WITH_CUDA=1 pip install . --no-build-isolation`
+with `CUDA_HOME=/usr/local/cuda-11.8` in the `cbench2` environment, i.e. the same kernels
+`tests/test_tans.py` exercises (96 interleaved cases: byte equality with the CPU at every
+factor, cross-decoding in both directions, bypass, padding indexes, head/tail and partial
+blocks, the staging A/B and the high-level API including the 32-lane capacity contract).
 

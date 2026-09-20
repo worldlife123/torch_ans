@@ -119,9 +119,9 @@ interleaved `rans32_16` coder is `rans32_16_i4_invcdf_pop`.
 - *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
 - *Stream Bits*: Number of bits per stream element. This affects the frequency of overflowed state to be written into/read from bitstream, slightly affecting speed.
 - *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In torch_ans implementation, State Bits > Stream Bits + Max Freq Bits.
-- *Interleaved States*: Number of interleaved states for sequential coding in one step (the `num_interleaves` argument of the family's `rans*_init_stream`). On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, interleaved coding is implemented for `rans32_16` only: `num_interleaves` 2, 4 and 8 map to that many consecutive lanes of a warp (4-lane sub-warp groups for `rans32_16_i4`), and 32 maps the whole stream onto the 32 lanes of a warp using warp-level primitives (`__ballot_sync`/`__shfl_xor_sync`, technique referenced from [Recoil](https://github.com/lin-toto/recoil)), with one shared bitstream cursor per warp. The interleaved `rans64`/`rans32` operators are CPU-only; asking them to code CUDA tensors raises an explicit error instead of returning garbage. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
+- *Interleaved States*: Number of interleaved states for sequential coding in one step (the `num_interleaves` argument of the family's `rans*_init_stream`). On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, interleaved coding is implemented for two kernel families: `rans32_16` (`num_interleaves` 2, 4 and 8 map to that many consecutive lanes of a warp — 4-lane sub-warp groups for `rans32_16_i4` — and 32 maps the whole stream onto the 32 lanes of a warp using warp-level primitives, technique referenced from [Recoil](https://github.com/lin-toto/recoil), with one shared bitstream cursor per warp) and the three tANS families (`tans_warp_cuda.cuh`, one lane group per stream, the bit buffer shared by the lanes). The interleaved `rans64`/`rans32` operators are CPU-only; asking them to code CUDA tensors raises an explicit error instead of returning garbage. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
 - *Symbol Lookup*: The decode-side symbol search. *divided search* is the default (folded into the plain `pop` function); *alias* is the alias-sampling coder (`alias_sampling=True` in the high-level API), which has its own push and pop (`*_alias*_push`/`*_alias*_pop`); *inverse CDF* keeps the plain push and replaces only the decoder (`*_invcdf_pop`, used with `inverse_cdf_precision`).
-- *Device Support*: Which devices each variant is available on (`all` = every interleave factor listed for that row). Interleaved CUDA coding exists for `rans32_16` alone, so the `rans64`/`rans32` interleaved variants are CPU-only there. `num_interleaves=32` exists only for `rans32_16` and has no alias variant.
+- *Device Support*: Which devices each variant is available on (`all` = every interleave factor listed for that row). Interleaved CUDA coding exists for `rans32_16` and for the tANS families, so the `rans64`/`rans32` interleaved variants are CPU-only there. `num_interleaves=32` exists for `rans32_16` and for the tANS families (it is the full-warp group of their CUDA kernels), and has no alias variant.
 - *init_func/push_func/pop_func*: Main API functions for this variant. The init function is always the family's `rans*_init_stream` (`-` reuses the one shown on the family's first row); alias and inverse-CDF variants differ from the family only in the push/pop shown.
 
 In addition to standard and interleaved rANS, two advanced coding types are supported: alias coding and inverse CDF coding. Both are available at every interleave factor their family supports (alias sampling has no 32-way variant), and both can be selected in the high-level API with `alias_sampling=True` and `inverse_cdf_precision` respectively.
@@ -145,26 +145,37 @@ rANS families, selected with `impl="tans32"` / `"tans16"` / `"tans8"`:
 
 | Variant  | State Bits | Stream Bits | Max Freq Bits | Table slots       | Interleaved States | Symbol Lookup     | Device Support            | init_func          | push_func   | pop_func   |
 |----------|------------|-------------|---------------|-------------------|--------------------|-------------------|---------------------------|--------------------|-------------|------------|
-| tans32   | 32         | 16          | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans32_init_stream | tans32_push / tans32_i2_push / ... | tans32_pop / tans32_i2_pop / ... |
-| tans16   | 16         | 8           | 15            | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans16_init_stream | tans16_push / tans16_i2_push / ... | tans16_pop / tans16_i2_pop / ... |
-| tans8    | 8          | 8           | 7             | 2**freq_precision | 1, 2, 4, 8         | tANS spread table | CPU (1/2/4/8), CUDA (1)   | tans8_init_stream  | tans8_push / tans8_i2_push / ... | tans8_pop / tans8_i2_pop / ... |
+| tans32   | 32         | 16          | 15            | 2**freq_precision | 1, 2, 4, 8, 32     | tANS spread table | all                       | tans32_init_stream | tans32_push / tans32_i2_push / ... | tans32_pop / tans32_i2_pop / ... |
+| tans16   | 16         | 8           | 15            | 2**freq_precision | 1, 2, 4, 8, 32     | tANS spread table | all                       | tans16_init_stream | tans16_push / tans16_i2_push / ... | tans16_pop / tans16_i2_pop / ... |
+| tans8    | 8          | 8           | 7             | 2**freq_precision | 1, 2, 4, 8, 32     | tANS spread table | all                       | tans8_init_stream  | tans8_push / tans8_i2_push / ... | tans8_pop / tans8_i2_pop / ... |
 
 The interleaved variants are one state per lane on top of the bit buffer the lanes
-share (see the stream header below), so `num_interleaves=2/4/8` works exactly like
+share (see the stream header below), so `num_interleaves=2/4/8/32` works exactly like
 it does for the rANS families - including `TorchANSInterface(impl="tans32",
 num_interleaves=4)`. Measured on an i7-class machine with `scripts/bench_tans_vs_rans.py`,
 interleaving pays off *more* for tANS than for rANS whenever the table is bigger
 than the cache: up to ~2.6x encode / ~2.2x decode at `freq_precision=15` (8 lanes),
 against ~1.2-1.3x at `freq_precision=7` where the table fits in L2.
 
-On CUDA the same single-lane algorithm runs as `tans_cuda.cu` (one thread per
-stream row, byte-compatible with the CPU kernels), so `TorchANSInterface(impl=
-"tans32", device="cuda")` works out of the box - the table is built on the host
-and moved to the device by `init_params`. The device kernels stage the whole
+On CUDA `tans_cuda.cu` runs the same algorithm in two shapes, byte-compatible with
+the CPU kernels either way, so `TorchANSInterface(impl="tans32", device="cuda")` works
+out of the box - the table is built on the host and moved to the device by
+`init_params`:
+
+- one thread per stream row at `num_interleaves=1`;
+- one **lane group** per stream above it (`tans_warp_cuda.cuh`): the `num_interleaves`
+  lanes of a group code one row, each owning its state while the bit buffer and the
+  payload cursor stay shared - the family's fixed-width state cannot absorb the bits
+  it does not emit. The per-lane table lookups run in parallel and the bits are
+  committed in lane order, so the payload is bit-identical to the CPU's interleaved
+  one (32 is a full warp per row).
+
+The device kernels stage the whole
 lookup table into shared memory when it fits the per-block budget
 (`TORCH_ANS_TANS_SMEM_BUDGET`, 16 KiB by default; `0` disables it), and the
-launch block size is derived from the batch size (`TORCH_ANS_TANS_BLOCK_THREADS`
-overrides it) because one thread codes one row. Measured on an RTX 2080 Ti
+launch block size is derived from the batch size (`TORCH_ANS_TANS_BLOCK_THREADS`,
+and `TORCH_ANS_TANS_WARP_BLOCK_THREADS` for the lane groups) - one thread (or one
+group) codes one row. Measured on an RTX 2080 Ti
 (`scripts/bench_tans_vs_rans.py --device cuda`, 1M symbols, 1024 rows, 256
 distributions, see `benchmark_status.md`): against **single-lane** rANS at the same
 `freq_precision`, single-lane tANS decodes 1.0-1.5x faster at `alphabet >= 64` (up
@@ -181,8 +192,17 @@ paid per block and L1 already serves a table that size) and a real gain for long
 decode**). The 256-distribution sweeps never trigger it. In that same small-table
 regime single-lane tANS decodes 1.15-1.33x faster than single-lane rANS (2.3x with
 long streams), so it is the family to pick when the distributions are few.
-Interleaved tANS is CPU-only for now: a CUDA tensor with `num_interleaves > 1`
-raises with that explanation.
+
+Interleaving on the device is worth it when the *batch* is small - the case where a
+one-thread-per-row kernel cannot fill the machine: over a 64-distribution table in
+global memory (`benchmarks/tans_interleaved_cuda.json`), `tans32` at
+`freq_precision=7` goes from 19.1/28.3 MB/s (encode/decode of symbols) at one lane to
+29.5/41.5 at 4 lanes (**+54%/+47%**) and 30.1/40.7 at 8 lanes (**+58%/+44%**) with 8
+stream rows, and to +29%/+29% (4 lanes) with 512 rows; with 4096 rows it flattens to
+~+6%/+5%, and 32 lanes is only interesting once a row is long enough that its
+136-byte header (34 words: one state per lane plus the shared bit buffer) does not
+dominate the coded size. The rANS warp path is still the fastest option when the
+alphabet allows it - its lanes own their words, so nothing is serialised per symbol.
 
 What is different from rANS:
 
@@ -210,8 +230,8 @@ What is different from rANS:
 - **Bypass coding writes the out-of-range value as raw bits** instead of coding it with a
   uniform tANS table as the reference does; both cost exactly `bypass_precision` bits per digit,
   so out-of-range symbols behave like they do in rANS.
-- **Limits.** `num_interleaves` is 1/2/4/8 on the CPU and 1 on CUDA (an interleaved tANS
-  interface on a device raises an explicit error; the 32-way CUDA warp path is rANS-only), and
+- **Limits.** `num_interleaves` is 1/2/4/8/32 on both devices (32 is the full-warp group of the
+  CUDA interleaved kernels, and the CPU kernels implement it too), and
   there is no `alias_sampling` / `inverse_cdf_precision` variant — the tANS table *is* the symbol
   lookup. Every symbol (plus the bypass sentinel) has to own at least one of the
   `2**freq_precision` table slots, so `alphabet + 1 > 2**freq_precision` cannot be coded.
@@ -545,7 +565,7 @@ On CUDA (RTX 2080 Ti, `rans32_16`, 1024 rows x 4096 symbols, alphabet 255, p=15,
 3. **Interleaved variants boost CPU performance via OoO (Out-of-Order) execution** — with `num_interleaves=4`, the independent rANS states per stream let the out-of-order engine overlap their renormalize/push/pop chains. Measured on an i7-6800K (1M symbols, alphabet 256, 256 distributions, single thread, best-of-5, `scripts/bench_interleaves_cpu.py`):
    - **Encoding: ~1.25-1.4x** with `num_interleaves=4` (1.5x without bypass coding).
    - **Decoding: ~1.8-2.0x** with the default (divided-search) symbol lookup, ~1.4-1.8x with the inverse-CDF table — the table's *absolute* decode throughput is the highest of the two (about 1.2-1.6x better than the divided search at the same `num_interleaves`), it just has less left to gain from interleaving because a single state is already fast.
-   - `num_interleaves=8` performs about the same as 4; `num_interleaves=32` is **not** useful on CPU (encode ~0.8x, register pressure) — it exists for the warp-level CUDA path. **Use 4 (or 8) on CPU.**
+   - `num_interleaves=8` performs about the same as 4; `num_interleaves=32` is **not** useful on CPU (encode ~0.8x, register pressure) — it exists for the warp-level CUDA path (the same holds for the tANS 32-way kernels, whose warp path is the device one). **Use 4 (or 8) on CPU.**
    - The inverse-CDF table (`inverse_cdf_precision="auto"` or an integer) is the fastest CPU decode configuration measured, at every alphabet size and every `num_interleaves`, *provided* the auto precision is used (a dense table is far worse: for 256 distributions it is tens of MB and thrashes the cache). This required removing the data-dependent linear walk that used to close the table's gap — see below.
    - The gains come from the fact that the coder is written to be overlap-friendly — see *Why interleaving helps* below.
 
@@ -789,7 +809,7 @@ per torch at first use, exactly as before (`torch < 2.10` always takes that path
 - Docs and examples for high-level API
 - ~~Fix interleave ANS state on CUDA, and possibly implement with [CUDA Warp-level Primitives](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)~~ Done for `rans32_16_i32` / `rans32_16_i4`: warp-level 32-way (and 4-way sub-warp) interleaved coding on CUDA, bit-compatible with the CPU interleaved streams (see `torch_ans/rans_warp_cuda.cuh`, technique referenced from [Recoil](https://github.com/lin-toto/recoil))
 - ~~Implement lookup table logic in push/pop steps for possible acceleration~~ Done: inverse-CDF lookup with a tunable (dense/sparse/`"auto"`) `2**q` table on CPU and CUDA, warp-level shared-memory staging on CUDA, and a `"auto"` precision heuristic.
-- ~~Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))~~ Done: `impl="tans32" / "tans16" / "tans8"` on the CPU *and* on CUDA (single lane on the device, bit-compatible with the CPU kernels; the interleaved variants 1/2/4/8 are CPU-only), with the FSE-style spread table built by `tans_build_tables`, a bit buffer in the stream header and the same capacity contract / high-level API as rANS (see [tANS](#tans-table-driven-ans)).
+- ~~Implement tANS and its variants with similar high-level API (refer to [FSAR](https://github.com/alipay/Finite_State_Autoregressive_Entropy_Coding))~~ Done: `impl="tans32" / "tans16" / "tans8"` on the CPU *and* on CUDA, bit-compatible with the CPU kernels in both shapes (one thread per row at one lane, one lane group per row at 1/2/4/8/32 - see `torch_ans/tans_warp_cuda.cuh`), with the FSE-style spread table built by `tans_build_tables`, a bit buffer in the stream header and the same capacity contract / high-level API as rANS (see [tANS](#tans-table-driven-ans)).
 - Test other backends supported in PyTorch (such as ROCm)
 - Add more examples such as neural compression
 

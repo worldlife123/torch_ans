@@ -31,12 +31,12 @@ SUPPORTED = {
     "rans64": [1, 2, 4, 8],
     "rans32": [1, 2, 4, 8],
     "rans32_16": [1, 2, 4, 8, 32],
-    "tans32": [1, 2, 4, 8],
-    "tans16": [1, 2, 4, 8],
-    "tans8": [1, 2, 4, 8],
+    "tans32": [1, 2, 4, 8, 32],
+    "tans16": [1, 2, 4, 8, 32],
+    "tans8": [1, 2, 4, 8, 32],
 }
 
-#: freq_precision cap per family (see rans_build_config.hpp / tans_utils.hpp)
+#: freq_precision cap per family (see ans_build_config.hpp / tans_utils.hpp)
 PRECISION_CAPS = {"rans64": 31, "rans32": 23, "rans32_16": 15,
                   "tans32": 15, "tans16": 15, "tans8": 7}
 

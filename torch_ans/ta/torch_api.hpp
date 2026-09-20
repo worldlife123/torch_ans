@@ -14,7 +14,7 @@
 // algorithm core in rans_utils.hpp and for the CPU/CUDA pair).
 //
 // Every source that touches torch goes through this header: rans.hpp,
-// rans_cpu.cpp, rans_cuda.cu, rans_warp_cuda.cuh, rans.cpp, rans_bindings.hpp
+// rans_cpu.cpp, rans_cuda.cu, rans_warp_cuda.cuh, rans.cpp, ans_bindings.hpp
 // and lib.cpp / lib_cuda.cpp (migration stages 1-4 and 6). A new call site means
 // adding a `ta::` primitive to *both* backends, never an ATen call from a kernel
 // or an op wrapper - that is what keeps the two build modes bit-comparable.

@@ -6,7 +6,7 @@
 //   makes it CPython-agnostic and torch-version-agnostic.
 
 #include "rans.hpp"
-#include "rans_bindings.hpp"
+#include "ans_bindings.hpp"
 
 #ifdef TORCH_ANS_STABLE_ABI
 
@@ -61,7 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
 
     // Gated by the TORCH_ANS_WITH_* feature macros: with incremental
     // compilation only the (impl, interleaves, lookup) subset an interface
-    // needs is compiled. See rans_bindings.hpp / rans_build_config.hpp.
+    // needs is compiled. See ans_bindings.hpp / ans_build_config.hpp.
     torch_ans_bind_all(m);
 }
 

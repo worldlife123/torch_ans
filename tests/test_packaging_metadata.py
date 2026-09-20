@@ -10,7 +10,7 @@ Two independent code paths can produce a distribution:
 
 Both copies must agree, otherwise the same release ships two different
 distributions. The same applies to ``MANIFEST.in``: the native headers
-``rans_bindings.hpp`` / ``rans_build_config.hpp`` are required to build the
+``ans_bindings.hpp`` / ``ans_build_config.hpp`` are required to build the
 extension from the sdist, and setuptools does not recompute the manifest when
 new source files appear, so they have to be listed explicitly.
 """

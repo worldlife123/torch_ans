@@ -323,7 +323,9 @@ class TestRansWarpCuda(unittest.TestCase):
                             f"CPU alias x{num_interleaves} stream did not decode on CUDA")
 
     def test_cuda_i4_unsupported_variant_raises(self):
-        # interleaved CUDA coding is rans32_16-only; other variants must fail loudly
+        # among the rANS families, interleaved CUDA coding is the rans32_16 warp
+        # path; the other variants must fail loudly (the tANS families have their
+        # own warp path, see tests/test_tans.py)
         self._require_cuda_coding()
         data = torch.randint(0, 4, (2, 64), dtype=torch.int32)
         indexes = torch.randint(0, 2, (2, 64), dtype=torch.int32)

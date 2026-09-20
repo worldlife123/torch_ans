@@ -2,9 +2,11 @@
 
 // ---------------------------------------------------------------------------
 // tANS (tabled ANS / FSE) core: table construction, the encode/decode steps and
-// the bit layer. Plain C++, no torch: the file is host-only today (the tANS
-// family is CPU-only, see tans.hpp) but is written the way rans_utils.hpp is,
-// so a CUDA port can include it verbatim.
+// the bit layer. Plain C++, no torch, host *and* device: the helpers are
+// `TANS_INLINE` (host inline, or __device__ under RANS_CUDA_API), so the CPU
+// kernels in tans_cpu.cpp, the single-lane CUDA kernels in tans_cuda.cu and the
+// warp-level interleaved ones in tans_warp_cuda.cuh all use this one copy of the
+// arithmetic - which is what keeps the three bit-compatible.
 //
 // Attribution: the table construction and the two symbol steps are the
 // algorithm of FSE (Yann Collet, "FiniteStateEntropy", BSD-2 / GPLv2 dual
@@ -286,9 +288,13 @@ TANS_INLINE void tans_push_raw_value(TansBitWriter<TANS_STREAM_TYPE>* bw,
   }
 }
 
-template <typename TANS_STREAM_TYPE>
-TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
-                                        uint32_t bypass_precision) {
+// Spelled against any reader that answers `take(k)`, so that one copy serves both
+// the shared bit layer below and the narrower window the warp-level interleaved
+// kernels keep per lane (tans_warp_cuda.cuh) - the two must consume the same
+// number of digits in the same order, and a second copy is exactly the kind of
+// drift that shows up as a decoder mismatch rather than a compile error.
+template <typename BitReader>
+TANS_INLINE uint32_t tans_pop_raw_value_generic(BitReader* br, uint32_t bypass_precision) {
   const uint32_t max_bypass_val = (1u << bypass_precision) - 1;
   uint32_t val = br->take(bypass_precision);
   uint32_t n_bypass = val;
@@ -303,6 +309,12 @@ TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
     raw_val |= br->take(bypass_precision) << (j * bypass_precision);
   }
   return raw_val;
+}
+
+template <typename TANS_STREAM_TYPE>
+TANS_INLINE uint32_t tans_pop_raw_value(TansBitReader<TANS_STREAM_TYPE>* br,
+                                        uint32_t bypass_precision) {
+  return tans_pop_raw_value_generic(br, bypass_precision);
 }
 
 // ---------------------------------------------------------------------------

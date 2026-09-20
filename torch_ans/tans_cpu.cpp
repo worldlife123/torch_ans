@@ -6,7 +6,7 @@
 //
 // The three exported families differ only in (state type, stream word type) -
 // see tans.hpp - and are instantiated at the bottom behind the
-// TORCH_ANS_WITH_TANS* gates of rans_build_config.hpp.
+// TORCH_ANS_WITH_TANS* gates of ans_build_config.hpp.
 
 #include "ta/torch_api.hpp"
 
@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "rans_build_config.hpp"
+#include "ans_build_config.hpp"
 #include "tans.hpp"
 #include "tans_utils.hpp"
 // `constexpr_for`: the compile-time lane loop the interleaved kernels need. It
@@ -114,18 +114,21 @@ ta::Tensor tans_build_tables(const ta::Tensor& cdfs, const ta::Tensor& cdfs_size
 // ---------------------------------------------------------------------------
 // The interleave factors with a bound (and instantiated) kernel pair. The
 // initializer rejects anything else with that list rather than building a stream
-// no kernel can read.
+// no kernel can read. 32 is part of the set for the same reason it is for
+// rans32_16: the CUDA warp kernels code one row per full warp with it, and the
+// CPU kernels below instantiate it too - the stream is a plain interleaved one
+// either way, so a 32-lane stream is interchangeable between the two.
 #define TANS_ILV_IS_SUPPORTED(num_interleaves) \
   ((num_interleaves) == 1 || (num_interleaves) == 2 || \
-   (num_interleaves) == 4 || (num_interleaves) == 8)
+   (num_interleaves) == 4 || (num_interleaves) == 8 || (num_interleaves) == 32)
 
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
 ta::Tensor tans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size)
 {
   STD_TORCH_CHECK(TANS_ILV_IS_SUPPORTED(num_interleaves),
-                  "tans_init_stream: num_interleaves must be 1, 2, 4 or 8 for tANS "
-                  "(got ", num_interleaves, "); there is no 32-way variant - that one "
-                  "is the CUDA warp path, and the tANS family is CPU-only");
+                  "tans_init_stream: num_interleaves must be 1, 2, 4, 8 or 32 for tANS "
+                  "(got ", num_interleaves, "); 32 is the full-warp group of the CUDA "
+                  "interleaved kernels, which the CPU kernels implement as well");
   STD_TORCH_CHECK(preallocate_size >= 0, "tans_init_stream: preallocate_size must be >= 0");
 
   // +1 for the length word, + the header (one state word per lane plus the
@@ -525,11 +528,11 @@ ta::Tensor tans_pop_indexed_cpu(ta::Tensor stream, const ta::Tensor& indexes,
 }
 
 // ---------------------------------------------------------------------------
-// Instantiations required by the bindings in rans_bindings.hpp.
+// Instantiations required by the bindings in ans_bindings.hpp.
 // ---------------------------------------------------------------------------
 // The wrappers in tans.hpp only see the declarations above, so every bound
 // family needs an explicit instantiation definition here - the same reason as
-// the rANS blocks in rans_cpu.cpp (rans_build_config.hpp spells it out). The
+// the rANS blocks in rans_cpu.cpp (ans_build_config.hpp spells it out). The
 // family gates are per family, the interleave ones are shared with the rANS
 // families, so an incremental build compiles only the requested subset.
 #define TORCH_ANS_TANS_INST_ILV(STATE, STREAM, ILV) \
@@ -548,6 +551,12 @@ TORCH_ANS_TANS_INST_ILV(uint32_t, uint16_t, 4);
 #  if TORCH_ANS_WITH_INTERLEAVE_8
 TORCH_ANS_TANS_INST_ILV(uint32_t, uint16_t, 8);
 #  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+// 32 lanes is the full warp of the CUDA interleaved kernels (tans_warp_cuda.cuh);
+// the CPU kernels implement it from the same constexpr_for lane loop, so a 32-lane
+// stream is interchangeable between the two.
+TORCH_ANS_TANS_INST_ILV(uint32_t, uint16_t, 32);
+#  endif
 #endif
 
 #if TORCH_ANS_WITH_TANS16
@@ -562,6 +571,9 @@ TORCH_ANS_TANS_INST_ILV(uint16_t, uint8_t, 4);
 #  if TORCH_ANS_WITH_INTERLEAVE_8
 TORCH_ANS_TANS_INST_ILV(uint16_t, uint8_t, 8);
 #  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+TORCH_ANS_TANS_INST_ILV(uint16_t, uint8_t, 32);
+#  endif
 #endif
 
 #if TORCH_ANS_WITH_TANS8
@@ -575,6 +587,9 @@ TORCH_ANS_TANS_INST_ILV(uint8_t, uint8_t, 4);
 #  endif
 #  if TORCH_ANS_WITH_INTERLEAVE_8
 TORCH_ANS_TANS_INST_ILV(uint8_t, uint8_t, 8);
+#  endif
+#  if TORCH_ANS_WITH_INTERLEAVE_32
+TORCH_ANS_TANS_INST_ILV(uint8_t, uint8_t, 32);
 #  endif
 #endif
 

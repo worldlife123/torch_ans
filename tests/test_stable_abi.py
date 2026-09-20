@@ -242,8 +242,10 @@ def test_bytes_operators_match_the_compiled_extension():
 # ---------------------------------------------------------------------------
 # The CUDA library is a second .so that registers implementations *only* for the
 # CUDA dispatch key; the operator names - and therefore every call below - are the
-# same ones the CPU library exports. `rans32_16` is the family the CUDA kernels
-# cover (interleaved coding is the warp path, which exists for rans32_16 only).
+# same ones the CPU library exports. `rans32_16` is the family these tests pin
+# down (interleaved coding there is the warp path, and among the rANS families it
+# exists for rans32_16 only; the tANS families have their own warp path and are
+# covered by tests/test_tans.py).
 
 @needs_stable_cuda
 def test_cuda_push_pop_matches_the_cpu_one_bit_for_bit():
@@ -415,7 +417,7 @@ def test_stable_abi_build_records_no_torch_version():
 
 def test_cuda_registration_mirrors_the_cpu_family_list():
     """The CUDA library registers the same families, minus the host-only op."""
-    bindings = (ROOT / "torch_ans" / "rans_bindings.hpp").read_text(encoding="utf-8")
+    bindings = (ROOT / "torch_ans" / "ans_bindings.hpp").read_text(encoding="utf-8")
     cpu = _slice(bindings, "inline void torch_ans_register_cpu_impls",
                  "#if TA_WITH_CUDA")
     cuda = _slice(bindings, "inline void torch_ans_register_cuda_impls",
