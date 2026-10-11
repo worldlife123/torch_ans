@@ -1,0 +1,382 @@
+name: Publish the prebuilt stable-ABI wheels
+
+# Publishes the CPU flavour of the prebuilt libtorch-stable-ABI wheel
+# (`WITH_STABLE_ABI=1`) for Linux / macOS / Windows, next to the sdist that
+# `release_sdist.yml` uploads for the same tag. Everything here is about *that*
+# artefact; `cibuildwheel.yml` remains the ABI regression gate (it builds the
+# same wheel and loads it under several torch versions) and publishes nothing.
+#
+# Why this does not change `Requires-Dist`:
+#
+#   One `.so` serves every `torch >= 2.10`, but pip reads the dependencies of
+#   the single best-matching wheel of a version, and a platform wheel beats a
+#   `py3-none-any` one - so declaring `torch>=2.10` here would make pip *upgrade
+#   torch* (hundreds of MB) for anyone on an older release. The constraint is
+#   therefore enforced at runtime: `torch_ans/_stable_C.py` skips the prebuilt
+#   library with one RuntimeWarning and the normal runtime build runs, which is
+#   exactly what a source install of an old torch does today. `pyproject.toml`
+#   keeps `torch>=1.10`.
+#
+# Why the repair step is disabled:
+#
+#   `auditwheel` / `delocate` exist to bundle the libraries a wheel links
+#   against. The prebuilt .so links `libc10` and `libtorch_cpu` - which is
+#   correct, the stable C shim lives there - and those come from the `torch`
+#   distribution this package depends on. Bundling them would add hundreds of MB
+#   per wheel and pin the wheel to the torch that was installed at build time,
+#   the opposite of what the stable ABI is for. Linux finds them through the
+#   DT_NEEDED entry (torch is imported first, so they are already in the
+#   process) and macOS through `@rpath/../torch/lib` (setup.py). The Linux
+#   platform tag is then set by hand from the image (`manylinux_2_28`), since
+#   auditwheel is the step that would normally do it.
+#
+# `cibuildwheel` is pinned to a major tag; pin it to a release tag
+# (`@v3.x.y`) if a build ever needs to be reproduced bit for bit.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Upload to PyPI (unchecked: build and verify only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: manylinux x86_64
+            artifact: wheel-manylinux-x86_64
+          - os: macos-latest
+            name: macOS arm64
+            artifact: wheel-macos-arm64
+          - os: macos-13
+            name: macOS x86_64
+            artifact: wheel-macos-x86_64
+          - os: windows-latest
+            name: Windows AMD64
+            artifact: wheel-win-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build the wheel
+        uses: pypa/cibuildwheel@v3
+        env:
+          # One CPython is enough: the stable-ABI libraries export no Python
+          # symbols at all (asserted below), so the wheel is retagged py3-none
+          # and building it for five interpreters would produce five identical
+          # files.
+          CIBW_BUILD: "cp311-*"
+          # `setup.py` has to import torch for its headers and for
+          # `cpp_extension`'s include paths, so the build must not be isolated.
+          # torch is *not* a runtime dependency of the .so - it is installed
+          # here only so the compiler can see its headers.
+          CIBW_BUILD_FRONTEND: "build; args: --no-isolation"
+          CIBW_BEFORE_BUILD: >
+            pip install --upgrade pip setuptools wheel build ninja &&
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          CIBW_ENVIRONMENT: "WITH_STABLE_ABI=1"
+          # The platform-specific spelling *replaces* CIBW_ENVIRONMENT, so the
+          # switch has to be repeated. 11.0 is the oldest macOS torch ships for.
+          CIBW_ENVIRONMENT_MACOS: "WITH_STABLE_ABI=1 MACOSX_DEPLOYMENT_TARGET=11.0"
+          CIBW_ARCHS_LINUX: "x86_64"
+          CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-13' && 'x86_64' || 'arm64' }}
+          CIBW_ARCHS_WINDOWS: "AMD64"
+          # manylinux_2_28 is the oldest glibc that still runs everywhere;
+          # cibuildwheel picks the matching container automatically.
+          CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+          # See the header: no auditwheel / delocate for this wheel.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            echo "skipping auditwheel: libc10/libtorch_cpu come from the torch wheel"
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >-
+            echo "skipping delocate: libtorch_cpu is reached through @rpath/../torch/lib"
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheelhouse/*.whl
+
+  retag-and-check:
+    name: Retag and check every wheel
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download every wheel
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Install the checkers
+        run: |
+          python -m pip install --upgrade pip
+          pip install setuptools wheel twine
+
+      - name: Retag to py3-none-<platform>
+        # Two things are fixed here:
+        #
+        # 1. the `cp311-cp311` that bdist_wheel derives from the mere presence of
+        #    ext_modules is an artefact - the libraries export no CPython symbols
+        #    at all (asserted by the checker below);
+        # 2. the Linux platform tag. cibuildwheel normally leaves that to
+        #    auditwheel, which is disabled here (see the header), so the tag is
+        #    taken from the image the wheel was built in - manylinux_2_28, see
+        #    CIBW_MANYLINUX_X86_64_IMAGE above. `linux_x86_64` is what a plain
+        #    build produces and PyPI refuses to accept it.
+        run: |
+          python - <<'PY'
+          import glob, subprocess, sys
+
+          #: glibc baseline of the image CIBW_MANYLINUX_*_IMAGE selects.
+          MANYLINUX = {"x86_64": "manylinux_2_28_x86_64", "aarch64": "manylinux_2_28_aarch64"}
+
+          for wheel in sorted(glob.glob("wheelhouse/*.whl")):
+              platform_tag = wheel[:-len(".whl")].split("-")[-1]
+              args = ["--python-tag", "py3", "--abi-tag", "none"]
+              if platform_tag.startswith("linux_"):
+                  args += ["--platform-tag", MANYLINUX[platform_tag.split("_", 1)[1]]]
+              subprocess.run([sys.executable, "-m", "wheel", "tags",
+                              *args, "--remove", wheel], check=True)
+              print("retagged:", wheel)
+          PY
+          ls -l wheelhouse
+
+      - name: Assert every tag is one PyPI accepts
+        # `linux_x86_64` (what a plain `build` produces) is rejected on upload,
+        # and a `none-any` wheel here would mean the extension was not built.
+        run: |
+          python - <<'PY'
+          import glob, pathlib, sys
+
+          wheels = sorted(glob.glob("wheelhouse/*.whl"))
+          assert len(wheels) == 4, f"expected one wheel per platform: {wheels}"
+          for wheel in wheels:
+              python_tag, abi, platform = pathlib.Path(wheel).stem.split("-")[-3:]
+              assert (python_tag, abi) == ("py3", "none"), (
+                  f"{wheel}: a stable-ABI wheel must be py3-none-<platform>")
+              assert platform.startswith(("manylinux", "musllinux", "macosx", "win")), (
+                  f"{wheel}: PyPI rejects the platform tag {platform!r}")
+              print("ok:", pathlib.Path(wheel).name)
+          PY
+
+      - name: Check the wheels (tag, shipped libraries, stable-ABI symbols)
+        run: python scripts/check_stable_abi_wheel.py wheelhouse/*.whl
+
+      - name: Twine check
+        run: python -m twine check wheelhouse/*.whl
+
+      - name: Upload the publishable wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-publish
+          path: wheelhouse/*.whl
+
+  verify-install:
+    name: Install and use it on ${{ matrix.name }}
+    needs: retag-and-check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux x86_64
+          - os: macos-latest
+            name: macOS arm64
+          - os: macos-13
+            name: macOS x86_64
+          - os: windows-latest
+            name: Windows AMD64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-publish
+          path: wheelhouse
+
+      - name: Install torch
+        shell: bash
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu \
+            || pip install torch
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Install this platform's wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > "$RUNNER_TEMP/wheel.txt"
+          import glob, platform, sys
+
+          machine = platform.machine().lower()
+          if sys.platform == "linux":
+              needle = "manylinux_2_28_" + ("x86_64" if machine in ("x86_64", "amd64") else "aarch64")
+          elif sys.platform == "darwin":
+              needle = "macosx_11_0_" + ("arm64" if machine == "arm64" else "x86_64")
+          else:
+              needle = "win_amd64"
+          matches = sorted(path for path in glob.glob("wheelhouse/*.whl") if needle in path)
+          assert len(matches) == 1, f"{needle}: {glob.glob('wheelhouse/*.whl')}"
+          print(matches[0])
+          PY
+          cat "$RUNNER_TEMP/wheel.txt"
+          pip install --no-deps "$(cat "$RUNNER_TEMP/wheel.txt")"
+
+      - name: Using it must compile nothing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import pathlib, torch_ans._C as C
+          from torch_ans import _stable_C
+
+          assert C.__file__.endswith("_C.py"), (
+              f"a compiled extension shadowed the shim: {C.__file__}")
+          stable = _stable_C.load_stable()
+          assert stable is not None, "the wheel's prebuilt extension was not loaded"
+          cache = pathlib.Path.home() / ".cache" / "torch_extensions"
+          compiled = list(cache.glob("*")) if cache.is_dir() else []
+          assert not compiled, f"using the wheel compiled something: {compiled}"
+          print("prebuilt extension :", ", ".join(stable._loaded_paths))
+          print("CUDA capability    :", stable._torch_ans_with_cuda)
+          print("no runtime build   : OK")
+          PY
+
+      - name: Run the stable-ABI tests against the installed wheel
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          pip install pytest
+          python -m pytest "$GITHUB_WORKSPACE/tests/test_stable_abi.py" \
+                           "$GITHUB_WORKSPACE/tests/test_capacity_contract.py" -q
+
+  verify-old-torch-fallback:
+    name: An old torch warns and falls back
+    needs: retag-and-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-publish
+          path: wheelhouse
+
+      - name: Install a torch below the stable-ABI floor and the wheel
+        # The floor is `_stable_C.STABLE_ABI_MIN_TORCH` (2.10); 2.9 is the
+        # release below it. Nothing here may compile: the point is that the
+        # prebuilt library is skipped with an explanation.
+        run: |
+          pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps wheelhouse/*manylinux_2_28_x86_64.whl
+          python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Assert the warning and the skip
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import warnings
+          from torch_ans import _stable_C
+
+          with warnings.catch_warnings(record=True) as caught:
+              warnings.simplefilter("always")
+              assert _stable_C.load_stable() is None, (
+                  "the prebuilt library was loaded by a torch below the floor")
+          messages = [str(item.message) for item in caught
+                      if issubclass(item.category, RuntimeWarning)]
+          assert any("torch >= 2.10" in message for message in messages), messages
+          print("warning:", messages[0])
+          PY
+
+  publish:
+    name: Publish to PyPI
+    needs: [retag-and-check, verify-install, verify-old-torch-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-publish
+          path: wheelhouse
+
+      - name: Install twine
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine
+
+      - name: Publish
+        # sdist and wheels are two workflows on the same tag; PyPI accepts
+        # additional files for a release, it only rejects replacing one.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: python -m twine upload --non-interactive wheelhouse/*.whl
+
+      - name: "Dry run: upload skipped"
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        run: |
+          echo "publish=false: keeping these wheels (upload with the same "
+          echo "dispatch and publish=true):"
+          ls -l wheelhouse
+
+# NOTES:
+# - CUDA flavour: not published yet. It needs a CUDA toolkit next to the build
+#   (a self-hosted runner or a CUDA container image) and a decision about which
+#   archs to ship, and the wheel grows to ~17 MB. When it is added, build it
+#   with WITH_STABLE_ABI=1 WITH_CUDA=1 FORCE_CUDA=1 and check it with
+#   `scripts/check_stable_abi_wheel.py --require-cuda`; the local recipe is in
+#   `cibuildwheel.yml` (CUDA_HOME / TORCH_ANS_STABLE_CUDA_CCBIN /
+#   TORCH_CUDA_ARCH_LIST). `setup.py` bypasses torch's CUDA version check for
+#   that build on purpose (see TORCH_ANS_STABLE_KEEP_CUDA_CHECK).
+# - A CPU wheel on a GPU machine is not a dead end: asking for CUDA coding makes
+#   `utils._ensure_native_for` compile a CUDA extension for the local torch
+#   (the ATen build is pybind11-only, so it cannot collide with the schemas the
+#   prebuilt library registered). Users without a toolkit get the usual
+#   `_CUDA_UNAVAILABLE_HINT` instead.

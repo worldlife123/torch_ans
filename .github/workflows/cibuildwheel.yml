@@ -1,5 +1,9 @@
 name: Build wheels (pure Python, prebuilt stable-ABI artifacts)
 
+# Nothing here is published: this workflow is the ABI regression gate (build the
+# prebuilt wheel, check its symbols, load it under several torch versions). The
+# wheels that go to PyPI are built by `release_wheels.yml`.
+
 # Two shapes are built here and they serve different purposes:
 #
 # * the pure-Python wheel (`py3-none-any`, no `_C*.so`) with SKIP_BUILD_EXT=1 -
@@ -160,6 +164,9 @@ jobs:
 # toolkit next to a cu130 torch is a supported combination - measured, see
 # poc/stable_abi/README.md section 3.4). Set TORCH_ANS_STABLE_KEEP_CUDA_CHECK=1
 # to keep torch's own behaviour instead.
+#
+# Publishing the CUDA flavour is a separate step and is not done yet - see the
+# TODO at the end of `release_wheels.yml`.
 
   cross-version-load:
     name: Load one wheel under torch ${{ matrix.torch }}

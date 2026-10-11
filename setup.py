@@ -169,6 +169,52 @@ def get_extension_config():
     return ext_modules, cmdclass
 
 
+def _stable_abi_platform_flags(defines):
+    """(extra_compile_args, extra_link_args) for the prebuilt stable-ABI libraries.
+
+    One `.so` has to load under every `torch >= 2.10` and every CPython, so
+    "optimise, and do not record a dependency on the torch that built it" is
+    spelled in the dialect of each toolchain:
+
+    * Linux   - `-O3` plus `-Wl,--as-needed`: GNU ld drops the libraries whose
+      symbols are unused, which is how the `-ltorch_python` that
+      `cpp_extension.CppExtension` links unconditionally disappears (measured:
+      the built library's DT_NEEDED is exactly `libc10`, `libtorch_cpu` and the
+      system libraries);
+    * macOS   - ld64 has no `--as-needed` (`ld: unknown option: --as-needed`),
+      so only `-ltorch_python` is dropped (below) and the dylibs that carry the
+      stable C shim stay - with an rpath into the *user's* torch install, which
+      is where dyld has to find them (`torch_ans` and `torch` are siblings in
+      site-packages);
+    * Windows - cl.exe rejects `-O3` (D9002; the optimisation level there is
+      `/O2`, which distutils passes anyway) and link.exe has no `--as-needed`
+      either, so nothing is passed and the torch import libraries stay: MSVC
+      resolves every symbol at link time and has no runtime lookup.
+    """
+    if sys.platform == "win32":
+        return {"cxx": ["/O2"] + defines}, []
+    if sys.platform == "darwin":
+        # `@loader_path` is the directory the .so ends up in
+        # (site-packages/torch_ans/), so `../torch/lib` is the torch it was built
+        # against *and* the one the user's `import torch` loads.
+        return {"cxx": ["-O3"] + defines}, ["-Wl,-rpath,@loader_path/../torch/lib"]
+    return {"cxx": ["-O3"] + defines}, ["-Wl,--as-needed"]
+
+
+def _stable_abi_drop_libraries(extension):
+    """Remove the libraries a prebuilt .so must not depend on.
+
+    `CppExtension` links `torch_python` on every platform (line 1327 of
+    torch/utils/cpp_extension.py: only `py_limited_api=True` skips it), and that
+    is exactly the dependency the stable ABI exists to remove: it would tie the
+    wheel to one CPython *and* one torch build. Nothing in these sources uses it
+    - the library's only torch symbols are the stable C shim's `aoti_torch_*`,
+    which live in `libtorch_cpu`, so `libtorch_python` is never needed.
+    """
+    extension.libraries = [lib for lib in extension.libraries if lib != "torch_python"]
+    return extension
+
+
 def get_stable_abi_extension_config():
     """The prebuilt libtorch-stable-ABI libraries (migration section 5).
 
@@ -186,8 +232,12 @@ def get_stable_abi_extension_config():
     second OpenMP runtime next to torch's gives the process two thread pools and
     aborts on macOS - pit 5), no ``-march=native`` (a wheel has to run on any
     x86-64, and it was measured to make no difference - section 7, risk 4) and
-    ``-Wl,--as-needed``, so the ``-ltorch_python`` that cpp_extension links
-    unconditionally is dropped instead of becoming a DT_NEEDED entry.
+    nothing that ties the library to one CPython or one torch build:
+    ``-Wl,--as-needed`` on Linux plus ``_stable_abi_drop_libraries``, so the
+    ``-ltorch_python`` that cpp_extension links unconditionally never becomes a
+    DT_NEEDED entry. Both depend on the toolchain - ``_stable_abi_platform_flags``
+    spells them per platform, which is what makes one recipe build the wheel on
+    Linux, macOS and Windows.
     """
     from torch.utils import cpp_extension
     import torch
@@ -219,18 +269,18 @@ def get_stable_abi_extension_config():
         "-DTORCH_ANS_STABLE_ABI=1",
         "-DTORCH_TARGET_VERSION=" + STABLE_ABI_TORCH_TARGET_VERSION,
     ]
-    extra_link_args = ["-Wl,--as-needed"]
+    compile_args, extra_link_args = _stable_abi_platform_flags(common_defines)
 
     ext_modules = [
-        cpp_extension.CppExtension(
+        _stable_abi_drop_libraries(cpp_extension.CppExtension(
             "torch_ans._C_cpu",
             sources=[os.path.join(package_dir, name)
                      for name in ("rans_cpu.cpp", "tans_cpu.cpp", "rans.cpp",
                                   "lib.cpp")],
             include_dirs=[package_dir],
-            extra_compile_args={"cxx": ["-O3"] + common_defines},
+            extra_compile_args=compile_args,
             extra_link_args=extra_link_args,
-        )
+        ))
     ]
 
     if with_cuda:
@@ -247,8 +297,13 @@ def get_stable_abi_extension_config():
         if cuda_ccbin:
             nvcc_flags += ["-ccbin", cuda_ccbin]
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", STABLE_ABI_CUDA_ARCH_LIST)
+        # nvcc understands -O3 on every platform, so only the host flags are the
+        # platform-dependent ones.
+        cuda_compile_args = dict(compile_args)
+        cuda_compile_args["cxx"] = compile_args["cxx"] + ["-DWITH_CUDA=1", "-DUSE_CUDA=1"]
+        cuda_compile_args["nvcc"] = nvcc_flags
         ext_modules.append(
-            cpp_extension.CUDAExtension(
+            _stable_abi_drop_libraries(cpp_extension.CUDAExtension(
                 "torch_ans._C_cuda",
                 # rans_cpu.cpp belongs to the CUDA library on purpose: rans_push /
                 # rans_pop are *one* wrapper each that routes on the tensor device
@@ -266,12 +321,9 @@ def get_stable_abi_extension_config():
                          for name in ("rans_cuda.cu", "tans_cuda.cu", "rans_cpu.cpp",
                                       "tans_cpu.cpp", "rans.cpp", "lib_cuda.cpp")],
                 include_dirs=[package_dir],
-                extra_compile_args={
-                    "cxx": ["-O3"] + cuda_defines,
-                    "nvcc": nvcc_flags,
-                },
+                extra_compile_args=cuda_compile_args,
                 extra_link_args=extra_link_args,
-            )
+            ))
         )
 
     cmdclass = {"build_ext": cpp_extension.BuildExtension}

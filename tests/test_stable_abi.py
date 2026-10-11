@@ -379,13 +379,23 @@ def _slice(source, start_marker, end_marker):
     return source[start:source.index(end_marker, start)]
 
 
+def _code(source, start_marker, end_marker):
+    """`_slice` with every docstring removed (only the code is asserted on)."""
+    region = _slice(source, start_marker, end_marker)
+    # odd indexes of a `"""` split are the docstrings, even ones the code
+    return "".join(part for index, part in enumerate(region.split('"""'))
+                   if index % 2 == 0)
+
+
 def test_setup_py_builds_the_two_stable_abi_libraries():
     source = _setup_source()
-    stable = _slice(source, "def get_stable_abi_extension_config(",
-                    "# Only import/build extensions")
-    # the docstring explains *why* the flags below are absent, so only the code
-    # that follows it is inspected
-    code = stable.split('"""', 2)[2]
+    # `_stable_abi_platform_flags` / `_stable_abi_drop_libraries` belong to the
+    # same region: they are where the flags and the library list come from, and
+    # they are what lets one recipe build the wheel on Linux, macOS and Windows.
+    # the docstrings explain *why* the flags below are absent, so only the code
+    # is inspected
+    code = _code(source, "def _stable_abi_platform_flags(",
+                 "# Only import/build extensions")
 
     assert "torch_ans._C_cpu" in code, "the CPU library must always be built"
     assert "torch_ans._C_cuda" in code, "the CUDA library must be built too"
@@ -402,6 +412,86 @@ def test_setup_py_builds_the_two_stable_abi_libraries():
         assert forbidden not in code, (
             f"{forbidden} must not be used for a prebuilt wheel "
             "(migration sections 4/5, pits 5 and 7)")
+
+
+def test_stable_abi_flags_are_spelled_per_platform():
+    """One recipe, three toolchains: GNU ld, ld64 and MSVC disagree."""
+    source = _setup_source()
+    code = _code(source, "def _stable_abi_platform_flags(",
+                 "def get_stable_abi_extension_config(")
+
+    assert code.count("-Wl,--as-needed") == 1, (
+        "--as-needed is a GNU ld option: it must stay in the Linux branch only "
+        "(ld64 aborts with 'unknown option', link.exe has no such concept)")
+    assert "@loader_path/../torch/lib" in code, (
+        "macOS has no --as-needed, so libtorch_cpu stays linked and dyld has to "
+        "find it through an rpath into the *user's* torch install")
+    assert "/O2" in code, "MSVC's optimisation level is /O2; -O3 is rejected"
+    for platform_ in ("win32", "darwin"):
+        assert f'sys.platform == "{platform_}"' in code, (
+            f"{platform_} has no branch: it would get the Linux flags")
+    # and the library that would freeze one CPython into the wheel is gone
+    libraries = _slice(source, "def _stable_abi_drop_libraries(",
+                       "def get_stable_abi_extension_config(")
+    assert "torch_python" in libraries, (
+        "cpp_extension links torch_python unconditionally; dropping it is what "
+        "keeps the wheel CPython- and torch-build-independent")
+
+
+def test_a_prebuilt_library_is_skipped_with_one_warning_on_an_old_torch(monkeypatch, tmp_path):
+    """`torch < STABLE_ABI_MIN_TORCH`: say why the wheel is not used, once.
+
+    This is the case the published wheel creates: the platform wheel is picked
+    by pip whatever torch is installed, so the fallback has to be announced
+    instead of silently compiling.
+    """
+    import warnings
+
+    library = tmp_path / "_C_cpu.so"
+    library.write_bytes(b"")
+    monkeypatch.setattr(_stable_C, "_torch_version_tuple", lambda: (2, 9, 0))
+    monkeypatch.setattr(_stable_C, "_find_extension",
+                        lambda stem: library if stem == "_C_cpu" else None)
+    monkeypatch.setattr(_stable_C, "_warned_old_torch", False)
+    monkeypatch.setattr(_stable_C, "_loaded", {})
+
+    with pytest.warns(RuntimeWarning, match="torch >= 2.10"):
+        assert _stable_C.load_stable() is None
+    # once: a CUDA request and a second interface must not repeat it
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _stable_C.load_stable(require_cuda=True) is None
+
+
+def test_an_old_torch_without_a_prebuilt_library_says_nothing(monkeypatch):
+    """A source install on an old torch has nothing to skip - stay quiet."""
+    import warnings
+
+    monkeypatch.setattr(_stable_C, "_torch_version_tuple", lambda: (2, 9, 0))
+    monkeypatch.setattr(_stable_C, "_find_extension", lambda stem: None)
+    monkeypatch.setattr(_stable_C, "_warned_old_torch", False)
+    monkeypatch.setattr(_stable_C, "_loaded", {})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _stable_C.load_stable() is None
+
+
+def test_the_opt_out_silences_the_old_torch_warning(monkeypatch, tmp_path):
+    import warnings
+
+    library = tmp_path / "_C_cpu.so"
+    library.write_bytes(b"")
+    monkeypatch.setenv(_stable_C.DISABLE_ENV_VAR, "1")
+    monkeypatch.setattr(_stable_C, "_torch_version_tuple", lambda: (2, 9, 0))
+    monkeypatch.setattr(_stable_C, "_find_extension",
+                        lambda stem: library if stem == "_C_cpu" else None)
+    monkeypatch.setattr(_stable_C, "_warned_old_torch", False)
+    monkeypatch.setattr(_stable_C, "_loaded", {})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _stable_C.load_stable() is None
 
 
 def test_stable_abi_build_records_no_torch_version():

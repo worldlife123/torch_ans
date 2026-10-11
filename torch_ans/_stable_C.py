@@ -11,7 +11,10 @@ module is the Python side of that path:
 * :class:`_StableModule` exposes the same attribute names the compiled `_C`
   module does, so `utils.py` does not need to know which path it got;
 * failure of any kind returns ``None`` - falling back to the runtime build,
-  the same philosophy as `utils._import_native_c` (migration section 5.2).
+  the same philosophy as `utils._import_native_c` (migration section 5.2). The
+  one exception to "silent" is a torch older than :data:`STABLE_ABI_MIN_TORCH`:
+  the wheel is then useless, so the fallback is announced once (and only from an
+  installed wheel - a source install has no library to skip).
 
 The two `py::bytes` operators are implemented here in Python: the stable ABI
 has no schema type for `std::vector<py::bytes>`, so C++ drops them (migration
@@ -174,13 +177,42 @@ def rans_byte_strings_to_stream(byte_strings: Sequence[bytes]) -> torch.Tensor:
 _loaded: dict = {}
 
 
+#: Set once the "this torch is too old for the prebuilt library" warning has
+#: been emitted: the lookup runs again for every `require_cuda` value and from
+#: `_lazy_C`, and one line per interface would be noise.
+_warned_old_torch = False
+
+
+def _warn_old_torch(found: Path) -> None:
+    """Explain the fallback instead of silently compiling (see the docstring).
+
+    Reachable only from an installed prebuilt wheel: a source install has no
+    `_C_cpu` next to the package, and saying anything there would be noise.
+    """
+    global _warned_old_torch
+    if _warned_old_torch:
+        return
+    _warned_old_torch = True
+    required = ".".join(str(part) for part in STABLE_ABI_MIN_TORCH)
+    warnings.warn(
+        f"torch_ans ships a prebuilt extension ({found.name}) that needs "
+        f"torch >= {required}, but torch {torch.__version__} is installed; it "
+        f"is being ignored and torch_ans is compiling for this torch instead "
+        f"(needs a C++ toolchain, and the first call is slow). Upgrade torch - "
+        f"`pip install -U 'torch>={required}'` - to use the prebuilt one, or "
+        f"set {DISABLE_ENV_VAR}=1 to silence this warning.",
+        RuntimeWarning, stacklevel=3)
+
+
 def _load(require_cuda: bool) -> Optional[_StableModule]:
     if _truthy(os.getenv(DISABLE_ENV_VAR)):
         return None
+    cpu_path = _find_extension("_C_cpu")
     if _torch_version_tuple() < STABLE_ABI_MIN_TORCH:
+        if cpu_path is not None:
+            _warn_old_torch(cpu_path)
         return None
 
-    cpu_path = _find_extension("_C_cpu")
     if cpu_path is None:
         return None
     cuda_path = _find_extension("_C_cuda")

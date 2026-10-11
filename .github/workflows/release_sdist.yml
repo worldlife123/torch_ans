@@ -1,5 +1,10 @@
 name: Release SDist
 
+# This workflow publishes the sdist only. The prebuilt stable-ABI wheels of the
+# same tag are built and uploaded by `release_wheels.yml` - a second workflow on
+# purpose, so a broken wheel build cannot stop the sdist and vice versa (PyPI
+# accepts additional files for a release, it only refuses to replace one). Do not
+# add wheel uploads here: two jobs uploading the same file fail the upload.
 on:
   push:
     tags:

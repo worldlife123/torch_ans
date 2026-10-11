@@ -4,23 +4,23 @@
 ![PyPI](https://img.shields.io/pypi/v/torch_ans?label=PyPI)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**torch_ans** is a high-performance PyTorch extension for ANS (Asymmetric Numeral Systems) entropy coding, supporting both C++ and CUDA backends across multiple platforms including Linux, macOS, and Windows. It enables fast, parallel rANS (range ANS) compression and decompression for deep learning and data compression workflows.
+**torch_ans** is a high-performance PyTorch extension for ANS (Asymmetric Numeral Systems) entropy coding, supporting both C++ and CUDA backends across multiple platforms including Linux, macOS, and Windows. It enables fast, parallel rANS (range ANS) and tANS (table-driven ANS) compression and decompression for deep learning and data compression workflows.
 This extension is designed as an efficient, extensible replacement to [torchac](https://github.com/fab-jul/torchac) and [CompressAI](https://github.com/InterDigitalInc/CompressAI) range coding.
 
 ## Features
 
 - **High-speed ANS compression/decompression**: Efficient encoding and decoding using rANS, suitable for large-scale data and neural network applications.
-- **Parallel rANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration/asynchronous operators for batch processing and high throughput.
+- **Parallel rANS/tANS on CPU and GPU**: Leverages PyTorch's CPU parallelism and CUDA acceleration/asynchronous operators for batch processing and high throughput.
 - **Warp-level decoding on CUDA**: `rans32_16` with `num_interleaves=32` maps each stream onto the 32 lanes of a warp, stages the CDF and lookup tables in shared memory and picks the symbol with a tunable inverse-CDF lookup — achieving **up to 25.8 Gsymbol/s decode (~29 GB/s of payload) on an RTX 2080 Ti**.
 - **Multi-platform support**: Compatible with Linux/macOS/Windows OS and x86_64/aarch64 based platforms, provided that PyTorch and the necessary build tools (C++ compiler, CUDA toolkit if applicable) are available on that platform.
-- **Flexible rANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
+- **Flexible rANS/tANS variants**: Supports multiple state sizes, stream sizes, frequency precisions, interleaved coding schemes and decoding acceleration tricks (alias coding, inverse cdf).
 - **Low-level and high-level APIs**: Exposes both granular tensor-based operations and user-friendly interfaces for integration.
 [CompressAI](https://github.com/InterDigitalInc/CompressAI) like API are also included, see [Cookbook](#cookbook).
 - **Off-the-shelf for research**: Modular design using C++ templates, allowing for rapid prototyping and extension of new rANS variants without compromise on efficiency.
 
 ## Installation
 
-`torch_ans` is distributed as a **source package**. The native extension is compiled **on your machine**, either at install time (`--no-build-isolation`, which needs a C++ toolchain) or lazily on first use (see [Runtime dynamic build](#runtime-dynamic-build)). Nothing is pinned to a particular PyTorch build: the extension is always compiled against the PyTorch you have installed, so there is no wheel-to-torch version to match. Pre-compiled wheels are deliberately not published - a wheel built against one torch version is not loadable by another.
+`torch_ans` is distributed as a **source package** *and* as a **prebuilt wheel**. The native extension is either compiled **on your machine** - at install time (`--no-build-isolation`, which needs a C++ toolchain) or lazily on first use (see [Runtime dynamic build](#runtime-dynamic-build)) - or taken from the prebuilt **stable-ABI wheel**, which talks to the libtorch stable C shim instead of to ATen and therefore serves every `torch >= 2.10` without compiling anything (see [Prebuilt stable-ABI wheel](#prebuilt-stable-abi-wheel)). The former is what you get when no wheel matches your platform, or when your torch is older than 2.10: nothing is pinned to a particular PyTorch build, the extension is compiled against the PyTorch you have installed, so there is no wheel-to-torch version to match.
 
 It is therefore recommended to install a specific version of [PyTorch](https://pytorch.org/get-started/locally/) first, then install torch_ans with `--no-build-isolation`. This is important for PyTorch version compability!
 
@@ -31,7 +31,16 @@ It is therefore recommended to install a specific version of [PyTorch](https://p
 pip install torch_ans --no-build-isolation
 ```
 
-This compiles the extension during installation, using the PyTorch that is already installed. Without `--no-build-isolation` the package still installs, but the extension is compiled later, on first use.
+On Linux (x86_64), macOS (arm64/x86_64) and Windows (AMD64) pip picks the prebuilt stable-ABI wheel, so **nothing is compiled** - provided your `torch` is `>= 2.10`, which is what the wheel's `.so` targets. With an older torch the wheel is still installed (pip cannot express "this wheel needs torch >= 2.10" without being willing to *upgrade* your torch), and `torch_ans` tells you so once and compiles for your torch instead:
+
+```
+RuntimeWarning: torch_ans ships a prebuilt extension (_C_cpu...) that needs torch >= 2.10,
+but torch 2.9.0 is installed; it is being ignored and torch_ans is compiling for this torch
+instead ... Upgrade torch - pip install -U 'torch>=2.10' - to use the prebuilt one, or set
+TORCH_ANS_NO_STABLE_ABI=1 to silence this warning.
+```
+
+If no wheel matches (other platforms, or `--no-binary torch_ans`), the package still installs and the extension is compiled - during installation with `--no-build-isolation`, otherwise on first use.
 
 To build with CUDA support:
 
@@ -93,11 +102,13 @@ The CI matrix builds and runs the full test suite against **PyTorch 1.10.1 (Pyth
 
 torch_ans supports a wide range of rANS variants, including different state, stream, and frequency sizes, interleaved coding, and parallel coding on CPU or GPU. 
 
-Below we list currently supported variants. Each family comes with three symbol
-lookups (divided search, alias sampling and inverse-CDF decoding) and several
-degrees of interleaving; `{iN}` in the function names stands for the interleave
-suffix of the operator (`_i2`, `_i4`, `_i8`, `_i32`) and is omitted for a single
-(non-interleaved) state:
+Below we list the currently supported **rANS** variants. Each rANS family comes with
+three symbol lookups (divided search, alias sampling and inverse-CDF decoding) and
+several degrees of interleaving; `{iN}` in the function names stands for the
+interleave suffix of the operator (`_i2`, `_i4`, `_i8`, `_i32`) and is omitted for a
+single (non-interleaved) state. The table-driven **tANS** families
+(`tans32` / `tans16` / `tans8`) have their own table in the [tANS section](#tans-table-driven-ans):
+the spread table *is* their symbol lookup, so they have no alias or inverse-CDF variant:
 
 | Variant          | State Bits | Stream Bits | Max Freq Bits | Interleaved States | Symbol Lookup  | Device Support       | init_func             | push_func                | pop_func                  |
 |------------------|------------|-------------|---------------|--------------------|----------------|----------------------|-----------------------|--------------------------|---------------------------|
@@ -118,7 +129,7 @@ interleaved `rans32_16` coder is `rans32_16_i4_invcdf_pop`.
 **Legend:**
 - *State Bits*: Number of bits in the ANS state. This affects initial stream length, thereby impacting compression ratio when there are less symbols.
 - *Stream Bits*: Number of bits per stream element. This affects the frequency of overflowed state to be written into/read from bitstream, slightly affecting speed.
-- *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In torch_ans implementation, State Bits > Stream Bits + Max Freq Bits.
+- *Max Freq Bits*: Maximum supported frequency precision. This affects the accuracy of entropy estimation, thereby impacting compression ratio (higher is better). However, higher frequency precision also leads to larger memory occupation by CDF tables. In the rANS implementation, State Bits > Stream Bits + Max Freq Bits; the tANS families do not follow that relation (their caps come from the encoder's fixed-point arithmetic and, for `tans8`, from its 8-bit state) — see [tANS](#tans-table-driven-ans).
 - *Interleaved States*: Number of interleaved states for sequential coding in one step (the `num_interleaves` argument of the family's `rans*_init_stream`). On CPU this maps to SIMD-friendly sequential interleaving. On CUDA, interleaved coding is implemented for two kernel families: `rans32_16` (`num_interleaves` 2, 4 and 8 map to that many consecutive lanes of a warp — 4-lane sub-warp groups for `rans32_16_i4` — and 32 maps the whole stream onto the 32 lanes of a warp using warp-level primitives, technique referenced from [Recoil](https://github.com/lin-toto/recoil), with one shared bitstream cursor per warp) and the three tANS families (`tans_warp_cuda.cuh`, one lane group per stream, the bit buffer shared by the lanes). The interleaved `rans64`/`rans32` operators are CPU-only; asking them to code CUDA tensors raises an explicit error instead of returning garbage. Interleaved streams are bit-compatible between the CPU and CUDA implementations (same layout and word order), so streams encoded on one device decode on the other.
 - *Symbol Lookup*: The decode-side symbol search. *divided search* is the default (folded into the plain `pop` function); *alias* is the alias-sampling coder (`alias_sampling=True` in the high-level API), which has its own push and pop (`*_alias*_push`/`*_alias*_pop`); *inverse CDF* keeps the plain push and replaces only the decoder (`*_invcdf_pop`, used with `inverse_cdf_precision`).
 - *Device Support*: Which devices each variant is available on (`all` = every interleave factor listed for that row). Interleaved CUDA coding exists for `rans32_16` and for the tANS families, so the `rans64`/`rans32` interleaved variants are CPU-only there. `num_interleaves=32` exists for `rans32_16` and for the tANS families (it is the full-warp group of their CUDA kernels), and has no alias variant.
@@ -180,9 +191,10 @@ group) codes one row. Measured on an RTX 2080 Ti
 distributions, see `benchmark_status.md`): against **single-lane** rANS at the same
 `freq_precision`, single-lane tANS decodes 1.0-1.5x faster at `alphabet >= 64` (up
 to 1.54x at alphabet 256 / `freq_precision=10`) and stays within ±5% on encode;
-the rANS **32-way warp path** is the fastest configuration overall (1.2-2.0x
-faster than tANS on decode, 1.25-1.5x on encode), at the price of ~0.6-0.8
-bit/symbol on 1024-symbol rows - each of its 32 lanes flushes its own state per row.
+the rANS **32-way warp path** keeps the encode edge (its lanes own whole
+words, so nothing is serialised per symbol), at the price of ~0.6-0.8 bit/symbol on
+1024-symbol rows - each of its 32 lanes flushes its own state per row. The tANS warp
+kernels are measured against it below.
 
 The shared-memory staging only reaches configurations whose *whole* table fits the
 budget (a handful of distributions at a small `freq_precision`), and there it is a
@@ -194,15 +206,25 @@ regime single-lane tANS decodes 1.15-1.33x faster than single-lane rANS (2.3x wi
 long streams), so it is the family to pick when the distributions are few.
 
 Interleaving on the device is worth it when the *batch* is small - the case where a
-one-thread-per-row kernel cannot fill the machine: over a 64-distribution table in
-global memory (`benchmarks/tans_interleaved_cuda.json`), `tans32` at
-`freq_precision=7` goes from 19.1/28.3 MB/s (encode/decode of symbols) at one lane to
-29.5/41.5 at 4 lanes (**+54%/+47%**) and 30.1/40.7 at 8 lanes (**+58%/+44%**) with 8
-stream rows, and to +29%/+29% (4 lanes) with 512 rows; with 4096 rows it flattens to
-~+6%/+5%, and 32 lanes is only interesting once a row is long enough that its
-136-byte header (34 words: one state per lane plus the shared bit buffer) does not
-dominate the coded size. The rANS warp path is still the fastest option when the
-alphabet allows it - its lanes own their words, so nothing is serialised per symbol.
+one-thread-per-row kernel cannot fill the machine. On the first device kernels that is
+where 4 and 8 lanes paid: over a 64-distribution table in global memory
+(`benchmarks/tans_interleaved_cuda.json`), `tans32` at `freq_precision=7` went from
+19.1/28.3 MB/s (encode/decode of symbols) at one lane to 29.5/41.5 at 4 lanes
+(**+54%/+47%**) and 30.1/40.7 at 8 lanes (**+58%/+44%**) with 8 stream rows, and to
++29%/+29% (4 lanes) with 512 rows, flattening to ~+6%/+5% at 4096 rows.
+
+The bit layer was then reworked (one packed `__shfl_sync` broadcast per lane, a rolled
+serial section, a parallel bit read on decode - 229 registers/thread down to 42-44),
+which improved every factor and made 32 lanes the fastest tANS factor at 8 and 512
+stream rows, at 2.59x encode / 11.6x decode over one lane at 8 rows
+(`benchmarks/tans_interleaved_cuda_optimized.json` is the after; the before/after table
+and the head-to-head with the rANS warp path are in `benchmark_status.md`). What 32
+lanes still cost is coded size: its 136-byte header (34 words: one state per lane plus
+the shared bit buffer) is ~1.1 bits/symbol at 1024-symbol rows (6.96 vs 5.99), which is
+why its encode is 0.94x of one lane at 4096 rows. Structurally the family still cannot
+match rANS at a tiny batch on encode - a tANS row shares one bit buffer where every rANS
+lane owns and renormalizes its own words; on decode the two are within a few percent
+once the device is saturated.
 
 What is different from rANS:
 
@@ -251,6 +273,7 @@ All encoding (push) and decoding (pop) operations in torch_ans are fully paralle
 
 - The stream tensor is typically `int32` (defined in DEFAULT_TORCH_TENSOR_TYPE and DEFAULT_TORCH_TENSOR_DTYPE in `rans_utils.hpp`) and has shape `(B, L)`, where `B` is the batch size (number of parallel states) and `L` is the stream length. Note that due to int32 range, each stream length could not exceed 2GB.
 - Initial stream length `L` is computed as `1 + ceil(num_interleaves * sizeof(RANS_STATE_TYPE) / 4)`. The first element stores the stream length, and the remaining elements store the ANS states. Therefore using 32 state bits could reduce overhead than 64 state bits, especially when a large number of parallel stream is used on small amount of data.
+- A **tANS** stream puts a header there instead: one state word **per interleave lane** (slots `1..num_interleaves`, a full `int32` whatever the family's state width is), then the residual bit buffer and its bit count — `4 * (num_interleaves + 2)` bytes, i.e. 12 at one lane. That header is part of the serialized byte string, which is what keeps the stream layout, the byte-string helpers and the capacity contract identical to rANS.
 - When calling `rans*_push` or `rans*_pop`, symbols are distributed along the batch dimension and processed in parallel across all states. 
 - On CPU you can set the number of threads for parallel coding with `torch.set_num_threads()`.
 
@@ -262,7 +285,7 @@ Increasing the number of parallel states (`B`) generally improves throughput, bu
 - For large datasets, GPUs become advantageous only with a large number of parallel states (typically >256).
 - Example: On an i7-6800k (6C12T) CPU and RTX 2080Ti GPU, rans64 encoding speed is similar for CPU and GPU with 128 parallel states, while with 256 parallel states GPU is 2 times faster than CPU.
 
-On CUDA, throughput of the warp-level interleaved path (`rans32_16` + `num_interleaves=32`) is governed by **how many warps the batch provides**: each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`. On a 68-SM GPU, `rows >= 2048` saturates the GPU; below that, decode throughput scales almost linearly with `rows` (measured: 6.6 -> 25.8 Gsymbol/s going from 256 to 2048 rows, `inverse_cdf_precision="auto"`). See [Performance Tuning](#Performance Tuning) for the full checklist.
+On CUDA, throughput of the warp-level interleaved path (`rans32_16` + `num_interleaves=32`) is governed by **how many warps the batch provides**: each stream is decoded by one warp, so occupancy is `rows / (32 * SM count)`. On a 68-SM GPU, `rows >= 2048` saturates the GPU; below that, decode throughput scales almost linearly with `rows` (measured: 6.6 -> 25.8 Gsymbol/s going from 256 to 2048 rows, `inverse_cdf_precision="auto"`). See [Performance Tuning](#performance-tuning) for the full checklist.
 
 
 ### Command-line benchmark tool
@@ -414,7 +437,7 @@ See `torch_ans_test.py` for more advanced usage and validation.
 
 ### High-level API Reference
 
-The high-level API provides a user-friendly interface for rANS coding similar to CompressAI, abstracting away tensor management and stream details. The main entry point is `TorchANSInterface` in `torch_ans.utils`, which supports encoding and decoding with various rANS implementations.
+The high-level API provides a user-friendly interface for ANS coding similar to CompressAI, abstracting away tensor management and stream details. The main entry point is `TorchANSInterface` in `torch_ans.utils`, which supports encoding and decoding with various rANS and tANS implementations.
 
 #### TorchANSInterface
 
@@ -427,7 +450,7 @@ from torch_ans.utils import TorchANSInterface
 ```python
 coder = TorchANSInterface(impl="rans64", freq_precision=16, device="cpu")
 ```
-- **impl** (str): rANS variant (e.g., "rans64", "rans32", "rans32_16", etc.)
+- **impl** (str): coder variant (e.g., "rans64", "rans32", "rans32_16", "tans32", "tans16", "tans8", etc.)
 - **freq_precision** (int): Frequency precision in bits.
 - **device** (str): "cpu" or "cuda".
 - ... (More parameters in [torch_ans/utils.py](torch_ans/utils.py))
@@ -475,9 +498,11 @@ See `torch_ans_test.py` for advanced usage, batch processing, and custom coding 
 | rans*_init_stream             | Initialize rANS stream tensor                                    |
 | rans*_push            | Encode symbols into rANS stream                                  |
 | rans*_pop             | Decode symbols from rANS stream                                  |
+| tans*_init_stream / tans*_push / tans*_pop | The tANS families' operators (identical signatures to the rANS ones; `cdfs` carries the spread table) |
+| tans_build_tables             | Build the FSE-style spread tables shared by the three tANS families |
 | rans_stream_to_byte_strings   | Convert stream tensor to list of bytes                           |
 | rans_byte_strings_to_stream   | Convert list of bytes to stream tensor                           |
-| TorchANSInterface             | High-level API for encoding/decoding with rANS variants          |
+| TorchANSInterface             | High-level API for encoding/decoding with rANS and tANS variants |
 | TorchANSInterface.init_params | Set PMF, alphabet size, and offsets for coder                   |
 | TorchANSInterface.encode_with_indexes | Encode symbols using high-level API                    |
 | TorchANSInterface.decode_with_indexes | Decode symbols using high-level API                    |
@@ -590,7 +615,7 @@ On CUDA (RTX 2080 Ti, `rans32_16`, 1024 rows x 4096 symbols, alphabet 255, p=15,
 
 ## Troubleshooting
 
-- Ensure PyTorch and pybind11 are installed and compatible with your Python version.
+- Ensure PyTorch is installed and compatible with your Python version. `pybind11` itself is not a dependency: the build takes its headers from `torch/include/pybind11` and the stable-ABI path needs none.
 - For CUDA support, verify CUDA toolkit is installed and `torch.cuda.is_available()` returns `True`.
 - If you encounter compilation errors, try cleaning the build directory and reinstalling:
   ```bash
@@ -687,7 +712,7 @@ This library is developed for research-purpose only, and not as a robust everyda
 
 ### Known Issues
 - Rans64 cuda coding test fails on some newer GPU architectures.
-- **No pre-compiled wheels are published**: installing requires a C++ toolchain (and `nvcc` for CUDA coding), and the extension is compiled against your local PyTorch. This is intentional - a wheel compiled against one torch build cannot be loaded by another, and shipping one would break the `import` on every other version.
+- **`pip install` may compile the extension locally**, which needs a C++ toolchain (and `nvcc` for the CUDA coding paths). That is what happens when no prebuilt wheel matches your platform, or when your torch is older than 2.10: a wheel compiled against ATen cannot be loaded by another torch build, so shipping one would break the `import` on every other version. The exception is the prebuilt **stable-ABI** wheel, which is published to PyPI and serves every `torch >= 2.10` (see [Prebuilt stable-ABI wheel](#prebuilt-stable-abi-wheel)).
 - **CUDA coding is off unless the extension was built with `WITH_CUDA=1`**: a CPU-only extension on a GPU machine only codes CPU tensors. Asking it for CUDA tensors triggers the automatic local CUDA build described in [CUDA support](#cuda-support); if that is not possible you get the commands to install/fix it.
 - **CUDA build fails with `std_function.h: parameter packs not expanded with '...'`**: `nvcc <= 12.1` cannot parse the `std::function` headers shipped with `libstdc++` from GCC >= 11.4 (e.g. Ubuntu 22.04.3+), so compiling CUDA extensions with the default `g++` fails. Fixes (any one of them):
   - Use an older host compiler for nvcc, e.g. `g++-10` (install with `apt install g++-10`). The runtime dynamic build detects this automatically: when a CUDA build fails, it retries with `g++-10`/`g++-9`/`g++-8` (`-ccbin`) before falling back to CPU-only, and remembers the working configuration in the torch extensions cache directory (`cuda_build_state`).
@@ -763,9 +788,26 @@ import torch_ans
 
 ## Prebuilt stable-ABI wheel
 
-Every release also builds a **prebuilt wheel**: since v0.4.0 the native code can be compiled once against the
+Every release publishes a **prebuilt wheel** to PyPI: since v0.4.0 the native code can be compiled once against the
 libtorch **stable ABI** (`TORCH_TARGET_VERSION` = torch 2.10) instead of against each user's torch, so one
 `.so` serves **every `torch >= 2.10`** - no compiler, no first-use build, no per-torch-version pinning.
+
+```bash
+pip install torch_ans            # gets the prebuilt wheel when one matches
+```
+
+Published files of a release (CPU flavour - the CUDA flavour is not published yet):
+
+| platform | wheel tag |
+| --- | --- |
+| Linux x86_64 | `py3-none-manylinux_2_28_x86_64` |
+| macOS arm64 | `py3-none-macosx_11_0_arm64` |
+| macOS x86_64 | `py3-none-macosx_11_0_x86_64` |
+| Windows AMD64 | `py3-none-win_amd64` |
+
+plus the sdist, which is what pip falls back to everywhere else.
+
+Building one locally works the same way:
 
 ```bash
 # CPU flavour: builds torch_ans/_C_cpu.so (schemas + CPU and catch-all implementations)
@@ -774,6 +816,13 @@ WITH_STABLE_ABI=1 pip install . --no-build-isolation
 # CUDA flavour: additionally builds torch_ans/_C_cuda.so (CUDA implementations only)
 WITH_STABLE_ABI=1 WITH_CUDA=1 pip install . --no-build-isolation
 ```
+
+Why the wheel does not declare `torch>=2.10`: pip reads the dependencies of the single best-matching
+wheel of a version, and a platform wheel beats a `py3-none-any` one, so declaring it would make pip
+**upgrade torch** (hundreds of MB) for everyone on an older release. The requirement is therefore
+enforced at runtime: with `torch < 2.10` the prebuilt library is skipped with one `RuntimeWarning` and
+the ordinary runtime build runs - the same behaviour a source install has always had. Set
+`TORCH_ANS_NO_STABLE_ABI=1` to silence it, or `pip install -U 'torch>=2.10'` to use the wheel.
 
 What CI checks (`scripts/check_stable_abi_wheel.py`, `tests/test_stable_abi.py`,
 `tests/test_cross_version_load.py`):
@@ -786,7 +835,11 @@ What CI checks (`scripts/check_stable_abi_wheel.py`, `tests/test_stable_abi.py`,
 - the CPU and CUDA libraries register under the *same* operator names (`torch.ops.torch_ans.*`), so the
   dispatcher picks the kernel and nothing on the Python side has to know which flavour is installed;
 - the same wheel produces a **byte-identical stream under every tested torch version** (the
-  `cross-version-load` CI job: 2.10 = the ABI floor, the build version, and the newest release).
+  `cross-version-load` CI job: 2.10 = the ABI floor, the build version, and the newest release);
+- `release_wheels.yml` (tag push) builds the four wheels with `cibuildwheel`, retags them to
+  `py3-none-<platform>`, checks them, installs and uses each one on its own platform, and then uploads
+  them next to the sdist that `release_sdist.yml` publishes. `cibuildwheel.yml` stays the ABI
+  regression gate and publishes nothing.
 
 Runtime behaviour and knobs:
 
@@ -803,7 +856,13 @@ Runtime behaviour and knobs:
   went from 157 to 39 us; `scripts/bench_stream_capacity.py` reproduces that).
 
 Source distributions are unchanged: without a prebuilt `.so` the package installs as pure Python and compiles
-per torch at first use, exactly as before (`torch < 2.10` always takes that path).
+per torch at first use, exactly as before. `torch < 2.10` always takes that path, even when the wheel was
+installed - with the one warning quoted above, and nothing else changes.
+
+A CPU wheel on a GPU machine is not a dead end either: asking for CUDA coding makes
+`utils._ensure_native_for` compile a CUDA extension for the local torch (`TORCH_ANS_FORCE_RUNTIME_BUILD=1`
+does the same unconditionally). The runtime build is a pybind11 module, so it cannot collide with the
+operator schemas the prebuilt library registered in the dispatcher.
 
 ### TODO
 - Docs and examples for high-level API
