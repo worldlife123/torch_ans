@@ -30,8 +30,11 @@ name: Publish the prebuilt stable-ABI wheels
 #   platform tag is then set by hand from the image (`manylinux_2_28`), since
 #   auditwheel is the step that would normally do it.
 #
-# `cibuildwheel` is pinned to a major tag; pin it to a release tag
-# (`@v3.x.y`) if a build ever needs to be reproduced bit for bit.
+# `cibuildwheel` is pinned to a release tag on purpose: the project publishes no
+# floating major tag (`pypa/cibuildwheel@v3` does not resolve - the refs are
+# `v3.x` and `v3.x.y` only), and an unresolvable `uses:` fails every job of the
+# matrix during "Set up job", before a single step runs. Check
+# https://github.com/pypa/cibuildwheel/releases when bumping it.
 
 on:
   push:
@@ -61,7 +64,10 @@ jobs:
           - os: macos-latest
             name: macOS arm64
             artifact: wheel-macos-arm64
-          - os: macos-13
+          # `macos-13` (the old Intel runner) was retired: labelling this job
+          # with it leaves it queued forever. `macos-15-intel` is what the test
+          # matrix uses for the same hardware.
+          - os: macos-15-intel
             name: macOS x86_64
             artifact: wheel-macos-x86_64
           - os: windows-latest
@@ -73,7 +79,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build the wheel
-        uses: pypa/cibuildwheel@v3
+        uses: pypa/cibuildwheel@v3.4.1
         env:
           # One CPython is enough: the stable-ABI libraries export no Python
           # symbols at all (asserted below), so the wheel is retagged py3-none
@@ -93,7 +99,7 @@ jobs:
           # switch has to be repeated. 11.0 is the oldest macOS torch ships for.
           CIBW_ENVIRONMENT_MACOS: "WITH_STABLE_ABI=1 MACOSX_DEPLOYMENT_TARGET=11.0"
           CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-13' && 'x86_64' || 'arm64' }}
+          CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-15-intel' && 'x86_64' || 'arm64' }}
           CIBW_ARCHS_WINDOWS: "AMD64"
           # manylinux_2_28 is the oldest glibc that still runs everywhere;
           # cibuildwheel picks the matching container automatically.
@@ -124,7 +130,7 @@ jobs:
           python-version: "3.11"
 
       - name: Download every wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: wheel-*
           path: wheelhouse
@@ -221,7 +227,7 @@ jobs:
           python-version: "3.11"
 
       - name: Download the wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-publish
           path: wheelhouse
@@ -297,7 +303,7 @@ jobs:
           python-version: "3.11"
 
       - name: Download the wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-publish
           path: wheelhouse
@@ -340,7 +346,7 @@ jobs:
           python-version: "3.11"
 
       - name: Download the wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-publish
           path: wheelhouse
