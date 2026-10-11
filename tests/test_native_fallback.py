@@ -493,6 +493,8 @@ def test_stable_loader_warns_and_falls_back_when_loading_fails(
 def test_stable_loader_warns_when_only_the_cuda_library_is_unusable(
         stable_loader, monkeypatch):
     """A broken CUDA library must not break CPU coding."""
+    import torch
+
     stable, directory = stable_loader
     (directory / "_C_cpu.so").write_bytes(b"")
     (directory / "_C_cuda.so").write_bytes(b"")
@@ -501,7 +503,12 @@ def test_stable_loader_warns_when_only_the_cuda_library_is_unusable(
     with pytest.warns(RuntimeWarning, match="CUDA extension"):
         assert stable.load_stable(require_cuda=True) is None
 
-    # a CPU request still succeeds, with the same warning and without CUDA
+    # a CPU request still succeeds, with the same warning and without CUDA.
+    # `_load` only reaches for `_C_cuda` when a GPU is visible, so there has to
+    # be one for this half to mean anything: the case under test is a *broken*
+    # CUDA library, not the hardware of the machine running the suite (a CI
+    # runner has no GPU and would otherwise see no warning at all).
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(stable, "_loaded", {})
     with pytest.warns(RuntimeWarning, match="CUDA extension"):
         module = stable.load_stable()

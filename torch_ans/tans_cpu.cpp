@@ -118,14 +118,21 @@ ta::Tensor tans_build_tables(const ta::Tensor& cdfs, const ta::Tensor& cdfs_size
 // rans32_16: the CUDA warp kernels code one row per full warp with it, and the
 // CPU kernels below instantiate it too - the stream is a plain interleaved one
 // either way, so a 32-lane stream is interchangeable between the two.
-#define TANS_ILV_IS_SUPPORTED(num_interleaves) \
-  ((num_interleaves) == 1 || (num_interleaves) == 2 || \
-   (num_interleaves) == 4 || (num_interleaves) == 8 || (num_interleaves) == 32)
+// `constexpr` rather than a `#define` on purpose: as a function-like macro used
+// as the argument of the variadic `STD_TORCH_CHECK` it silently stopped
+// validating under MSVC (the Windows jobs of the 0.4.0 matrix reported "DID NOT
+// RAISE" for `tans32_init_stream(..., 3, ...)` while every other
+// `STD_TORCH_CHECK` in the same file still threw), and the condition reads
+// better as a function anyway.
+constexpr bool tans_interleaves_supported(int64_t num_interleaves) {
+  return num_interleaves == 1 || num_interleaves == 2 || num_interleaves == 4 ||
+         num_interleaves == 8 || num_interleaves == 32;
+}
 
 template <typename TANS_STATE_TYPE, typename TANS_STREAM_TYPE>
 ta::Tensor tans_init_stream(int64_t size, int64_t num_interleaves, int64_t preallocate_size)
 {
-  STD_TORCH_CHECK(TANS_ILV_IS_SUPPORTED(num_interleaves),
+  STD_TORCH_CHECK(tans_interleaves_supported(num_interleaves),
                   "tans_init_stream: num_interleaves must be 1, 2, 4, 8 or 32 for tANS "
                   "(got ", num_interleaves, "); 32 is the full-warp group of the CUDA "
                   "interleaved kernels, which the CPU kernels implement as well");

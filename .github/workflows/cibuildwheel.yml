@@ -171,6 +171,11 @@ jobs:
   cross-version-load:
     name: Load one wheel under torch ${{ matrix.torch }}
     needs: build-stable-wheel
+    # A job without `runs-on` makes the *whole file* invalid: GitHub then rejects
+    # every push of this workflow with a zero-job startup failure and displays it
+    # under the file path instead of its `name` - which is what happened to this
+    # workflow from v0.1.1 up to v0.3.0.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

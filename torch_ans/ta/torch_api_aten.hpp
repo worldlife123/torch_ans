@@ -104,7 +104,13 @@ inline T* data_ptr(const Tensor& t) {
 
 template <typename T>
 inline const T* const_data_ptr(const Tensor& t) {
-  return t.const_data_ptr<T>();
+  // `data_ptr<T>()` rather than ATen's `const_data_ptr<T>()`: the latter only
+  // exists from torch 1.11 on, while `pyproject.toml` still promises
+  // `torch>=1.10` and the CI matrix builds against 1.10.1 (where
+  // `const_data_ptr` is not a member of at::Tensor at all). It is
+  // const-qualified in every release and returns the same pointer - this helper
+  // *is* the const spelling of it.
+  return t.data_ptr<T>();
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +221,8 @@ inline T max_scalar(const Tensor& t) {
   if (!reduced.is_cpu()) {
     reduced = ta::to(reduced, Device(DeviceType::CPU, 0));
   }
-  return *reduced.const_data_ptr<T>();
+  // through the helper, which is the torch >= 1.10 spelling of this read
+  return *ta::const_data_ptr<T>(reduced);
 }
 
 // ---------------------------------------------------------------------------

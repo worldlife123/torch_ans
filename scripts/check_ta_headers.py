@@ -48,6 +48,12 @@ TA_DIR = ROOT / "torch_ans" / "ta"
 #: lowest ABI a stable-ABI .so claims to support (torch 2.10).
 TORCH_TARGET_VERSION = "0x020a000000000000"
 
+#: The same floor as a version, for the skip decision below: the stable half of
+#: the check needs torch's stable-ABI headers, which only exist from here on.
+#: Kept in step with `torch_ans/_stable_C.STABLE_ABI_MIN_TORCH` and with
+#: `TORCH_TARGET_VERSION` above (both are torch 2.10).
+STABLE_ABI_MIN_TORCH = (2, 10)
+
 #: One arch is enough to syntax-check kernels; sm_75 is what the POC used.
 CUDA_ARCH = "compute_75,code=sm_75"
 
@@ -192,6 +198,71 @@ def _torch_includes(needs_python: bool):
     return ["-I" + p for p in json.loads(out)]
 
 
+def _torch_probe():
+    """(`torch.__version__`, `torch.version.cuda`) of the installed torch.
+
+    Everything the skip decisions need, asked once so that the two answers come
+    from the same process: the CUDA half needs a torch built with CUDA
+    (`torch.version.cuda is not None`), the stable half a torch that has the
+    stable ABI - a CPU-only wheel has no `c10/cuda` headers that can compile and
+    a torch below `STABLE_ABI_MIN_TORCH` no `<torch/csrc/stable/...>` at all.
+    """
+    code = ("import json, torch\n"
+            "print(json.dumps({'version': torch.__version__,\n"
+            "                  'cuda': torch.version.cuda}))\n")
+    return json.loads(subprocess.check_output([sys.executable, "-c", code], text=True))
+
+
+def _version_tuple(version):
+    """`(major, minor)` of a torch version string ('2.11.0+cu130' -> (2, 11))."""
+    parts = []
+    for chunk in version.split("+")[0].split(".")[:2]:
+        digits = "".join(char for char in chunk if char.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts)
+
+
+def _cxx_skip_reason():
+    """Why the two `-fsyntax-only` combinations cannot be checked, or None.
+
+    Windows has no compiler this check can use: MSVC is not a drop-in for
+    `-fsyntax-only` and the mingw `g++` on the CI runners cannot parse ATen's
+    headers (measured: `aten-cpp` fails there). The Windows build is covered by
+    the extension build itself, which compiles every kernel with MSVC.
+    """
+    if sys.platform == "win32":
+        return ("the g++ syntax check does not apply on Windows (the MSVC build "
+                "of the extension is the real check)")
+    if shutil.which("g++") is None:
+        return "no g++ on PATH"
+    return None
+
+
+def _stable_skip_reason(probe):
+    """Why the stable-ABI combinations cannot be checked, or None.
+
+    `torch_api_stable.hpp` includes `<torch/csrc/stable/accelerator.h>`, which
+    only ships from torch 2.10 on (the ABI this layer's stable backend and the
+    prebuilt wheel target); with an older torch the honest answer is "not
+    applicable", not "broken".
+    """
+    if _version_tuple(probe["version"]) >= STABLE_ABI_MIN_TORCH:
+        return None
+    return ("the installed torch (%s) predates the stable ABI "
+            "(torch >= %s)" % (probe["version"],
+                               ".".join(str(part) for part in STABLE_ABI_MIN_TORCH)))
+
+
+def _cuda_torch_skip_reason(probe):
+    """Why no CUDA combination can be checked, before even looking for nvcc."""
+    if probe["cuda"] is None:
+        return ("the installed torch is a CPU-only build (torch.version.cuda is "
+                "None, so its c10/cuda headers cannot compile)")
+    return None
+
+
 def _find_nvcc(cuda_home):
     """nvcc from an explicit CUDA home, else the newest local /usr/local one.
 
@@ -229,7 +300,10 @@ def _find_ccbin(ccbin):
     return None
 
 
-def _cuda_skip_reason(cuda_home):
+def _cuda_skip_reason(cuda_home, probe):
+    reason = _cuda_torch_skip_reason(probe)
+    if reason:
+        return reason
     nvcc, _ = _find_nvcc(cuda_home)
     if nvcc is None:
         return "no nvcc found (pass --cuda-home or set CUDA_HOME)"
@@ -283,6 +357,13 @@ def main(argv=None):
     if args.no_cuda and args.only_cuda:
         parser.error("--no-cuda and --only-cuda are mutually exclusive")
 
+    torch_probe = _torch_probe()
+    #: A combination that does not apply here is skipped, not failed: a CPU-only
+    #: torch cannot compile the c10/cuda headers, a torch below 2.10 has no
+    #: stable-ABI ones, and Windows has no g++ that can parse ATen's headers.
+    cxx_reason = _cxx_skip_reason()
+    stable_reason = _stable_skip_reason(torch_probe)
+
     aten_includes = _torch_includes(needs_python=True)
     stable_includes = _torch_includes(needs_python=False)
     common_flags = ["-std=c++17", "-I" + str(TA_DIR)]
@@ -304,6 +385,11 @@ def main(argv=None):
                 ("aten-cpp", [], aten_includes),
                 ("stable-cpp", STABLE_DEFINES, stable_includes),
             ):
+                reason = cxx_reason or (stable_reason if name.startswith("stable")
+                                        else None)
+                if reason:
+                    print(f"[skip] {name:10} ({reason})")
+                    continue
                 command = ["g++", "-fsyntax-only"] + common_flags + includes + defines
                 command += [cpp_path]
                 if not _check(name, command, args.verbose):
@@ -314,7 +400,7 @@ def main(argv=None):
             print("[skip] aten-cu   (--no-cuda)")
             print("[skip] stable-cu (--no-cuda)")
         else:
-            reason = _cuda_skip_reason(args.cuda_home)
+            reason = _cuda_skip_reason(args.cuda_home, torch_probe)
             if reason:
                 print(f"[skip] aten-cu   ({reason})")
                 print(f"[skip] stable-cu ({reason})")
@@ -330,6 +416,9 @@ def main(argv=None):
                     ("stable-cu", STABLE_DEFINES + STABLE_CU_DEFINES,
                      stable_includes),
                 ):
+                    if name.startswith("stable") and stable_reason:
+                        print(f"[skip] {name:10} ({stable_reason})")
+                        continue
                     command = [nvcc, "-c"] + common_flags + cuda_flags + includes
                     command += defines + [cu_path, "-o", tmp / (name + ".o")]
                     if args.verbose:
