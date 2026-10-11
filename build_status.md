@@ -43,11 +43,11 @@
 | linux | x86_64 | 3.7 | cpu | lazy | ✅ |
 | linux | x86_64 | 3.8 | cpu | lazy | ✅ |
 | linux | x86_64 | 3.9 | cpu | lazy | ✅ |
-| macos | arm64 | 3.10 | cpu | lazy | ❌ |
-| macos | arm64 | 3.11 | cpu | lazy | ❌ |
-| macos | arm64 | 3.12 | cpu | lazy | ❌ |
-| macos | arm64 | 3.13 | cpu | lazy | ❌ |
-| macos | arm64 | 3.14 | cpu | lazy | ❌ |
+| macos | arm64 | 3.10 | cpu | lazy | ✅ |
+| macos | arm64 | 3.11 | cpu | lazy | ✅ |
+| macos | arm64 | 3.12 | cpu | lazy | ✅ |
+| macos | arm64 | 3.13 | cpu | lazy | ✅ |
+| macos | arm64 | 3.14 | cpu | lazy | ✅ |
 | windows | x86_64 | 3.10 | cpu | lazy | ✅ |
 | windows | x86_64 | 3.11 | cpu | lazy | ✅ |
 | windows | x86_64 | 3.12 | cpu | lazy | ✅ |
@@ -57,4 +57,4 @@
 | windows | x86_64 | 3.8 | cpu | lazy | ✅ |
 | windows | x86_64 | 3.9 | cpu | lazy | ✅ |
 
-Last updated: Mon Sep 14 17:13:51 UTC 2026
+Last updated: Mon Sep 14 17:45:55 UTC 2026
