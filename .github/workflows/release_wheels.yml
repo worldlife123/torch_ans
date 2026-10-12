@@ -85,6 +85,13 @@ jobs:
           # and building it for five interpreters would produce five identical
           # files.
           CIBW_BUILD: "cp311-*"
+          # musllinux is not a target: PyTorch publishes no musl wheel above
+          # 2.6, so that container installs the *glibc* torch and setup.py - with
+          # no stable ABI to build against - installs a pure-Python package:
+          # cibuildwheel then rejects the run ("Build failed because a pure
+          # Python wheel was generated"). Everything above the ABI floor is
+          # manylinux, which is what this wheel is for.
+          CIBW_SKIP: "*-musllinux_*"
           # `setup.py` has to import torch for its headers and for
           # `cpp_extension`'s include paths, so the build must not be isolated.
           # torch is *not* a runtime dependency of the .so - it is installed
