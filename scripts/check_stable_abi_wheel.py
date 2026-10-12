@@ -50,6 +50,15 @@ FORBIDDEN_SYMBOL_PATTERNS = [
 #: Libraries that must not be DT_NEEDED entries of a prebuilt `.so`.
 FORBIDDEN_NEEDED = ("libtorch_python", "libpython")
 
+#: Ceiling for one native library. Measured, stripped: 2.4 MB (Windows AMD64),
+#: 3.8 MB (macOS arm64), 5.2 MB (manylinux, `.text` alone is 4.3 MB of it). The
+#: ceiling is far above that and far below what debug information costs: the
+#: first published Linux wheel carried a 69.6 MB `.so` of which 64.5 MB was
+#: `.debug_*` (`.debug_loc` 24.4, `.debug_info` 16.0, `.debug_str` 13.1 MB),
+#: because the manylinux image's CPython CFLAGS carry `-g` and the auditwheel
+#: run that would strip it is skipped on purpose - see setup.py's `-g0`.
+MAX_LIBRARY_BYTES = 25 * 1000 * 1000
+
 #: On top of `FORBIDDEN_NEEDED`, what "tied to one torch build" looks like per
 #: platform. Windows spells the same libraries without the `lib` prefix and
 #: links the CPython import library, which shows up as `python3xx.dll`. macOS
@@ -177,6 +186,18 @@ def check_wheel(wheel: Path, require_cuda: bool, platform: str = "auto") -> None
             forbidden_names = FORBIDDEN_NEEDED + EXTRA_FORBIDDEN_NEEDED.get(platform, ())
             for library in libraries:
                 print(f"  {library.name}")
+                size = library.stat().st_size
+                print(f"    size: {size / 1e6:.2f} MB")
+                # Checked before the tool-dependent half (and on every platform):
+                # a wheel that kept its debug information is the one mistake no
+                # symbol check notices.
+                if size > MAX_LIBRARY_BYTES:
+                    failures.append(
+                        f"{library.name} is {size / 1e6:.1f} MB (ceiling "
+                        f"{MAX_LIBRARY_BYTES / 1e6:.0f} MB): that is debug "
+                        f"information, not code - the stable build passes `-g0` "
+                        f"for this reason (setup.py) and the repair step that "
+                        f"would strip it is skipped on purpose")
                 if tools:
                     continue
                 if platform != "windows":

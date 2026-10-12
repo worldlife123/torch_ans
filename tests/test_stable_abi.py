@@ -429,6 +429,10 @@ def test_stable_abi_flags_are_spelled_per_platform():
         "macOS has no --as-needed, so libtorch_cpu stays linked and dyld has to "
         "find it through an rpath into the *user's* torch install")
     assert "/O2" in code, "MSVC's optimisation level is /O2; -O3 is rejected"
+    assert "-g0" in code, (
+        "the manylinux image's CPython CFLAGS carry -g, and the auditwheel run "
+        "that would strip the result is skipped on purpose: without -g0 the "
+        "first published wheel shipped a 69.6 MB .so, 64.5 MB of it .debug_*")
     for platform_ in ("win32", "darwin"):
         assert f'sys.platform == "{platform_}"' in code, (
             f"{platform_} has no branch: it would get the Linux flags")

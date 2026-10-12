@@ -176,11 +176,18 @@ def _stable_abi_platform_flags(defines):
     "optimise, and do not record a dependency on the torch that built it" is
     spelled in the dialect of each toolchain:
 
-    * Linux   - `-O3` plus `-Wl,--as-needed`: GNU ld drops the libraries whose
-      symbols are unused, which is how the `-ltorch_python` that
+    * Linux   - `-O3`, `-g0` plus `-Wl,--as-needed`: GNU ld drops the libraries
+      whose symbols are unused, which is how the `-ltorch_python` that
       `cpp_extension.CppExtension` links unconditionally disappears (measured:
       the built library's DT_NEEDED is exactly `libc10`, `libtorch_cpu` and the
-      system libraries);
+      system libraries). `-g0` is not cosmetic: the manylinux image's CPython
+      CFLAGS carry `-g`, and the auditwheel run that would normally strip the
+      result is skipped here on purpose - unasked, the first published wheel
+      shipped a 69.6 MB `.so` of which 64.5 MB was `.debug_*`
+      (`.debug_loc` 24.4, `.debug_info` 16.0, `.debug_str` 13.1 MB) against
+      4.3 MB of `.text`. `-g0` comes after the CFLAGS `-g`, so it wins. The
+      CUDA build inherits it through the `cxx` list; nvcc needs no equivalent
+      (it emits no debug information unless `-g` is passed to it);
     * macOS   - ld64 has no `--as-needed` (`ld: unknown option: --as-needed`),
       so only `-ltorch_python` is dropped (below) and the dylibs that carry the
       stable C shim stay - with an rpath into the *user's* torch install, which
@@ -198,7 +205,7 @@ def _stable_abi_platform_flags(defines):
         # (site-packages/torch_ans/), so `../torch/lib` is the torch it was built
         # against *and* the one the user's `import torch` loads.
         return {"cxx": ["-O3"] + defines}, ["-Wl,-rpath,@loader_path/../torch/lib"]
-    return {"cxx": ["-O3"] + defines}, ["-Wl,--as-needed"]
+    return {"cxx": ["-O3", "-g0"] + defines}, ["-Wl,--as-needed"]
 
 
 def _stable_abi_drop_libraries(extension):
