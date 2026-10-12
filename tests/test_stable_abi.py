@@ -34,6 +34,8 @@ import torch
 
 from torch_ans import _dynamic_build, _stable_C
 
+from stream_helpers import uint8_view
+
 ROOT = Path(__file__).resolve().parents[1]
 
 #: Loading the prebuilt extension registers its operators process-wide, so the
@@ -157,7 +159,7 @@ def _coded_bytes(stream):
     bitstream, starting at the second element).
     """
     lengths = stream[:, 0].tolist()
-    raw = stream.view(torch.uint8).reshape(stream.shape[0], -1)
+    raw = uint8_view(stream)
     return [bytes(raw[row, 4:4 + int(length)].tolist())
             for row, length in enumerate(lengths)]
 

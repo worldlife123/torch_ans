@@ -366,6 +366,11 @@ def main(argv=None):
 
     aten_includes = _torch_includes(needs_python=True)
     stable_includes = _torch_includes(needs_python=False)
+    # Same workaround as setup.py's `darwin_extra`: clang on macOS (Xcode 16)
+    # turns torch's own `std::is_arithmetic` specialization in
+    # c10/util/strong_type.h into an error, which has nothing to do with this
+    # layer. Without it the `aten-cpp` combination fails on every macOS runner.
+    cxx_platform_flags = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
     common_flags = ["-std=c++17", "-I" + str(TA_DIR)]
 
     failures = []
@@ -390,7 +395,8 @@ def main(argv=None):
                 if reason:
                     print(f"[skip] {name:10} ({reason})")
                     continue
-                command = ["g++", "-fsyntax-only"] + common_flags + includes + defines
+                command = ["g++", "-fsyntax-only"] + common_flags + cxx_platform_flags
+                command += includes + defines
                 command += [cpp_path]
                 if not _check(name, command, args.verbose):
                     failures.append(name)

@@ -21,6 +21,8 @@ import torch
 from torch_ans import utils
 from torch_ans.utils import TorchANSInterface
 
+from stream_helpers import uint8_view
+
 BATCH = 2
 SEQ = 32
 NUM_DISTS = 4
@@ -91,7 +93,7 @@ def _used_bytes(stream):
 def _coded_rows(stream):
     """Per row: the length word plus the bytes it counts (no padding)."""
     lengths = stream[:, 0].tolist()
-    raw = stream.view(torch.uint8).reshape(stream.shape[0], -1)
+    raw = uint8_view(stream)
     return [bytes(raw[row, 4:4 + int(length)].tolist())
             for row, length in enumerate(lengths)]
 

@@ -116,7 +116,11 @@ class _StableModule:
         if namespace is not None:
             try:
                 return getattr(namespace, name)
-            except AttributeError:
+            except (AttributeError, RuntimeError):
+                # torch < 2.0 answers a missing operator with a RuntimeError
+                # ("No such operator torch_ans::x") instead of an
+                # AttributeError; both mean the same thing here, and the
+                # AttributeError below is the one callers document.
                 pass
         raise AttributeError(
             f"the stable-ABI extension does not provide {name!r}; it was loaded "

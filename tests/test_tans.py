@@ -64,6 +64,8 @@ from torch_ans import _dynamic_build as build_config
 from torch_ans import utils
 from torch_ans.utils import TorchANSInterface
 
+from stream_helpers import uint8_view
+
 #: (family, freq_precision cap) - see ans_build_config.hpp / tans_utils.hpp
 FAMILIES = (("tans32", 15), ("tans16", 15), ("tans8", 7))
 
@@ -363,7 +365,7 @@ def test_interleaved_byte_string_roundtrip(family, cap, num_interleaves):
     getattr(module, _op_name(family, num_interleaves, "push"))(
         stream, symbols, indexes, tables, cdfs_sizes, offsets, 8, fp, True, 4)
     byte_strings = module.rans_stream_to_byte_strings(stream)
-    raw = stream.view(torch.uint8).reshape(stream.shape[0], -1)
+    raw = uint8_view(stream)
     lengths = stream[:, 0].tolist()
     for row, byte_string in enumerate(byte_strings):
         assert bytes(byte_string) == bytes(raw[row, 4:4 + int(lengths[row])].tolist())
@@ -497,7 +499,7 @@ def test_byte_string_roundtrip(family, cap):
     byte_strings = module.rans_stream_to_byte_strings(stream)
     # each byte string is exactly the coded bytes (the length word counts the
     # header, which the byte string includes)
-    raw = stream.view(torch.uint8).reshape(stream.shape[0], -1)
+    raw = uint8_view(stream)
     lengths = stream[:, 0].tolist()
     for row, byte_string in enumerate(byte_strings):
         assert bytes(byte_string) == bytes(raw[row, 4:4 + int(lengths[row])].tolist())
@@ -637,8 +639,22 @@ def test_unsupported_interleave_factors_are_rejected():
     """
     module = _tans_module("tans32")
     for unsupported in (0, 3, 16, 64):
-        with pytest.raises((ValueError, RuntimeError), match="num_interleaves"):
-            module.tans32_init_stream(2, unsupported, 0)
+        try:
+            stream = module.tans32_init_stream(2, unsupported, 0)
+        except (ValueError, RuntimeError) as error:
+            assert "num_interleaves" in str(error), error
+        else:
+            # Deliberately not `pytest.raises`: when nothing is raised, which is
+            # what the Windows jobs of the matrix do, the only way to tell a
+            # missing validation from the wrong module being called is to name
+            # both. (`pytest.raises` would only say "DID NOT RAISE".)
+            pytest.fail(
+                f"num_interleaves={unsupported} was accepted and returned a "
+                f"{tuple(stream.shape)} {stream.dtype} stream.\n"
+                f"module: {module!r}\n"
+                f"module file: {getattr(module, '__file__', '<edited out>')}\n"
+                f"lazy shim: {hasattr(module, 'ensure_module')}\n"
+                f"init_stream: {module.tans32_init_stream!r}")
     stream = module.tans32_init_stream(2, 32, 0)
     assert int(stream[:, 0].unique().item()) == 4 * (32 + 2)
 

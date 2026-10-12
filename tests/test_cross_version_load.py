@@ -37,6 +37,8 @@ import torch
 
 from torch_ans import _stable_C
 
+from stream_helpers import uint8_view
+
 #: Where the probe result of another torch version is, for the pytest entry point.
 REFERENCE_ENV_VAR = "TORCH_ANS_CROSS_VERSION_REFERENCE"
 
@@ -87,7 +89,7 @@ def stream_digest(stream) -> str:
     """Hash the coded part of every row (the length word plus what it counts)."""
     data = stream.contiguous().cpu()
     lengths = data[:, 0].tolist()
-    raw = data.view(torch.uint8)
+    raw = uint8_view(data)
     out = []
     for row, length in enumerate(lengths):
         # .tolist() rather than .numpy(): the probe must not need numpy
