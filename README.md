@@ -31,7 +31,7 @@ It is therefore recommended to install a specific version of [PyTorch](https://p
 pip install torch_ans --no-build-isolation
 ```
 
-On Linux (x86_64), macOS (arm64/x86_64) and Windows (AMD64) pip picks the prebuilt stable-ABI wheel, so **nothing is compiled** - provided your `torch` is `>= 2.10`, which is what the wheel's `.so` targets. With an older torch the wheel is still installed (pip cannot express "this wheel needs torch >= 2.10" without being willing to *upgrade* your torch), and `torch_ans` tells you so once and compiles for your torch instead:
+On Linux x86_64, macOS arm64 and Windows AMD64 pip picks the prebuilt stable-ABI wheel, so **nothing is compiled** - provided your `torch` is `>= 2.10`, which is what the wheel's `.so` targets. With an older torch the wheel is still installed (pip cannot express "this wheel needs torch >= 2.10" without being willing to *upgrade* your torch), and `torch_ans` tells you so once and compiles for your torch instead:
 
 ```
 RuntimeWarning: torch_ans ships a prebuilt extension (_C_cpu...) that needs torch >= 2.10,
@@ -802,10 +802,11 @@ Published files of a release (CPU flavour - the CUDA flavour is not published ye
 | --- | --- |
 | Linux x86_64 | `py3-none-manylinux_2_28_x86_64` |
 | macOS arm64 | `py3-none-macosx_11_0_arm64` |
-| macOS x86_64 | `py3-none-macosx_11_0_x86_64` |
 | Windows AMD64 | `py3-none-win_amd64` |
 
-plus the sdist, which is what pip falls back to everywhere else.
+plus the sdist, which is what pip falls back to everywhere else - including
+**macOS x86_64**: PyTorch publishes no Intel macOS wheel above 2.2, so that
+platform has no `torch >= 2.10` for this wheel to target and gets the sdist.
 
 Building one locally works the same way:
 

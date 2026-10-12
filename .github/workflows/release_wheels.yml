@@ -64,12 +64,11 @@ jobs:
           - os: macos-latest
             name: macOS arm64
             artifact: wheel-macos-arm64
-          # `macos-13` (the old Intel runner) was retired: labelling this job
-          # with it leaves it queued forever. `macos-15-intel` is what the test
-          # matrix uses for the same hardware.
-          - os: macos-15-intel
-            name: macOS x86_64
-            artifact: wheel-macos-x86_64
+          # No macOS x86_64 leg: PyTorch publishes no macOS Intel wheel above
+          # 2.2, so that platform cannot have the stable ABI (2.10) this wheel
+          # needs at all - `pip install torch` there installs 2.2.2 and the build
+          # dies on `torch/csrc/stable/accelerator.h`. Intel macOS users are
+          # served by the sdist, which is exactly what they have today.
           - os: windows-latest
             name: Windows AMD64
             artifact: wheel-win-amd64
@@ -92,23 +91,30 @@ jobs:
           # here only so the compiler can see its headers.
           CIBW_BUILD_FRONTEND: "build; args: --no-isolation"
           CIBW_BEFORE_BUILD: >
-            pip install --upgrade pip setuptools wheel build ninja &&
-            pip install torch --index-url https://download.pytorch.org/whl/cpu
+            python -m pip install --upgrade setuptools wheel build ninja &&
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           CIBW_ENVIRONMENT: "WITH_STABLE_ABI=1"
           # The platform-specific spelling *replaces* CIBW_ENVIRONMENT, so the
           # switch has to be repeated. 11.0 is the oldest macOS torch ships for.
           CIBW_ENVIRONMENT_MACOS: "WITH_STABLE_ABI=1 MACOSX_DEPLOYMENT_TARGET=11.0"
           CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_ARCHS_MACOS: ${{ matrix.os == 'macos-15-intel' && 'x86_64' || 'arm64' }}
+          CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           # manylinux_2_28 is the oldest glibc that still runs everywhere;
           # cibuildwheel picks the matching container automatically.
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          # See the header: no auditwheel / delocate for this wheel.
+          # See the header: no auditwheel / delocate for this wheel - it is
+          # *meant* to use the torch the user has. The `cp` is not optional:
+          # cibuildwheel fails the build when the repair step leaves `{dest_dir}`
+          # without a wheel ("the repair step completed successfully but did not
+          # produce a wheel"), which is what the bare `echo` did on Linux and
+          # macOS arm64 - both wheels had been built successfully by then.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
-            echo "skipping auditwheel: libc10/libtorch_cpu come from the torch wheel"
+            echo "skipping auditwheel: libc10/libtorch_cpu come from the torch wheel" &&
+            cp {wheel} {dest_dir}
           CIBW_REPAIR_WHEEL_COMMAND_MACOS: >-
-            echo "skipping delocate: libtorch_cpu is reached through @rpath/../torch/lib"
+            echo "skipping delocate: libtorch_cpu is reached through @rpath/../torch/lib" &&
+            cp {wheel} {dest_dir}
 
       - name: Upload the wheel
         uses: actions/upload-artifact@v7
@@ -178,7 +184,7 @@ jobs:
           import glob, pathlib, sys
 
           wheels = sorted(glob.glob("wheelhouse/*.whl"))
-          assert len(wheels) == 4, f"expected one wheel per platform: {wheels}"
+          assert len(wheels) == 3, f"expected one wheel per platform: {wheels}"
           for wheel in wheels:
               python_tag, abi, platform = pathlib.Path(wheel).stem.split("-")[-3:]
               assert (python_tag, abi) == ("py3", "none"), (
@@ -212,8 +218,6 @@ jobs:
             name: Linux x86_64
           - os: macos-latest
             name: macOS arm64
-          - os: macos-13
-            name: macOS x86_64
           - os: windows-latest
             name: Windows AMD64
 

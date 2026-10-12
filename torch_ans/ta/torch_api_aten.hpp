@@ -75,16 +75,43 @@ using DeviceType = at::DeviceType;
 // <torch/extension.h> may already have pulled the header-only definition in;
 // overwriting it would be a redefinition warning and would silently change the
 // exception type.
+namespace detail {
+
+// Builds the c10::Error for a failed `STD_TORCH_CHECK`. A function, not a macro
+// sending `__VA_ARGS__` on: the message arguments have to be split by whoever
+// parses the call, and MSVC's traditional preprocessor substitutes `__VA_ARGS__`
+// as a *single* argument. With the previous spelling
+// (`#define STD_TORCH_CHECK(...) TORCH_CHECK(__VA_ARGS__)`) the expansion became
+// `if (!(cond, "message", value))` there - a comma expression whose value is its
+// last operand, i.e. always true - so *every* check in an MSVC ATen build was a
+// silent no-op. Measured in CI: `tans_init_stream` accepted
+// `num_interleaves=0` on Windows (both the setuptools install and a fresh JIT
+// build) while gcc and clang threw, and the checks whose tests did pass there
+// (tans_utils.hpp's "sums to" / "no probability mass") come from an
+// `std::string* error` out-parameter, not from this macro.
+template <typename... Args>
+[[noreturn]] inline void check_failed(const Args&... args) {
+  if constexpr (sizeof...(Args) == 0) {
+    // `STD_TORCH_CHECK(cond)` is a legal call (19 of the call sites use it), and
+    // a trailing empty `__VA_ARGS__` does not compile on torch 2.7.
+    TORCH_CHECK(false, "torch_ans: a ta:: precondition does not hold");
+  } else {
+    TORCH_CHECK(false, args...);
+  }
+}
+
+}  // namespace detail
+
 #ifndef STD_TORCH_CHECK
-// NOTE: every argument is forwarded verbatim (`TORCH_CHECK(__VA_ARGS__)`)
-// instead of naming the condition and appending `__VA_ARGS__`: the usual call is
-// the single-argument `STD_TORCH_CHECK(cond)`, and `TORCH_CHECK(cond, )` with
-// that trailing empty argument only compiles on the newer torch releases (on
-// torch 2.7 the message-building macro cannot take an empty `__VA_ARGS__` and
-// fails with "expected primary-expression before ')' token"). Forwarding is
-// equivalent for the multi-argument form and makes the macro version
-// independent.
-#define STD_TORCH_CHECK(...) TORCH_CHECK(__VA_ARGS__)
+// The condition is a *named* parameter, so it is the caller's expression: that
+// is the whole point (see `detail::check_failed` for what the variadic
+// forwarding used to do on MSVC).
+#define STD_TORCH_CHECK(cond, ...) \
+  do {                             \
+    if (!(cond)) {                 \
+      ::ta::detail::check_failed(__VA_ARGS__); \
+    }                              \
+  } while (0)
 #endif
 
 // ---------------------------------------------------------------------------

@@ -567,8 +567,11 @@ def test_high_level_api(family, cap):
     interface.set_stream(encoded)
     assert torch.equal(interface.decode_stream(indexes), symbols)
 
-    # the dist_freqs pattern (a distribution per symbol)
-    flat_indexes = indexes.reshape(-1)
+    # the dist_freqs pattern (a distribution per symbol). `.long()` because an
+    # integer index tensor has to be int64 before torch 2.0, where these rows
+    # are otherwise fine: `IndexError: tensors used as indices must be long,
+    # byte or bool tensors` was the last failure of the 1.10.1 CI entry.
+    flat_indexes = indexes.reshape(-1).long()
     per_symbol_freqs = freqs[flat_indexes].reshape(2, 128, alphabet)
     per_symbol_num = num_freqs[flat_indexes].reshape(2, 128)
     per_symbol_offsets = offsets[flat_indexes].reshape(2, 128)
