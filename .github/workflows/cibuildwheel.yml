@@ -196,13 +196,20 @@ jobs:
           python-version: "3.11"
 
       - name: Download the prebuilt wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-stable-cpu
           path: wheelhouse
 
       - name: Install torch and the *same* wheel
+        # `pytest` as well: the probe is `tests/test_cross_version_load.py`, the
+        # module that also serves the pytest entry point, so it imports pytest
+        # before it can run `main()`. Without it every job of this matrix failed
+        # with `ModuleNotFoundError: No module named 'pytest'` on the 0.4.0 tag -
+        # the first run this gate ever had (it was invalid until the `runs-on`
+        # above was restored).
         run: |
+          pip install pytest
           pip install "torch==${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
           pip install --no-deps wheelhouse/*.whl
           python -c "import torch; print('torch', torch.__version__)"
@@ -233,7 +240,7 @@ jobs:
           python-version: "3.11"
 
       - name: Download every probe
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: probe-*
           path: probes

@@ -34,6 +34,7 @@ Usage::
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -199,18 +200,46 @@ def _torch_includes(needs_python: bool):
 
 
 def _torch_probe():
-    """(`torch.__version__`, `torch.version.cuda`) of the installed torch.
+    """(`torch.__version__`, `torch.version.cuda`, `<torch>/include`) in one call.
 
-    Everything the skip decisions need, asked once so that the two answers come
-    from the same process: the CUDA half needs a torch built with CUDA
+    Everything the skip decisions need, asked once so that the answers come from
+    the same process: the CUDA half needs a torch built with CUDA
     (`torch.version.cuda is not None`), the stable half a torch that has the
     stable ABI - a CPU-only wheel has no `c10/cuda` headers that can compile and
-    a torch below `STABLE_ABI_MIN_TORCH` no `<torch/csrc/stable/...>` at all.
+    a torch below `STABLE_ABI_MIN_TORCH` no `<torch/csrc/stable/...>` at all -
+    and the C++ standard is read out of the headers under `include` (see
+    `_required_cxx_standard`).
     """
-    code = ("import json, torch\n"
+    code = ("import json, pathlib, torch\n"
             "print(json.dumps({'version': torch.__version__,\n"
-            "                  'cuda': torch.version.cuda}))\n")
+            "                  'cuda': torch.version.cuda,\n"
+            "                  'include': str(pathlib.Path(torch.__file__).resolve()"
+            ".parent / 'include')}))\n")
     return json.loads(subprocess.check_output([sys.executable, "-c", code], text=True))
+
+
+#: What the `ta::` layer itself needs: `std::optional` and `if constexpr` are
+#: C++17, and `setup.py` passes `-std=c++17` for torch 1.x for the same reason.
+MIN_CXX_STANDARD = 17
+
+
+def _required_cxx_standard(probe):
+    """The `-std=c++NN` the installed torch's headers demand (at least C++17).
+
+    `ATen/ATen.h` states it in an `#error` line, and that line moves: "C++17 or
+    later compatible compiler is required to use ATen" through torch 2.13,
+    "C++20 or later" from 2.14 (whose `c10/util/intrusive_ptr.h` uses
+    `std::strong_ordering`). Reading it from the header keeps this check in step
+    with whatever the job installed - a hardcoded 17 failed `aten-cpp` on every
+    full-matrix entry that installs torch 2.14, while torch's own
+    `cpp_extension` passes the standard its release needs.
+    """
+    header = Path(probe["include"]) / "ATen" / "ATen.h"
+    try:
+        match = re.search(r"#error C\+\+(\d\d) or later", header.read_text(errors="replace"))
+    except OSError:
+        match = None
+    return max(int(match.group(1)) if match else MIN_CXX_STANDARD, MIN_CXX_STANDARD)
 
 
 def _version_tuple(version):
@@ -371,7 +400,8 @@ def main(argv=None):
     # c10/util/strong_type.h into an error, which has nothing to do with this
     # layer. Without it the `aten-cpp` combination fails on every macOS runner.
     cxx_platform_flags = ["-Wno-invalid-specialization"] if sys.platform == "darwin" else []
-    common_flags = ["-std=c++17", "-I" + str(TA_DIR)]
+    common_flags = [f"-std=c++{_required_cxx_standard(torch_probe)}",
+                    "-I" + str(TA_DIR)]
 
     failures = []
     with tempfile.TemporaryDirectory(prefix="ta_header_check_") as tmp:

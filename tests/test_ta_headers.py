@@ -87,6 +87,33 @@ def test_aten_backend_is_the_aten_one():
     assert "namespace ta" in code
 
 
+def test_the_cxx_standard_follows_the_installed_torch(tmp_path):
+    """C++17 up to torch 2.13, C++20 where ATen says so (torch 2.14).
+
+    torch's own `cpp_extension` passes the standard its release needs, and the
+    release states it in an `#error` line at the top of `ATen/ATen.h`. A
+    hardcoded `-std=c++17` failed `aten-cpp` on every full-matrix entry that
+    installed torch 2.14, whose `c10/util/intrusive_ptr.h` uses
+    `std::strong_ordering` ("C++20 or later compatible compiler is required").
+    """
+    checker = _load_checker()
+    (tmp_path / "ATen").mkdir()
+    header = tmp_path / "ATen" / "ATen.h"
+
+    for text, expected in ((("#error C++20 or later compatible compiler is "
+                            "required to use ATen.\n"), 20),
+                           (("#error C++17 or later compatible compiler is "
+                             "required to use ATen.\n"), 17),
+                           (("#error C++14 or later compatible compiler is "
+                             "required to use ATen.\n"), checker.MIN_CXX_STANDARD)):
+        header.write_text(text)
+        assert checker._required_cxx_standard({"include": str(tmp_path)}) == expected, text
+
+    # the floor is what the `ta::` layer itself uses (`std::optional`,
+    # `if constexpr`), and setup.py passes the same one for torch 1.x
+    assert checker.MIN_CXX_STANDARD == 17
+
+
 def test_headers_compile_with_gpp_in_both_modes():
     """The actual stage-0 acceptance criterion (migration section 3)."""
     result = _run_checker("--no-cuda")
