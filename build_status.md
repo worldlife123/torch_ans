@@ -57,4 +57,4 @@
 | windows | x86_64 | 3.8 | cpu | lazy | ✅ |
 | windows | x86_64 | 3.9 | cpu | lazy | ✅ |
 
-Last updated: Wed Oct 14 03:55:38 UTC 2026
+Last updated: Wed Oct 14 05:01:49 UTC 2026
